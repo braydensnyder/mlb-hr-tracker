@@ -1,0 +1,67 @@
+name: HR Tracker — scheduled update
+
+# Runs the orchestrated update on a cadence. Each scheduled tick is small
+# and idempotent — re-running is always safe.
+#
+# Cron times are UTC. Below maps to US Eastern roughly:
+#   12:00 UTC =  8:00 AM ET   → update:morning  (yesterday's finals)
+#   16:00 UTC = 12:00 PM ET   → update:daily    (mid-day refresh)
+#   19:00 UTC =  3:00 PM ET   → update:daily    (afternoon refresh)
+#    2:00 UTC = 10:00 PM ET   → update:night    (today's finals)
+#
+# Adjust the cron lines or env timezone to taste. workflow_dispatch lets
+# you run on demand from the Actions tab.
+
+on:
+  schedule:
+    - cron: '0 12 * * *'   # 8am ET — morning
+    - cron: '0 16 * * *'   # 12pm ET — midday
+    - cron: '0 19 * * *'   # 3pm  ET — afternoon
+    - cron: '0  2 * * *'   # 10pm ET (previous calendar day in UTC) — night
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Which mode to run'
+        required: true
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - morning
+          - night
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: hr-tracker-update
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Pick mode (cron → mode mapping)
+        id: pick
+        run: |
+          if [ -n "${{ github.event.inputs.mode }}" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
+          else
+            case "${{ github.event.schedule }}" in
+              '0 12 * * *') echo "mode=morning" >> "$GITHUB_OUTPUT" ;;
+              '0  2 * * *') echo "mode=night"   >> "$GITHUB_OUTPUT" ;;
+              *)            echo "mode=daily"   >> "$GITHUB_OUTPUT" ;;
+            esac
+          fi
+
+      - name: Run update:${{ steps.pick.outputs.mode }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: npm run update:${{ steps.pick.outputs.mode }}

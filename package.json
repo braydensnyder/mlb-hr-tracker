@@ -1,0 +1,49 @@
+{
+  "name": "hr-tracker",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "MVP web app for tracking MLB home runs by player day-by-day, with rolling stats.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "process:date": "tsx scripts/runProcessDate.ts",
+    "rebuild:summaries": "tsx scripts/runRebuildSummaries.ts",
+    "rebuild:all": "tsx scripts/runRebuildAll.ts",
+    "enrich:handedness": "tsx scripts/runEnrichHandedness.ts",
+    "enrich:venues": "tsx scripts/runEnrichVenues.ts",
+    "enrich:schedule": "tsx scripts/runEnrichSchedule.ts",
+    "enrich:players": "tsx scripts/runEnrichPlayers.ts",
+    "enrich:probable-pitchers": "tsx scripts/runEnrichProbablePitchers.ts",
+    "enrich:pitcher-starts": "tsx scripts/runEnrichPitcherStarts.ts",
+    "update:daily": "tsx scripts/runUpdateDaily.ts daily",
+    "update:morning": "tsx scripts/runUpdateDaily.ts morning",
+    "update:night": "tsx scripts/runUpdateDaily.ts night",
+    "snapshot:targets": "tsx scripts/runSnapshotHrTargets.ts",
+    "snapshot:today": "tsx scripts/runSnapshotHrTargets.ts today",
+    "snapshot:tomorrow": "tsx scripts/runSnapshotHrTargets.ts tomorrow",
+    "snapshot:range": "tsx scripts/runSnapshotRange.ts",
+    "process:yesterday": "tsx scripts/runProcessDate.ts yesterday",
+    "process:today": "tsx scripts/runProcessDate.ts today",
+    "backfill:season": "tsx scripts/runBackfillSeason.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "date-fns": "^3.6.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "dotenv": "^16.4.5",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.3",
+    "vite": "^5.4.0"
+  }
+}

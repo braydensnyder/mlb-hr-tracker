@@ -1,0 +1,1516 @@
+/**
+ * Pure aggregation helpers for the dashboard + HR Targets model.
+ *
+ * All functions take a flat array of `home_runs` rows and an "anchor date"
+ * (the right edge of the window, typically the user-selected end date).
+ * They never mutate input. They return small, view-ready objects so the
+ * dashboard components stay dumb.
+ *
+ * `HomeRunRow` lives here (not in supabase.ts) so this module is fully
+ * self-contained — node scripts can import it without dragging in the
+ * Supabase browser client.
+ */
+
+/** One row from the `home_runs` table. Re-exported from supabase.ts. */
+export interface HomeRunRow {
+  id: number;
+  game_pk: number;
+  game_date: string;
+  player_id: number;
+  player_name: string;
+  team: string;
+  opponent: string;
+  inning: number | null;
+  pitcher_id: number | null;
+  pitcher_name: string | null;
+  exit_velocity: number | null;
+  launch_angle: number | null;
+  distance: number | null;
+  batter_side: string | null;
+  pitcher_throws: string | null;
+  venue_id: number | null;
+  venue_name: string | null;
+  created_at: string;
+}
+
+// ---------- canonical team resolution ----------
+
+/**
+ * A minimal map of player_id → canonical MLB team name.
+ *
+ * Built from the `players` table (see fetchPlayerIndex in supabase helpers).
+ * Used by `applyCanonicalTeams` to remap each HR row's `team` field to the
+ * player's *current MLB team* before any aggregation. This guarantees that
+ * leaderboards, hot-hitter panels, and player pages never display a non-MLB
+ * team string (e.g., "United States" from a WBC row).
+ */
+export type PlayerTeamIndex = ReadonlyMap<number, { team: string | null; full_name?: string | null }>;
+
+/**
+ * Return a NEW HomeRunRow array with each row's `team` (and `player_name`,
+ * if available in the index) replaced by the canonical value. Rows whose
+ * player_id isn't in the index pass through unchanged so we degrade
+ * gracefully when enrich:players hasn't been run yet.
+ */
+export function applyCanonicalTeams<T extends HomeRunRow>(rows: T[], index: PlayerTeamIndex): T[] {
+  if (!index || index.size === 0) return rows;
+  return rows.map((r) => {
+    const canon = index.get(r.player_id);
+    if (!canon || !canon.team) return r;
+    if (r.team === canon.team && (!canon.full_name || r.player_name === canon.full_name)) return r;
+    return { ...r, team: canon.team, player_name: canon.full_name ?? r.player_name };
+  });
+}
+
+// ---------- date math (string-only, no Date objects) ----------
+
+export function addDays(yyyyMmDd: string, delta: number): string {
+  const [y, m, d] = yyyyMmDd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + delta);
+  return dt.toISOString().slice(0, 10);
+}
+
+export function daysBetween(a: string, b: string): number {
+  const [ay, am, ad] = a.split('-').map(Number);
+  const [by, bm, bd] = b.split('-').map(Number);
+  const da = Date.UTC(ay, am - 1, ad);
+  const db = Date.UTC(by, bm - 1, bd);
+  return Math.round((db - da) / 86_400_000);
+}
+
+// ---------- per-player aggregation ----------
+
+export interface PlayerAgg {
+  player_id: number;
+  player_name: string;
+  team: string;
+  /** Every HR row for this player in the window, newest first. */
+  rows: HomeRunRow[];
+  /** Distinct game_dates (string), newest first. */
+  distinctDates: string[];
+  /** Per-date HR counts: Map<game_date, count>. */
+  perDate: Map<string, number>;
+  totalInWindow: number;
+}
+
+export function aggregateByPlayer(rows: HomeRunRow[]): Map<number, PlayerAgg> {
+  const out = new Map<number, PlayerAgg>();
+  for (const r of rows) {
+    let p = out.get(r.player_id);
+    if (!p) {
+      p = {
+        player_id: r.player_id,
+        player_name: r.player_name,
+        team: r.team,
+        rows: [],
+        distinctDates: [],
+        perDate: new Map(),
+        totalInWindow: 0,
+      };
+      out.set(r.player_id, p);
+    }
+    p.rows.push(r);
+    p.totalInWindow += 1;
+    p.perDate.set(r.game_date, (p.perDate.get(r.game_date) ?? 0) + 1);
+    // keep most recent display name/team
+    p.player_name = r.player_name;
+    p.team = r.team;
+  }
+  for (const p of out.values()) {
+    p.rows.sort((a, b) => (a.game_date < b.game_date ? 1 : a.game_date > b.game_date ? -1 : b.id - a.id));
+    p.distinctDates = Array.from(p.perDate.keys()).sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+  }
+  return out;
+}
+
+// ---------- "hot hitters last N games" ----------
+
+export interface HotHitter {
+  player_id: number;
+  player_name: string;
+  team: string;
+  hrs_in_last_n_games: number;
+  games_with_hr_in_window: number;
+  total_in_window: number;
+  most_recent_hr: string;
+}
+
+/**
+ * For each player, sum HRs across their N most-recent distinct game_dates
+ * (only dates ≤ anchor). N typically 3 or 5. Sorted desc by that sum then
+ * by total_in_window for tie-breaks.
+ */
+export function hotHittersLastNGames(
+  byPlayer: Map<number, PlayerAgg>,
+  anchor: string,
+  n: number,
+): HotHitter[] {
+  const rows: HotHitter[] = [];
+  for (const p of byPlayer.values()) {
+    const eligibleDates = p.distinctDates.filter((d) => d <= anchor).slice(0, n);
+    if (eligibleDates.length === 0) continue;
+    let sum = 0;
+    for (const d of eligibleDates) sum += p.perDate.get(d) ?? 0;
+    rows.push({
+      player_id: p.player_id,
+      player_name: p.player_name,
+      team: p.team,
+      hrs_in_last_n_games: sum,
+      games_with_hr_in_window: eligibleDates.length,
+      total_in_window: p.totalInWindow,
+      most_recent_hr: eligibleDates[0],
+    });
+  }
+  rows.sort(
+    (a, b) =>
+      b.hrs_in_last_n_games - a.hrs_in_last_n_games ||
+      b.total_in_window - a.total_in_window ||
+      a.player_name.localeCompare(b.player_name),
+  );
+  return rows;
+}
+
+// ---------- "HRs in last X days" ----------
+
+export interface RangeHr {
+  player_id: number;
+  player_name: string;
+  team: string;
+  hrs: number;
+  total_in_window: number;
+}
+
+export function hrsInLastDays(
+  byPlayer: Map<number, PlayerAgg>,
+  anchor: string,
+  days: number,
+): RangeHr[] {
+  const start = addDays(anchor, -(days - 1));
+  const out: RangeHr[] = [];
+  for (const p of byPlayer.values()) {
+    let n = 0;
+    for (const [date, count] of p.perDate) {
+      if (date >= start && date <= anchor) n += count;
+    }
+    if (n > 0) {
+      out.push({
+        player_id: p.player_id,
+        player_name: p.player_name,
+        team: p.team,
+        hrs: n,
+        total_in_window: p.totalInWindow,
+      });
+    }
+  }
+  out.sort(
+    (a, b) =>
+      b.hrs - a.hrs ||
+      b.total_in_window - a.total_in_window ||
+      a.player_name.localeCompare(b.player_name),
+  );
+  return out;
+}
+
+// ---------- team leaderboards ----------
+
+export interface TeamHr {
+  team: string;
+  hrs: number;
+  unique_hitters: number;
+}
+
+export function teamHrLeaderboard(
+  rows: HomeRunRow[],
+  opts: { since?: string; until?: string } = {},
+): TeamHr[] {
+  const buckets = new Map<string, { hrs: number; players: Set<number> }>();
+  for (const r of rows) {
+    if (opts.since && r.game_date < opts.since) continue;
+    if (opts.until && r.game_date > opts.until) continue;
+    let b = buckets.get(r.team);
+    if (!b) {
+      b = { hrs: 0, players: new Set() };
+      buckets.set(r.team, b);
+    }
+    b.hrs += 1;
+    b.players.add(r.player_id);
+  }
+  return Array.from(buckets.entries())
+    .map(([team, b]) => ({ team, hrs: b.hrs, unique_hitters: b.players.size }))
+    .sort((a, b) => b.hrs - a.hrs || a.team.localeCompare(b.team));
+}
+
+// ---------- back-to-back games ----------
+
+export interface BackToBack {
+  player_id: number;
+  player_name: string;
+  team: string;
+  /** The two consecutive calendar dates (ascending). */
+  date_a: string;
+  date_b: string;
+  /** Total HRs across the two days. */
+  hrs_in_streak: number;
+  /** Length of the *current* streak ending at the most recent HR date. */
+  current_streak_len: number;
+}
+
+/**
+ * Players whose two most recent HR dates within the window are consecutive
+ * calendar days (delta == 1). We approximate "back-to-back games" as
+ * back-to-back calendar days, which is correct for the vast majority of the
+ * MLB schedule (off days are common but a "back-to-back HR" is colloquially
+ * back-to-back days). Sorted by current_streak_len desc, then by HRs in those
+ * two days desc.
+ */
+export function backToBackHr(
+  byPlayer: Map<number, PlayerAgg>,
+  anchor: string,
+): BackToBack[] {
+  const out: BackToBack[] = [];
+  for (const p of byPlayer.values()) {
+    const eligible = p.distinctDates.filter((d) => d <= anchor);
+    if (eligible.length < 2) continue;
+    const newest = eligible[0];
+    const prev = eligible[1];
+    if (daysBetween(prev, newest) !== 1) continue;
+
+    // measure current streak length
+    let streak = 1;
+    for (let i = 0; i < eligible.length - 1; i++) {
+      if (daysBetween(eligible[i + 1], eligible[i]) === 1) streak++;
+      else break;
+    }
+
+    out.push({
+      player_id: p.player_id,
+      player_name: p.player_name,
+      team: p.team,
+      date_a: prev,
+      date_b: newest,
+      hrs_in_streak: (p.perDate.get(prev) ?? 0) + (p.perDate.get(newest) ?? 0),
+      current_streak_len: streak,
+    });
+  }
+  out.sort(
+    (a, b) =>
+      b.current_streak_len - a.current_streak_len ||
+      b.hrs_in_streak - a.hrs_in_streak ||
+      (b.date_b < a.date_b ? -1 : 1),
+  );
+  return out;
+}
+
+// ---------- 2+ HR in last 5 games ----------
+
+export interface MultiHrGame {
+  player_id: number;
+  player_name: string;
+  team: string;
+  multi_hr_games: { date: string; hrs: number }[];
+  /** Sum of HRs across those multi-HR games (in the last 5 game window). */
+  total_multi_hrs: number;
+}
+
+export function multiHrInLastNGames(
+  byPlayer: Map<number, PlayerAgg>,
+  anchor: string,
+  windowGames: number,
+  threshold = 2,
+): MultiHrGame[] {
+  const out: MultiHrGame[] = [];
+  for (const p of byPlayer.values()) {
+    const lastN = p.distinctDates.filter((d) => d <= anchor).slice(0, windowGames);
+    const multi = lastN
+      .map((d) => ({ date: d, hrs: p.perDate.get(d) ?? 0 }))
+      .filter((g) => g.hrs >= threshold);
+    if (multi.length === 0) continue;
+    out.push({
+      player_id: p.player_id,
+      player_name: p.player_name,
+      team: p.team,
+      multi_hr_games: multi,
+      total_multi_hrs: multi.reduce((s, g) => s + g.hrs, 0),
+    });
+  }
+  out.sort(
+    (a, b) =>
+      b.multi_hr_games.length - a.multi_hr_games.length ||
+      b.total_multi_hrs - a.total_multi_hrs ||
+      a.player_name.localeCompare(b.player_name),
+  );
+  return out;
+}
+
+// ---------- season leaderboard (just total HRs in window per player) ----------
+
+export interface SeasonLeader {
+  player_id: number;
+  player_name: string;
+  team: string;
+  hrs: number;
+  last_hr: string;
+}
+
+export function seasonLeaders(byPlayer: Map<number, PlayerAgg>): SeasonLeader[] {
+  return Array.from(byPlayer.values())
+    .filter((p) => p.totalInWindow > 0)
+    .map((p) => ({
+      player_id: p.player_id,
+      player_name: p.player_name,
+      team: p.team,
+      hrs: p.totalInWindow,
+      last_hr: p.distinctDates[0],
+    }))
+    .sort(
+      (a, b) =>
+        b.hrs - a.hrs ||
+        (b.last_hr < a.last_hr ? -1 : 1) ||
+        a.player_name.localeCompare(b.player_name),
+    );
+}
+
+// ---------- single-player "as of" view ----------
+
+/**
+ * Compute every stat the PlayerDetail page needs from one player's raw HR
+ * rows, anchored at `anchor`. This is intentionally the same math the
+ * Dashboard uses, just packaged for one player — so the player page and
+ * the dashboard cells can NEVER disagree.
+ *
+ * `home_runs` is the single source of truth. Do not derive any of these
+ * from `player_daily_summary` on the frontend.
+ */
+export interface PlayerView {
+  /** All rows passed in, newest first. */
+  rows: HomeRunRow[];
+  /** Anchor date used (YYYY-MM-DD). */
+  anchor: string;
+
+  player_id: number | null;
+  player_name: string;
+  team: string;
+
+  hrs_today: number;
+  season_total: number;
+  hrs_last_3_games: number;
+  hrs_last_5_games: number;
+  hrs_last_7_days: number;
+  hrs_last_14_days: number;
+  last_hr_date: string | null;
+
+  /** Most recent distinct game_dates ≤ anchor (newest first), with per-date HR counts. */
+  recent_games: { date: string; hrs: number }[];
+}
+
+export function computePlayerView(rows: HomeRunRow[], anchor: string): PlayerView {
+  // Defensive sort — never trust caller order.
+  const sorted = [...rows].sort((a, b) =>
+    a.game_date < b.game_date ? 1 : a.game_date > b.game_date ? -1 : b.id - a.id,
+  );
+
+  // Only consider rows up to and including the anchor date. Anything later
+  // (e.g. a future-dated row that snuck in) must NOT influence the view.
+  const inScope = sorted.filter((r) => r.game_date <= anchor);
+
+  const yearStart = `${anchor.slice(0, 4)}-01-01`;
+
+  // per-date counts (only ≤ anchor)
+  const perDate = new Map<string, number>();
+  for (const r of inScope) perDate.set(r.game_date, (perDate.get(r.game_date) ?? 0) + 1);
+
+  const distinctDates = Array.from(perDate.keys()).sort((a, b) =>
+    a < b ? 1 : a > b ? -1 : 0,
+  );
+
+  // last 3 / last 5 distinct game dates
+  const last3Dates = new Set(distinctDates.slice(0, 3));
+  const last5Dates = new Set(distinctDates.slice(0, 5));
+
+  const sevenStart = addDays(anchor, -6);
+  const fourteenStart = addDays(anchor, -13);
+
+  let hrs_today = 0;
+  let season_total = 0;
+  let hrs_last_3_games = 0;
+  let hrs_last_5_games = 0;
+  let hrs_last_7_days = 0;
+  let hrs_last_14_days = 0;
+
+  for (const r of inScope) {
+    const d = r.game_date;
+    if (d === anchor) hrs_today++;
+    if (d >= yearStart) season_total++;
+    if (last3Dates.has(d)) hrs_last_3_games++;
+    if (last5Dates.has(d)) hrs_last_5_games++;
+    if (d >= sevenStart) hrs_last_7_days++;
+    if (d >= fourteenStart) hrs_last_14_days++;
+  }
+
+  // Pick display name/team from the most recent in-scope row, falling back to
+  // whatever the caller passed in (in case all rows are out of scope).
+  const newest = inScope[0] ?? sorted[0] ?? null;
+
+  return {
+    rows: sorted,
+    anchor,
+    player_id: newest?.player_id ?? null,
+    player_name: newest?.player_name ?? `Player`,
+    team: newest?.team ?? '—',
+    hrs_today,
+    season_total,
+    hrs_last_3_games,
+    hrs_last_5_games,
+    hrs_last_7_days,
+    hrs_last_14_days,
+    last_hr_date: distinctDates[0] ?? null,
+    recent_games: distinctDates.map((d) => ({ date: d, hrs: perDate.get(d) ?? 0 })),
+  };
+}
+
+// ---------- pitcher HR-allowed leaderboard ----------
+
+export interface PitcherAllowed {
+  pitcher_id: number;
+  pitcher_name: string;
+  /** Pitcher's team is approximated as "the opponent of the batter" — i.e., the
+   *  defending team in each HR row. We pick the most common opponent across
+   *  this pitcher's HR-allowed rows; for the rare cross-trade pitcher this may
+   *  shift mid-season but it's right for "current team" most of the time. */
+  team: string;
+  pitcher_throws: string | null; // 'L' | 'R' | null when unknown
+  season_allowed: number;
+  /** HRs allowed in pitcher's most recent 3 HR-allowed game-dates ≤ anchor. */
+  allowed_last_3_starts: number;
+  /** Same for 5 dates. */
+  allowed_last_5_starts: number;
+  /** HRs allowed in [anchor-13, anchor]. */
+  allowed_last_14_days: number;
+  most_recent_allowed: string;
+}
+
+export function pitcherHrLeaderboard(rows: HomeRunRow[], anchor: string): PitcherAllowed[] {
+  const fourteenStart = addDays(anchor, -13);
+  const buckets = new Map<
+    number,
+    {
+      name: string;
+      hand: string | null;
+      teamCounts: Map<string, number>;
+      perDate: Map<string, number>;
+      total: number;
+      l14: number;
+    }
+  >();
+
+  for (const r of rows) {
+    if (r.pitcher_id == null) continue;
+    if (r.game_date > anchor) continue;
+    let b = buckets.get(r.pitcher_id);
+    if (!b) {
+      b = { name: r.pitcher_name ?? `#${r.pitcher_id}`, hand: r.pitcher_throws ?? null, teamCounts: new Map(), perDate: new Map(), total: 0, l14: 0 };
+      buckets.set(r.pitcher_id, b);
+    }
+    // keep the most recently observed name & hand (handles renames / late enrichment)
+    b.name = r.pitcher_name ?? b.name;
+    if (r.pitcher_throws) b.hand = r.pitcher_throws;
+    // pitcher's team = batter's opponent
+    b.teamCounts.set(r.opponent, (b.teamCounts.get(r.opponent) ?? 0) + 1);
+    b.perDate.set(r.game_date, (b.perDate.get(r.game_date) ?? 0) + 1);
+    b.total += 1;
+    if (r.game_date >= fourteenStart) b.l14 += 1;
+  }
+
+  const out: PitcherAllowed[] = [];
+  for (const [pitcher_id, b] of buckets) {
+    const distinctDates = Array.from(b.perDate.keys()).sort((a, b2) => (a < b2 ? 1 : a > b2 ? -1 : 0));
+    const last3 = distinctDates.slice(0, 3);
+    const last5 = distinctDates.slice(0, 5);
+    const sum = (dates: string[]) => dates.reduce((s, d) => s + (b.perDate.get(d) ?? 0), 0);
+
+    // pick the team the pitcher most often defended against
+    let team = '—';
+    let max = -1;
+    for (const [t, c] of b.teamCounts) if (c > max) { team = t; max = c; }
+
+    out.push({
+      pitcher_id,
+      pitcher_name: b.name,
+      team,
+      pitcher_throws: b.hand,
+      season_allowed: b.total,
+      allowed_last_3_starts: sum(last3),
+      allowed_last_5_starts: sum(last5),
+      allowed_last_14_days: b.l14,
+      most_recent_allowed: distinctDates[0] ?? '',
+    });
+  }
+  out.sort(
+    (a, b2) =>
+      b2.season_allowed - a.season_allowed ||
+      b2.allowed_last_14_days - a.allowed_last_14_days ||
+      a.pitcher_name.localeCompare(b2.pitcher_name),
+  );
+  return out;
+}
+
+// ---------- handedness splits ----------
+
+export interface HandednessSplit {
+  /** Total HRs across rows where pitcher_throws is known. */
+  total_known: number;
+  /** Rows with no pitcher_throws data — useful for "X% of HRs lack handedness data" UI hints. */
+  total_unknown: number;
+  vs_lhp: number;
+  vs_rhp: number;
+}
+
+export function leagueHandednessSplit(rows: HomeRunRow[], anchor: string): HandednessSplit {
+  const out: HandednessSplit = { total_known: 0, total_unknown: 0, vs_lhp: 0, vs_rhp: 0 };
+  for (const r of rows) {
+    if (r.game_date > anchor) continue;
+    if (r.pitcher_throws === 'L') { out.vs_lhp++; out.total_known++; }
+    else if (r.pitcher_throws === 'R') { out.vs_rhp++; out.total_known++; }
+    else out.total_unknown++;
+  }
+  return out;
+}
+
+export interface PlayerHandednessSplit {
+  player_id: number;
+  player_name: string;
+  team: string;
+  /** Per-AB batter side that we observed in HR rows (rare to vary outside of switch hitters). */
+  bat_side: string | null;
+  vs_lhp: number;
+  vs_rhp: number;
+  unknown: number;
+  vs_lhp_l30d: number;
+  vs_rhp_l30d: number;
+  total: number;
+}
+
+/** Per-player handedness split anchored at the as-of date. */
+export function playerHandednessSplits(rows: HomeRunRow[], anchor: string): PlayerHandednessSplit[] {
+  const thirtyStart = addDays(anchor, -29);
+  const buckets = new Map<number, PlayerHandednessSplit>();
+  for (const r of rows) {
+    if (r.game_date > anchor) continue;
+    let b = buckets.get(r.player_id);
+    if (!b) {
+      b = {
+        player_id: r.player_id,
+        player_name: r.player_name,
+        team: r.team,
+        bat_side: r.batter_side ?? null,
+        vs_lhp: 0,
+        vs_rhp: 0,
+        unknown: 0,
+        vs_lhp_l30d: 0,
+        vs_rhp_l30d: 0,
+        total: 0,
+      };
+      buckets.set(r.player_id, b);
+    }
+    b.player_name = r.player_name;
+    b.team = r.team;
+    if (r.batter_side) b.bat_side = r.batter_side;
+    b.total++;
+    const inL30 = r.game_date >= thirtyStart;
+    if (r.pitcher_throws === 'L') { b.vs_lhp++; if (inL30) b.vs_lhp_l30d++; }
+    else if (r.pitcher_throws === 'R') { b.vs_rhp++; if (inL30) b.vs_rhp_l30d++; }
+    else b.unknown++;
+  }
+  return Array.from(buckets.values()).sort((a, b) => b.total - a.total || a.player_name.localeCompare(b.player_name));
+}
+
+/** Compute the handedness split for a single player's rows, anchored at asOf. */
+export function singlePlayerHandedness(rows: HomeRunRow[], anchor: string): PlayerHandednessSplit | null {
+  const split = playerHandednessSplits(rows, anchor);
+  return split[0] ?? null;
+}
+
+// ---------- venue (ballpark) leaderboard ----------
+
+export interface VenueStats {
+  venue_name: string;
+  season: number;
+  l7d: number;
+  l14d: number;
+  /** Distinct teams seen homering at this venue — proxy for "teams playing here". */
+  teams_seen: string[];
+}
+
+export function venueLeaderboard(rows: HomeRunRow[], anchor: string): VenueStats[] {
+  const sevenStart = addDays(anchor, -6);
+  const fourteenStart = addDays(anchor, -13);
+  const buckets = new Map<string, { season: number; l7: number; l14: number; teams: Set<string> }>();
+  for (const r of rows) {
+    if (!r.venue_name) continue;
+    if (r.game_date > anchor) continue;
+    let b = buckets.get(r.venue_name);
+    if (!b) {
+      b = { season: 0, l7: 0, l14: 0, teams: new Set() };
+      buckets.set(r.venue_name, b);
+    }
+    b.season++;
+    if (r.game_date >= sevenStart) b.l7++;
+    if (r.game_date >= fourteenStart) b.l14++;
+    b.teams.add(r.team);
+    b.teams.add(r.opponent);
+  }
+  return Array.from(buckets.entries())
+    .map(([venue_name, b]) => ({
+      venue_name,
+      season: b.season,
+      l7d: b.l7,
+      l14d: b.l14,
+      teams_seen: Array.from(b.teams).sort(),
+    }))
+    // Rank by L14 friendliness then season volume — user's "HR friendliness based on stored data"
+    .sort((a, b) => b.l14d - a.l14d || b.season - a.season || a.venue_name.localeCompare(b.venue_name));
+}
+
+// ---------- HR Targets (heat score) ----------
+
+/**
+ * "HR Heat Score" — a research-only ranking of which hitters are most
+ * likely to homer in a specific game. NOT a guaranteed pick.
+ *
+ * Each component is normalized to 0..1 by dividing its raw value by a
+ * saturation cap, then multiplied by its weight. The final heat score is
+ * the weighted sum (max = 100 since weights total 100). This shape
+ * de-emphasizes single-game L3 streaks vs the previous uncapped formula
+ * and makes the contribution of each signal easy to read off.
+ *
+ * `weather` is a 0-weight placeholder so the formula already accepts the
+ * field when weather data is wired in.
+ *
+ * Components and weights (tunable in HEAT_SCORE_WEIGHTS):
+ *   l3       35  — HRs in last 3 distinct HR-game-dates (sat at 3)
+ *   l5       20  — HRs in last 5 distinct HR-game-dates (sat at 4)
+ *   l7d      15  — HRs in last 7 calendar days          (sat at 5)
+ *   season   10  — season HRs                            (sat at 30)
+ *   pitcher  10  — opposing pitcher L14d HRs allowed     (sat at 6)
+ *   park      5  — venue L14d HRs                        (sat at 12)
+ *   hand      5  — share of HRs vs probable's throwing hand
+ *   weather   0  — placeholder
+ *
+ * Every component degrades gracefully:
+ *   - missing pitcher → hand + pitcher contributions = 0
+ *   - missing venue   → park contribution = 0
+ *   - new player      → l3/l5/l7d/season still meaningful
+ */
+
+/**
+ * Heat score weights (sum to 100).
+ *
+ * Season Power is the **structural base** — 40% of the model. Recent form
+ * is a 25% booster, not a driver. Matchup signals fill the rest. The
+ * shape was retuned because the previous 38/30 split let short-term hot
+ * streaks outweigh true power.
+ *
+ *   Season Power     = 40   (season HR; floored for elites — see Power Floor)
+ *   Recent Form      = 25   (l3 14 + l5 8 + l7d 3 — dampened by stability)
+ *   Pitcher Matchup  = 15
+ *   Handedness       = 10
+ *   Venue            = 10
+ *   Weather          =  0   (placeholder)
+ *
+ * Plus two hard guard rails (see below):
+ *   - Auto-elite at season_hr ≥ 12: Power Floor + full stability automatically.
+ *   - Low-power cap: non-elite, sub-5-HR players capped at LOW_POWER_CAP
+ *     unless they've hit 2+ HR in last 3 games.
+ */
+export const HEAT_SCORE_WEIGHTS = {
+  season: 40,   // was 30 — Season Power is now the structural base
+  l3: 14,       // was 18
+  l5: 8,        // was 12
+  l7d: 3,       // was 8
+  pitcher: 15,  // was 14
+  park: 10,     // unchanged
+  hand: 10,     // was 8
+  weather: 0,   // placeholder
+} as const;
+
+export const HEAT_SCORE_SATURATION = {
+  l3: 3,
+  l5: 4,
+  l7d: 5,
+  season: 30,
+  pitcher_l14d: 6,
+  park_l14d: 12,
+  hand: 5,
+} as const;
+
+/**
+ * STABILITY factor — dampens recent-form contributions when a player
+ * doesn't have a meaningful season HR baseline.
+ *
+ *   stability = clamp(effective_season_hr / RAMP, FLOOR, 1.0)
+ *
+ * `effective_season_hr` lifts known-elite power hitters to a minimum so a
+ * slow-start Aaron Judge (5 actual HRs in April) isn't penalized like a
+ * fringe hitter (also 5 HRs, no track record).
+ */
+export const HEAT_SCORE_STABILITY = {
+  /** Full stability credit at this many season HR. */
+  ramp: 12,         // was 10 — tighter ramp so sub-12 hitters are clearly dampened
+  /** Minimum stability factor regardless of season HR. */
+  floor: 0.35,      // was 0.4
+  /** Elite power hitters get treated as having at least this many season HR
+   *  for stability + season-power floor purposes. */
+  elite_min_season_hr: 15,
+  /** Any player with ≥ this many season HR is automatically treated as elite
+   *  (Power Floor + full stability), even when not in the curated list. */
+  auto_elite_hr: 12,
+} as const;
+
+/**
+ * Low-power cap. A non-elite hitter with very few season HRs can't earn a
+ * top-10 ranking purely on a tiny recent uptick. They have to show an
+ * extreme calendar-recent streak (≥ L7D_EXEMPTION HR in the calendar last
+ * 7 days) to break the cap.
+ *
+ * Why hrs_l7d and not hrs_l3? `hrs_l3` is "HRs in the player's most recent
+ * 3 distinct HR-dates" — for a fringe hitter who last homered weeks ago,
+ * that metric can read as 2 even though they have no calendar-recent form.
+ * Using hrs_l7d enforces the user's intent: real, current heat.
+ *
+ *   if (!isElitePower  AND  season_hr < SEASON_HR_MAX  AND  hrs_l7d < L7D_EXEMPTION)
+ *   then  heat = min(heat, CAP)
+ */
+export const HEAT_SCORE_LOW_POWER_CAP = {
+  /** Cap applies when season_hr is BELOW this value. */
+  season_hr_max: 5,
+  /** Calendar-7d HRs at or above this exempt the player from the cap. */
+  l7d_exemption: 2,
+  /** Maximum heat score for capped players. */
+  cap: 30,
+} as const;
+
+export function stabilityFactor(season_hr: number, isElitePower = false): number {
+  const effective = isElitePower
+    ? Math.max(season_hr, HEAT_SCORE_STABILITY.elite_min_season_hr)
+    : season_hr;
+  return clamp(effective / HEAT_SCORE_STABILITY.ramp, HEAT_SCORE_STABILITY.floor, 1.0);
+}
+
+/**
+ * ELITE_POWER_NAMES — curated set of names whose canonical players row
+ * (full_name) should be treated as elite-power for the Heat Score model.
+ *
+ * Matching is case-insensitive on `players.full_name`. This list is the
+ * default; pass `elitePowerIds` to computeHrTargets to override or extend.
+ *
+ * The MARKET-SANITY future hook is: once we ingest sportsbook HR odds,
+ * the Power Floor will defer to odds for any player whose implied
+ * probability is above a threshold; the curated list will remain as the
+ * "odds-missing" fallback so elite sluggers never disappear.
+ */
+export const ELITE_POWER_NAMES: ReadonlySet<string> = new Set([
+  'aaron judge',
+  'shohei ohtani',
+  'kyle schwarber',
+  'pete alonso',
+  'matt olson',
+  'corey seager',
+  'juan soto',
+  'yordan alvarez',
+  'mookie betts',
+  'bryce harper',
+  'vladimir guerrero jr.',
+  'jose ramirez',
+  'rafael devers',
+  'fernando tatis jr.',
+  'manny machado',
+  'eugenio suarez',
+  'austin riley',
+  'marcell ozuna',
+  'adolis garcia',
+  'gunnar henderson',
+  'ronald acuna jr.',
+  'salvador perez',
+  'cal raleigh',
+  'william contreras',
+  'mike trout',
+  'paul goldschmidt',
+  'freddie freeman',
+  'rhys hoskins',
+  'francisco lindor',
+  'teoscar hernandez',
+]);
+
+/**
+ * Future hook for sportsbook HR-prop odds. Not wired to any fetcher yet —
+ * declared so the UI / model can be incrementally extended. When odds
+ * are present, they override the curated Power Floor.
+ */
+export interface DailyHrOdds {
+  player_id: number;
+  game_date: string;
+  bookmaker?: string;
+  american_odds?: number;        // e.g. +350
+  implied_probability?: number;  // 0..1
+}
+
+export interface HrTargetGame {
+  game_pk: number;
+  game_date: string;
+  home_team: string;
+  away_team: string;
+  venue_name: string | null;
+  home_probable_pitcher_id: number | null;
+  home_probable_pitcher_name: string | null;
+  home_probable_pitcher_hand: string | null;
+  away_probable_pitcher_id: number | null;
+  away_probable_pitcher_name: string | null;
+  away_probable_pitcher_hand: string | null;
+}
+
+/**
+ * Grouped score breakdown shown in the expandable matchup detail. These
+ * are sums of the per-component contributions, grouped by the priority
+ * categories the user reasons about (form / power / matchup / venue).
+ */
+export interface HrTargetBreakdown {
+  season_power_score: number;    // season contribution
+  recent_form_score: number;     // L3 + L5 + L7d contributions (post-stability)
+  pitcher_score: number;         // pitcher contribution only
+  handedness_score: number;      // handedness vs probable
+  venue_score: number;           // park contribution
+  weather_score: number;         // 0 today; placeholder
+  /** Multiplier (0.35..1.0) applied to recent-form contributions when
+   *  season HR baseline is low. Lower = stronger dampening. */
+  stability_factor: number;
+  /** Heat score BEFORE Power Floor or Low-power cap. Shown for transparency. */
+  raw_score: number;
+  /** Human-readable list of adjustments applied between raw_score and final_heat_score.
+   *  Positive delta = boost (Power Floor); negative delta = cap. */
+  adjustments: { label: string; delta: number }[];
+  final_heat_score: number;      // mirror of HrTarget.heat_score (post-adjustments)
+}
+
+/** Normalized 0..1 values per component, plus the points each contributed
+ *  to the final heat score (= normalized * weight). */
+export interface HrTargetSubscores {
+  l3: number;
+  l5: number;
+  l7d: number;
+  season: number;
+  pitcher: number;
+  park: number;
+  hand: number;
+  weather: number;
+  contributions: {
+    l3: number;
+    l5: number;
+    l7d: number;
+    season: number;
+    pitcher: number;
+    park: number;
+    hand: number;
+    weather: number;
+  };
+}
+
+export interface HrTarget {
+  player_id: number;
+  player_name: string;
+  team: string;
+  opponent: string;
+  venue_name: string | null;
+  pitcher_id: number | null;
+  pitcher_name: string;        // "TBD" when unknown
+  pitcher_hand: string | null;
+  batter_side: string | null;
+  /** HRs in player's last 2 distinct HR-game-dates ≤ asOf (for "3 HR in last 2 games" reason). */
+  hrs_l2: number;
+  hrs_l3: number;
+  hrs_l5: number;
+  hrs_l7d: number;
+  /** Length of consecutive-calendar-day HR streak ending at the player's most recent HR ≤ asOf. */
+  hr_streak: number;
+  season_hr: number;
+  /** Per-pitcher-hand HRs this season (excludes rows with unknown pitcher_throws). */
+  vs_lhp_season: number;
+  vs_rhp_season: number;
+  heat_score: number;          // rounded to 1 decimal
+  subscores: HrTargetSubscores;
+  /** Grouped score breakdown (post-stability) for the expandable detail. */
+  breakdown: HrTargetBreakdown;
+  /** 1–3 specific, numeric reason strings (e.g. "5 HR last 5 games"). */
+  reasons: string[];
+
+  // Pitcher / venue context, denormalized for display + reason text:
+  pitcher_l14d_allowed: number;
+  pitcher_l3_starts_allowed: number;
+  pitcher_l5_starts_allowed: number;
+  pitcher_season_allowed: number;
+  /** How many starts we have on file for this pitcher. 0 = approximation from home_runs. */
+  pitcher_starts_known: number;
+  venue_l14d_hrs: number;
+  /** 1-based rank of this venue in the league by L14d HRs. null if no venue. */
+  venue_l14d_rank: number | null;
+  /** Total venues with at least one HR — used to express rank context. */
+  venue_total: number;
+  /** True when the player is in the curated ELITE_POWER_NAMES set (or caller-supplied elitePowerIds). */
+  is_elite_power: boolean;
+}
+
+export interface HrTargetsBoard {
+  game_pk: number;
+  game_date: string;
+  away_team: string;
+  home_team: string;
+  venue_name: string | null;
+  /** Pitcher facing the AWAY team's batters (i.e., the HOME team's probable). */
+  away_facing: { id: number | null; name: string; hand: string | null };
+  /** Pitcher facing the HOME team's batters (i.e., the AWAY team's probable). */
+  home_facing: { id: number | null; name: string; hand: string | null };
+  away_targets: HrTarget[];
+  home_targets: HrTarget[];
+}
+
+interface InternalAgg {
+  player_id: number;
+  name: string;
+  team: string;
+  batter_side: string | null;
+  rows: HomeRunRowLite[];
+  perDate: Map<string, number>;
+  distinctDates: string[];
+  vs_lhp: number;
+  vs_rhp: number;
+  known_hand_hrs: number;
+}
+
+type HomeRunRowLite = Pick<
+  HomeRunRow,
+  'player_id' | 'player_name' | 'team' | 'game_date' | 'batter_side' | 'pitcher_throws' | 'id'
+>;
+
+function aggregateByPlayerForTargets(rows: HomeRunRowLite[], anchor: string): Map<number, InternalAgg> {
+  const out = new Map<number, InternalAgg>();
+  for (const r of rows) {
+    if (r.game_date > anchor) continue; // never use future data
+    let a = out.get(r.player_id);
+    if (!a) {
+      a = {
+        player_id: r.player_id,
+        name: r.player_name,
+        team: r.team,
+        batter_side: r.batter_side ?? null,
+        rows: [],
+        perDate: new Map(),
+        distinctDates: [],
+        vs_lhp: 0,
+        vs_rhp: 0,
+        known_hand_hrs: 0,
+      };
+      out.set(r.player_id, a);
+    }
+    a.name = r.player_name;
+    a.team = r.team;
+    if (r.batter_side) a.batter_side = r.batter_side;
+    a.rows.push(r);
+    a.perDate.set(r.game_date, (a.perDate.get(r.game_date) ?? 0) + 1);
+    if (r.pitcher_throws === 'L') { a.vs_lhp++; a.known_hand_hrs++; }
+    else if (r.pitcher_throws === 'R') { a.vs_rhp++; a.known_hand_hrs++; }
+  }
+  for (const a of out.values()) {
+    a.distinctDates = Array.from(a.perDate.keys()).sort((x, y) => (x < y ? 1 : x > y ? -1 : 0));
+  }
+  return out;
+}
+
+function clamp(n: number, lo: number, hi: number) { return Math.min(hi, Math.max(lo, n)); }
+function round1(n: number) { return Math.round(n * 10) / 10; }
+function round2(n: number) { return Math.round(n * 100) / 100; }
+
+/**
+ * Build specific, numeric reason strings — never generic.
+ *
+ * Returns 1–3 strings prioritized by how much they contributed to the heat
+ * score. Examples produced:
+ *   "5 HR last 5 games"
+ *   "12 season HR"
+ *   "5 HR vs RHP this season"
+ *   "Venue top 5 in L14d HRs"
+ *   "Pitcher allowed 3 HR last 3 starts"
+ */
+/**
+ * Builds specific, numeric reason strings. Up to 4 per player, prioritized
+ * by their contribution to the heat score so the strongest signals lead.
+ *
+ * Includes:
+ *   - L2 / L3 / L5 / L7d streaks (most specific phrasing wins)
+ *   - Multi-day consecutive-game streak ("HR in 3 straight games")
+ *   - Season power milestone
+ *   - Per-pitcher-hand season count vs the actual probable's hand
+ *   - Pitcher recent HR-allowed (L3 starts → L14d fallback)
+ *   - Park rank (top 5) or absolute L14d
+ *   - Meta tag: "Hot streak + favorable matchup" when 2+ heavy signals stack
+ */
+function pickReasons(t: HrTarget): string[] {
+  const candidates: { weight: number; text: string }[] = [];
+  const c = t.subscores.contributions;
+
+  // ----- recent form: pick the SHARPEST window that is non-trivial -----
+  if (t.hrs_l2 >= 2) {
+    // "3 HR in last 2 games" — the user's example
+    candidates.push({ weight: 30 + 5 * t.hrs_l2, text: `${t.hrs_l2} HR in last 2 games` });
+  } else if (t.hrs_l3 >= 2) {
+    candidates.push({ weight: 25 + 3 * t.hrs_l3, text: `${t.hrs_l3} HR in last 3 games` });
+  } else if (t.hrs_l5 >= 3) {
+    candidates.push({ weight: 18 + 2 * t.hrs_l5, text: `${t.hrs_l5} HR in last 5 games` });
+  } else if (t.hrs_l7d >= 3) {
+    candidates.push({ weight: 15 + t.hrs_l7d, text: `${t.hrs_l7d} HR in last 7 days` });
+  } else if (t.hrs_l5 >= 2) {
+    candidates.push({ weight: 10 + t.hrs_l5, text: `${t.hrs_l5} HR in last 5 games` });
+  }
+
+  // Consecutive HR-day streak — distinct signal from L3 HR count
+  if (t.hr_streak >= 3) {
+    candidates.push({ weight: 18 + t.hr_streak, text: `HR in ${t.hr_streak} straight games` });
+  }
+
+  // ----- season power -----
+  if (t.season_hr >= 25) {
+    // Elite power profile: gets its own narrative tag in addition to the count.
+    candidates.push({ weight: c.season + 4, text: `Elite power profile (${t.season_hr} season HR)` });
+  } else if (t.season_hr >= 15) {
+    candidates.push({ weight: c.season + t.season_hr / 8, text: `${t.season_hr} season HR` });
+  } else if (t.season_hr >= 5 && c.season >= 1) {
+    // Mid-power batters still get a reason if nothing flashier is there
+    candidates.push({ weight: c.season, text: `${t.season_hr} season HR` });
+  }
+
+  // ----- handedness edge -----
+  if (t.pitcher_hand === 'L' || t.pitcher_hand === 'R') {
+    const vsCount = t.pitcher_hand === 'L' ? t.vs_lhp_season : t.vs_rhp_season;
+    if (vsCount >= 3 && c.hand >= 1.5) {
+      candidates.push({
+        weight: c.hand + 1.5,
+        text: `${vsCount} HR vs ${t.pitcher_hand}HP this season`,
+      });
+    } else if (c.hand >= 3.5) {
+      // Strong edge ratio even on a low absolute count → still worth surfacing
+      candidates.push({ weight: c.hand, text: `Strong vs ${t.pitcher_hand}HP` });
+    }
+  }
+
+  // ----- pitcher weakness, with concrete count -----
+  // Prefer the L3-starts phrasing only when we have real starts data; otherwise
+  // the count can be misleadingly low for HR-suppressing pitchers (0-HR starts
+  // don't appear in home_runs). With real pitcher_starts data we trust both.
+  const havePitcherStarts = t.pitcher_starts_known >= 3;
+  if (havePitcherStarts && t.pitcher_l5_starts_allowed >= 4) {
+    candidates.push({
+      weight: c.pitcher + t.pitcher_l5_starts_allowed,
+      text: `Pitcher allowed ${t.pitcher_l5_starts_allowed} HR in last 5 starts`,
+    });
+  } else if (t.pitcher_l3_starts_allowed >= 3) {
+    candidates.push({
+      weight: c.pitcher + t.pitcher_l3_starts_allowed,
+      text: `Pitcher allowed ${t.pitcher_l3_starts_allowed} HR in last 3 starts`,
+    });
+  } else if (t.pitcher_l14d_allowed >= 3) {
+    candidates.push({
+      weight: c.pitcher,
+      text: `Pitcher allowed ${t.pitcher_l14d_allowed} HR in last 14 days`,
+    });
+  }
+
+  // Pitcher-quality narrative tag (no specific count needed).
+  // Elevated rate: a starter who's actively giving up HRs across recent starts.
+  const handLabel = t.pitcher_hand ? `${t.pitcher_hand}HP` : 'Pitcher';
+  if (havePitcherStarts && t.pitcher_l5_starts_allowed >= 5) {
+    candidates.push({ weight: c.pitcher + 0.5, text: `${handLabel} allowing elevated HR rate` });
+  } else if (t.pitcher_l14d_allowed >= 4) {
+    candidates.push({ weight: c.pitcher + 0.5, text: 'Weak HR suppression recently' });
+  }
+
+  // ----- park boost: rank-based when in top 5 -----
+  if (t.venue_l14d_rank != null && t.venue_l14d_rank <= 5 && t.venue_l14d_hrs >= 2) {
+    candidates.push({
+      weight: c.park + (6 - t.venue_l14d_rank),
+      text: `Venue top ${t.venue_l14d_rank} HR park in L14d`,
+    });
+  } else if (t.venue_l14d_hrs >= 4) {
+    candidates.push({
+      weight: c.park,
+      text: `Hitter-friendly venue (${t.venue_l14d_hrs} HR L14d)`,
+    });
+  }
+
+  // ----- META: two strong signals stacked -----
+  // "Recent form" here checks the UN-DAMPENED normalized subscores so the
+  // meta-tag still fires when a real streak exists even if the stability
+  // factor dropped the contributions. The matchup checks use contributions
+  // because those aren't dampened by stability.
+  const W = HEAT_SCORE_WEIGHTS;
+  const recentSignal  = (t.subscores.l3 + t.subscores.l5) >= 1.4; // ≥70% of 2.0 max
+  const pitcherSignal = c.pitcher >= 0.6 * W.pitcher;
+  const parkSignal    = c.park    >= 0.6 * W.park;
+  const handSignal    = c.hand    >= 0.6 * W.hand;
+  const heavyMatchup  = pitcherSignal || parkSignal || handSignal;
+  if (recentSignal && heavyMatchup) {
+    candidates.push({ weight: 28, text: 'Hot streak + favorable matchup' });
+  }
+
+  candidates.sort((a, b) => b.weight - a.weight);
+  if (candidates.length === 0) {
+    if (t.season_hr > 0) return [`${t.season_hr} season HR`];
+    return [];
+  }
+
+  // De-dup by text (meta tag can echo a recent-form theme; pick highest weight version)
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const c2 of candidates) {
+    if (seen.has(c2.text)) continue;
+    seen.add(c2.text);
+    out.push(c2.text);
+    if (out.length === 4) break;
+  }
+  return out;
+}
+
+/** Public so HrTargets.tsx can build the index and pass it in. */
+export interface PitcherFormLite {
+  pitcher_id: number;
+  pitcher_throws: string | null;
+  allowed_last_14_days: number;
+  allowed_last_3_starts: number;
+  /** Last 5 starts HR allowed. Only meaningful when sourced from pitcher_starts. */
+  allowed_last_5_starts?: number;
+  /** Season HR allowed. Only meaningful when sourced from pitcher_starts. */
+  season_hr_allowed?: number;
+  /** How many starts we have data for. 0 = approximation from home_runs. */
+  starts_known?: number;
+}
+
+interface VenueFormLite {
+  venue_name: string;
+  l14d: number;
+  /** 1-based rank in L14d HRs across all venues (1 = most). */
+  rank_l14d?: number;
+  /** Total ranked venues (denominator for "top N of M" phrasing). */
+  total_ranked?: number;
+}
+
+/**
+ * Build a per-game targets board for each scheduled game. Hitters considered:
+ * every player who has at least one HR in the season-to-date window AND whose
+ * canonical team (already remapped via applyCanonicalTeams upstream) matches
+ * one of the game's teams.
+ */
+export function computeHrTargets(
+  rows: HomeRunRowLite[],
+  asOf: string,
+  games: HrTargetGame[],
+  opts: {
+    pitcherIndex?: ReadonlyMap<number, PitcherFormLite>;
+    venueIndex?: ReadonlyMap<string, VenueFormLite>;
+    limitPerTeam?: number;
+    /**
+     * Player IDs the caller has identified as elite power (Power Floor applies).
+     * Typically built from the canonical `players` table by matching full_name
+     * against ELITE_POWER_NAMES. Override-able for tests.
+     */
+    elitePowerIds?: ReadonlySet<number>;
+  } = {},
+): HrTargetsBoard[] {
+  const limit = opts.limitPerTeam ?? 8;
+  const pitcherIndex = opts.pitcherIndex ?? new Map<number, PitcherFormLite>();
+  const venueIndex = opts.venueIndex ?? new Map<string, VenueFormLite>();
+  const elitePowerIds = opts.elitePowerIds ?? new Set<number>();
+  const byPlayer = aggregateByPlayerForTargets(rows, asOf);
+
+  // Group candidate hitters by team for fast lookup
+  const candidatesByTeam = new Map<string, InternalAgg[]>();
+  for (const a of byPlayer.values()) {
+    if (a.rows.length === 0) continue;
+    let arr = candidatesByTeam.get(a.team);
+    if (!arr) { arr = []; candidatesByTeam.set(a.team, arr); }
+    arr.push(a);
+  }
+
+  const sevenStart = addDays(asOf, -6);
+  const yearStart = `${asOf.slice(0, 4)}-01-01`;
+
+  function rankForTeam(team: string, opponent: string, venueName: string | null, pitcher: { id: number | null; name: string; hand: string | null }): HrTarget[] {
+    const pool = candidatesByTeam.get(team) ?? [];
+
+    // Per-pitcher form — prefer pitcher_starts data when present, else
+    // fall back to the home_runs-based approximation.
+    const pitcherForm = pitcher.id != null ? pitcherIndex.get(pitcher.id) ?? null : null;
+    const pitcher_l14d = pitcherForm?.allowed_last_14_days ?? 0;
+    const pitcher_l3_starts = pitcherForm?.allowed_last_3_starts ?? 0;
+    const pitcher_l5_starts = pitcherForm?.allowed_last_5_starts ?? pitcher_l3_starts;
+    const pitcher_season   = pitcherForm?.season_hr_allowed ?? 0;
+    const pitcher_starts_known = pitcherForm?.starts_known ?? 0;
+
+    // Per-venue form — fallback 0
+    const venueForm = venueName ? venueIndex.get(venueName) ?? null : null;
+    const venue_l14d = venueForm?.l14d ?? 0;
+    const venue_rank = venueForm?.rank_l14d ?? null;
+    const venue_total = venueForm?.total_ranked ?? 0;
+
+    const targets = pool.map<HrTarget>((a) => {
+      // L2 / L3 / L5 (per-player most-recent distinct HR-dates ≤ asOf)
+      const last2 = a.distinctDates.slice(0, 2);
+      const last3 = a.distinctDates.slice(0, 3);
+      const last5 = a.distinctDates.slice(0, 5);
+      const sumDates = (ds: string[]) => ds.reduce((s, d) => s + (a.perDate.get(d) ?? 0), 0);
+      const hrs_l2 = sumDates(last2);
+      const hrs_l3 = sumDates(last3);
+      const hrs_l5 = sumDates(last5);
+
+      // L7d and season totals
+      let hrs_l7d = 0;
+      let season_hr = 0;
+      for (const r of a.rows) {
+        if (r.game_date >= sevenStart) hrs_l7d++;
+        if (r.game_date >= yearStart) season_hr++;
+      }
+
+      // Consecutive-calendar-day HR streak ending at the most recent HR
+      let hr_streak = 0;
+      for (let i = 0; i < a.distinctDates.length; i++) {
+        if (i === 0) {
+          hr_streak = 1;
+          continue;
+        }
+        if (daysBetween(a.distinctDates[i], a.distinctDates[i - 1]) === 1) {
+          hr_streak++;
+        } else {
+          break;
+        }
+      }
+      if (a.distinctDates.length === 0) hr_streak = 0;
+
+      // ---- elite power detection ----
+      // Elite players get a Power Floor: their season_power normalized
+      // value can't drop below ELITE_SEASON_POWER_FLOOR, and their
+      // stability factor uses an elevated effective season_hr.
+      //
+      // Two paths to "elite":
+      //   1. Curated list (ELITE_POWER_NAMES → elitePowerIds) — for known
+      //      sluggers whose current-season HR count hasn't caught up yet
+      //   2. Auto-elite at season_hr ≥ 12 — guard rail so the model can
+      //      always recognize a power profile from the data itself
+      const isCuratedElite = elitePowerIds.has(a.player_id);
+      const isAutoElite = season_hr >= HEAT_SCORE_STABILITY.auto_elite_hr;
+      const isElitePower = isCuratedElite || isAutoElite;
+
+      // ---- normalized 0..1 subscores ----
+      const W = HEAT_SCORE_WEIGHTS;
+      const SAT = HEAT_SCORE_SATURATION;
+      const n_l3      = clamp(hrs_l3 / SAT.l3,           0, 1);
+      const n_l5      = clamp(hrs_l5 / SAT.l5,           0, 1);
+      const n_l7d     = clamp(hrs_l7d / SAT.l7d,         0, 1);
+      // Season power: actual normalized, OR 0.7 floor for elite power hitters
+      // when their current-season count hasn't caught up to their track record.
+      const ELITE_SEASON_POWER_FLOOR = 0.7;
+      const n_season_actual = clamp(season_hr / SAT.season, 0, 1);
+      const n_season  = isElitePower
+        ? Math.max(n_season_actual, ELITE_SEASON_POWER_FLOOR)
+        : n_season_actual;
+      const n_pitcher = clamp(pitcher_l14d / SAT.pitcher_l14d, 0, 1);
+      const n_park    = clamp(venue_l14d / SAT.park_l14d,      0, 1);
+
+      let raw_hand_edge = 0;
+      if (pitcher.hand === 'L' || pitcher.hand === 'R') {
+        const vs = pitcher.hand === 'L' ? a.vs_lhp : a.vs_rhp;
+        const denom = a.known_hand_hrs || 0;
+        if (denom > 0) raw_hand_edge = clamp((vs / denom) * SAT.hand, 0, SAT.hand);
+      }
+      const n_hand    = raw_hand_edge / SAT.hand; // 0..1
+      const n_weather = 0; // placeholder until weather data is wired
+
+      // ---- stability factor: dampens recent-form contributions when the
+      //      player has a thin season HR baseline. Elite power hitters get
+      //      a lifted effective_season_hr so a slow-start Judge isn't
+      //      dampened the same way a true fringe hitter would be.
+      const stab     = stabilityFactor(season_hr, isElitePower);
+      const stab_raw = stabilityFactor(season_hr, false); // for raw-score comparison
+
+      // ---- contributions (points) ----
+      // Recent-form contributions get the stability dampener applied.
+      const c_l3      = W.l3      * n_l3      * stab;
+      const c_l5      = W.l5      * n_l5      * stab;
+      const c_l7d     = W.l7d     * n_l7d     * stab;
+      // Season power / matchup / venue / weather are NOT dampened.
+      const c_season  = W.season  * n_season;
+      const c_pitcher = W.pitcher * n_pitcher;
+      const c_park    = W.park    * n_park;
+      const c_hand    = W.hand    * n_hand;
+      const c_weather = W.weather * n_weather;
+
+      // ---- raw heat (no Power Floor, no cap) — for transparency ----
+      // Shows the user what the score would be without elite adjustments
+      // or the low-power cap. We use the same formula but with
+      // un-floored season_power and un-elite stability.
+      const heat_raw = (
+        W.l3 * n_l3 * stab_raw +
+        W.l5 * n_l5 * stab_raw +
+        W.l7d * n_l7d * stab_raw +
+        W.season * n_season_actual +
+        c_pitcher + c_park + c_hand + c_weather
+      );
+
+      // ---- adjusted heat ----
+      let heat = c_l3 + c_l5 + c_l7d + c_season + c_pitcher + c_park + c_hand + c_weather;
+      const adjustments: { label: string; delta: number }[] = [];
+
+      // Track Power Floor boost (combined season + stability lift)
+      const powerFloorDelta = heat - heat_raw;
+      if (isElitePower && powerFloorDelta > 0.05) {
+        adjustments.push({
+          label: isAutoElite && !isCuratedElite
+            ? 'Power Floor (12+ season HR, auto)'
+            : 'Power Floor (curated elite)',
+          delta: round1(powerFloorDelta),
+        });
+      }
+
+      // Low-power cap: non-elite player with sub-5 season HR and no
+      // calendar-recent streak. Caps how high they can rank so a single
+      // matchup edge doesn't put a fringe hitter into the Top 10.
+      // hrs_l7d ≥ 2 (real 7-day streak) exempts.
+      const C = HEAT_SCORE_LOW_POWER_CAP;
+      const lowPowerCapEligible = !isElitePower
+        && season_hr < C.season_hr_max
+        && hrs_l7d < C.l7d_exemption;
+      if (lowPowerCapEligible && heat > C.cap) {
+        const before = heat;
+        heat = C.cap;
+        adjustments.push({
+          label: `Low-power cap (≤${C.cap}; <${C.season_hr_max} season HR + <${C.l7d_exemption} HR L7d)`,
+          delta: round1(heat - before),
+        });
+      }
+
+      const subscores: HrTargetSubscores = {
+        l3: round2(n_l3),
+        l5: round2(n_l5),
+        l7d: round2(n_l7d),
+        season: round2(n_season),
+        pitcher: round2(n_pitcher),
+        park: round2(n_park),
+        hand: round2(n_hand),
+        weather: round2(n_weather),
+        contributions: {
+          l3: round1(c_l3),
+          l5: round1(c_l5),
+          l7d: round1(c_l7d),
+          season: round1(c_season),
+          pitcher: round1(c_pitcher),
+          park: round1(c_park),
+          hand: round1(c_hand),
+          weather: round1(c_weather),
+        },
+      };
+
+      const breakdown: HrTargetBreakdown = {
+        season_power_score: round1(c_season),
+        recent_form_score: round1(c_l3 + c_l5 + c_l7d),
+        pitcher_score: round1(c_pitcher),
+        handedness_score: round1(c_hand),
+        venue_score: round1(c_park),
+        weather_score: round1(c_weather),
+        stability_factor: round2(stab),
+        raw_score: round1(heat_raw),
+        adjustments,
+        final_heat_score: round1(heat),
+      };
+
+      const target: HrTarget = {
+        player_id: a.player_id,
+        player_name: a.name,
+        team,
+        opponent,
+        venue_name: venueName,
+        pitcher_id: pitcher.id,
+        pitcher_name: pitcher.name,
+        pitcher_hand: pitcher.hand,
+        batter_side: a.batter_side,
+        hrs_l2,
+        hrs_l3,
+        hrs_l5,
+        hrs_l7d,
+        hr_streak,
+        season_hr,
+        vs_lhp_season: a.vs_lhp,
+        vs_rhp_season: a.vs_rhp,
+        heat_score: round1(heat),
+        subscores,
+        breakdown,
+        reasons: [],
+        pitcher_l14d_allowed: pitcher_l14d,
+        pitcher_l3_starts_allowed: pitcher_l3_starts,
+        pitcher_l5_starts_allowed: pitcher_l5_starts,
+        pitcher_season_allowed: pitcher_season,
+        pitcher_starts_known: pitcher_starts_known,
+        venue_l14d_hrs: venue_l14d,
+        venue_l14d_rank: venue_rank,
+        venue_total,
+        is_elite_power: isElitePower,
+      };
+      target.reasons = pickReasons(target);
+      return target;
+    });
+
+    targets.sort(
+      (x, y) =>
+        y.heat_score - x.heat_score ||
+        y.season_hr - x.season_hr ||
+        x.player_name.localeCompare(y.player_name),
+    );
+    return targets.slice(0, limit);
+  }
+
+  return games.map<HrTargetsBoard>((g) => {
+    const homeFacing = {
+      id: g.away_probable_pitcher_id,
+      name: g.away_probable_pitcher_name ?? 'TBD',
+      hand: g.away_probable_pitcher_hand ?? (g.away_probable_pitcher_id != null ? pitcherIndex.get(g.away_probable_pitcher_id)?.pitcher_throws ?? null : null),
+    };
+    const awayFacing = {
+      id: g.home_probable_pitcher_id,
+      name: g.home_probable_pitcher_name ?? 'TBD',
+      hand: g.home_probable_pitcher_hand ?? (g.home_probable_pitcher_id != null ? pitcherIndex.get(g.home_probable_pitcher_id)?.pitcher_throws ?? null : null),
+    };
+
+    return {
+      game_pk: g.game_pk,
+      game_date: g.game_date,
+      away_team: g.away_team,
+      home_team: g.home_team,
+      venue_name: g.venue_name,
+      away_facing: awayFacing,
+      home_facing: homeFacing,
+      away_targets: rankForTeam(g.away_team, g.home_team, g.venue_name, awayFacing),
+      home_targets: rankForTeam(g.home_team, g.away_team, g.venue_name, homeFacing),
+    };
+  });
+}
+
+// ---------- filtering helpers ----------
+
+export function applyFilters(
+  rows: HomeRunRow[],
+  opts: { team?: string; search?: string },
+): HomeRunRow[] {
+  const team = opts.team?.trim() ?? '';
+  const search = opts.search?.trim().toLowerCase() ?? '';
+  if (!team && !search) return rows;
+  return rows.filter((r) => {
+    if (team && r.team !== team) return false;
+    if (search && !r.player_name.toLowerCase().includes(search)) return false;
+    return true;
+  });
+}

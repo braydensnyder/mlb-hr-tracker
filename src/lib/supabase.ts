@@ -1,0 +1,258 @@
+import { createClient } from '@supabase/supabase-js';
+
+/**
+ * Browser Supabase client — uses the *anon* key. RLS allows read-only access
+ * to the three public tables; writes happen exclusively from backend scripts.
+ */
+const url = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+const key = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
+
+if (!url || !key) {
+  // Don't crash the app — just log; the UI surfaces a helpful error too.
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[supabase] VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY are not set. ' +
+      'Copy .env.example to .env and restart `npm run dev`.',
+  );
+}
+
+export const supabase = createClient(url ?? 'http://invalid', key ?? 'invalid');
+
+// ---- Row types matching the SQL schema ----
+// HomeRunRow lives in stats.ts so the model is fully self-contained for
+// node scripts. Re-exported here so existing frontend code (which imports
+// from supabase) keeps working unchanged.
+export type { HomeRunRow } from './stats';
+
+export interface PlayerSummaryRow {
+  player_id: number;
+  player_name: string;
+  date: string;
+  team: string;
+  hrs_today: number;
+  season_total: number;
+  hrs_last_3_games: number;
+  hrs_last_5_games: number;
+  hrs_last_7_days: number;
+  last_hr_date: string | null;
+}
+
+export interface GameRow {
+  game_pk: number;
+  game_date: string;
+  home_team: string;
+  away_team: string;
+  status: string;
+  processed: boolean;
+  processed_at: string | null;
+
+  // Matchup context (may be null until MLB announces probables)
+  venue_id: number | null;
+  venue_name: string | null;
+  home_probable_pitcher_id: number | null;
+  home_probable_pitcher_name: string | null;
+  home_probable_pitcher_hand: string | null;
+  away_probable_pitcher_id: number | null;
+  away_probable_pitcher_name: string | null;
+  away_probable_pitcher_hand: string | null;
+}
+
+/** Canonical players catalog. The frontend prefers `current_team_name` from
+ *  this table over the per-HR `team` field (which can be a non-MLB name
+ *  like "United States" for WBC games). Maintained by `npm run enrich:players`. */
+export interface PlayerRow {
+  player_id: number;
+  full_name: string;
+  current_team_id: number | null;
+  current_team_name: string | null;
+  primary_position: string | null;
+  bat_side: string | null;
+  pitch_hand: string | null;
+  birth_country: string | null;
+  active: boolean;
+}
+
+/** Canonical venues catalog. */
+export interface VenueRow {
+  venue_id: number;
+  name: string;
+  city: string | null;
+  state: string | null;
+}
+
+/**
+ * Fetch all rows from the canonical `players` table and return them as a
+ * Map<player_id, { team, full_name }>. Cheap query (small table) — call
+ * once per page load. Frontend uses this to remap each HR row's per-game
+ * team string to the player's current MLB team before aggregating.
+ */
+export async function fetchPlayerIndex(): Promise<Map<number, { team: string | null; full_name: string | null }>> {
+  const all: PlayerRow[] = [];
+  const PAGE = 1000;
+  for (let page = 0; ; page++) {
+    const from = page * PAGE;
+    const to = from + PAGE - 1;
+    const { data, error } = await supabase
+      .from('players')
+      .select('player_id, full_name, current_team_name')
+      .range(from, to);
+    if (error) throw new Error(error.message);
+    const rows = (data ?? []) as Pick<PlayerRow, 'player_id' | 'full_name' | 'current_team_name'>[];
+    for (const r of rows) {
+      all.push({ ...r, current_team_id: null, primary_position: null, bat_side: null, pitch_hand: null, birth_country: null, active: true });
+    }
+    if (rows.length < PAGE) break;
+  }
+  const m = new Map<number, { team: string | null; full_name: string | null }>();
+  for (const p of all) {
+    m.set(p.player_id, { team: p.current_team_name, full_name: p.full_name });
+  }
+  return m;
+}
+
+/** One row per (game_id, pitcher_id) for every starting pitcher (canonical
+ *  shape per migration 006). Drives accurate "HR allowed L3 starts / L5
+ *  starts / L14d / season" on the HR Targets page. Populated by
+ *  processDate (forward) and `npm run enrich:pitcher-starts` (backfill). */
+export interface PitcherStartRow {
+  game_id: number;
+  game_date: string;
+  pitcher_id: number;
+  pitcher_name: string | null;
+  pitcher_hand: string | null;
+  team_id: number | null;
+  team_name: string | null;
+  opponent_id: number | null;
+  opponent_name: string | null;
+  venue_id: number | null;
+  venue_name: string | null;
+  innings_pitched: number | null;
+  hits_allowed: number | null;
+  earned_runs: number | null;
+  home_runs_allowed: number;
+  walks: number | null;
+  strikeouts: number | null;
+  pitches: number | null;
+  decision: string | null;
+}
+
+/**
+ * For each pitcher_id, compute real "form" from `pitcher_starts`:
+ *   - season HR allowed (current calendar year, ≤ asOf)
+ *   - HR allowed in last 3 / 5 starts
+ *   - HR allowed in last 14 calendar days
+ *
+ * Returns an empty map when no rows exist (frontend gracefully falls back
+ * to the home_runs approximation in that case). Designed for ≤ a few
+ * hundred pitcher_ids per call — fine to pass every probable id on a date.
+ */
+export async function fetchPitcherFormIndex(
+  pitcherIds: number[],
+  asOf: string,
+): Promise<Map<number, {
+  pitcher_id: number;
+  pitcher_throws: string | null;
+  starts_count: number;
+  season_hr_allowed: number;
+  hr_allowed_l3_starts: number;
+  hr_allowed_l5_starts: number;
+  hr_allowed_l14d: number;
+}>> {
+  const result = new Map<number, {
+    pitcher_id: number;
+    pitcher_throws: string | null;
+    starts_count: number;
+    season_hr_allowed: number;
+    hr_allowed_l3_starts: number;
+    hr_allowed_l5_starts: number;
+    hr_allowed_l14d: number;
+  }>();
+  if (pitcherIds.length === 0) return result;
+
+  const yearStart = `${asOf.slice(0, 4)}-01-01`;
+
+  // Postgres has a hard cap on .in() of ~1000 values. We're well below that
+  // in practice, but slice into safe chunks just in case.
+  const CHUNK = 200;
+  const allStarts: PitcherStartRow[] = [];
+  for (let i = 0; i < pitcherIds.length; i += CHUNK) {
+    const slice = pitcherIds.slice(i, i + CHUNK);
+    const { data, error } = await supabase
+      .from('pitcher_starts')
+      .select('*')
+      .in('pitcher_id', slice)
+      .gte('game_date', yearStart)
+      .lte('game_date', asOf)
+      .order('game_date', { ascending: false });
+    if (error) throw new Error(error.message);
+    allStarts.push(...((data ?? []) as PitcherStartRow[]));
+  }
+
+  const fourteenStart = (() => {
+    const [y, m, d] = asOf.split('-').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() - 13);
+    return dt.toISOString().slice(0, 10);
+  })();
+
+  // Group rows by pitcher; rows are already desc by game_date.
+  const buckets = new Map<number, PitcherStartRow[]>();
+  for (const s of allStarts) {
+    let arr = buckets.get(s.pitcher_id);
+    if (!arr) { arr = []; buckets.set(s.pitcher_id, arr); }
+    arr.push(s);
+  }
+
+  for (const [pid, starts] of buckets) {
+    const last3 = starts.slice(0, 3);
+    const last5 = starts.slice(0, 5);
+    const sum = (rows: PitcherStartRow[]) => rows.reduce((s, r) => s + (r.home_runs_allowed ?? 0), 0);
+    const l14 = starts.filter((r) => r.game_date >= fourteenStart).reduce((s, r) => s + (r.home_runs_allowed ?? 0), 0);
+    // pitcher_hand — prefer most recent non-null value
+    const hand = starts.find((s) => s.pitcher_hand)?.pitcher_hand ?? null;
+
+    result.set(pid, {
+      pitcher_id: pid,
+      pitcher_throws: hand,
+      starts_count: starts.length,
+      season_hr_allowed: sum(starts),
+      hr_allowed_l3_starts: sum(last3),
+      hr_allowed_l5_starts: sum(last5),
+      hr_allowed_l14d: l14,
+    });
+  }
+  return result;
+}
+
+/** One row from hr_target_snapshots — a persisted Top-N HR target ranking
+ *  for a target_date. Drives the Backtest page (compares ranking vs. actual HRs). */
+export interface HrTargetSnapshotRow {
+  id: number;
+  target_date: string;        // YYYY-MM-DD (the day games are predicted FOR)
+  snapshot_date: string;      // timestamptz — when this row was written
+  player_id: number;
+  game_pk: number;
+  rank: number;               // 1-based across all targets that day
+  player_name: string;
+  team: string;
+  opponent: string;
+  heat_score: number;
+  reason: string | null;
+  /** 'live' = honest pre-game snapshot (taken before first pitch).
+   *  'simulated' = historical backfill via snapshot:range OR taken after games started. */
+  snapshot_type: 'live' | 'simulated';
+  created_at: string;
+}
+
+/** Derived venue HR cache, maintained by `npm run enrich:venues`. */
+export interface VenueSummaryRow {
+  venue_id: number;
+  venue_name: string;
+  computed_for: string;
+  hrs_season: number;
+  hrs_l7d: number;
+  hrs_l14d: number;
+  unique_hitters: number;
+  teams_seen: string[];
+  updated_at: string;
+}
