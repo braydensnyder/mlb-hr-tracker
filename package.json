@@ -1,7 +1,7 @@
 {
   "name": "hr-tracker",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "MVP web app for tracking MLB home runs by player day-by-day, with rolling stats.",
   "scripts": {
