@@ -1,16 +1,28 @@
 # ─────────────────────────────────────────────────────────────────────────
 # DEPRECATED — superseded by .github/workflows/update-daily.yml
 #
-# This file used to define the scheduled update workflow. It has been
-# disabled (no `on:` triggers, no jobs) so it will NEVER run. Kept in
-# the repo only so existing references don't 404; safe to delete via:
+# This file used to define the scheduled update workflow. It's been
+# reduced to a manual-only no-op so it never auto-runs but still passes
+# GitHub Actions workflow-schema validation.
 #
+# Safe to delete entirely:
 #   git rm .github/workflows/update.yml
 #   git commit -m "chore: remove deprecated update.yml workflow"
+#   git push
 #
-# All scheduled work is now in update-daily.yml.
+# All scheduled work is in update-daily.yml.
 # ─────────────────────────────────────────────────────────────────────────
 name: HR Tracker — DEPRECATED (see update-daily.yml)
 
-on: {}     # no triggers — workflow will not run
-jobs: {}   # no jobs — workflow has nothing to do
+on:
+  workflow_dispatch:   # manual-only — never runs on its own
+
+jobs:
+  noop:
+    name: This workflow is deprecated
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "::warning::This workflow is deprecated. The active scheduled"
+          echo "::warning::workflow is .github/workflows/update-daily.yml."
+          echo "::warning::Delete this file with: git rm .github/workflows/update.yml"
