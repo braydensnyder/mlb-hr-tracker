@@ -435,29 +435,31 @@ eq('Judge raw_score == final_heat_score (no adjustments)', judge.breakdown.raw_s
 // Judge should be ranked above LeMahieu in this team panel
 eq('Judge is #1 NYY target', tBoard.home_targets[0].player_id, 100);
 // ---- specific, numeric reason strings ----
-// Judge: 2 HR in last 2 games (L2 takes precedence over L3)
+// Judge: 2 HR over last 2 HR games (L2 takes precedence over L3)
 //      + 5 HR vs RHP this season
-//      + Pitcher allowed 6 HR in last 3 starts
+//      + Pitcher allowed 8 HR in last 5 starts (real pitcher_starts data)
 //      + Venue top 1 HR park in L14d
 //      + (meta) "Hot streak + favorable matchup" when 2+ heavy signals stack
+//
+// Wording changed (task #152): "2 HR in last 2 games" → "2 HR over last 2
+// HR games" because the count is across the player's 2 most-recent
+// distinct HR-DATES, not literal last 2 MLB games played. Pitcher-
+// narrative tags like "RHP allowing elevated HR rate" were removed in
+// favor of strictly numeric phrasing.
 const judgeReasons = judge.reasons;
-eq('Judge reasons include L2 phrasing "2 HR in last 2 games"', judgeReasons.some((r) => r === '2 HR in last 2 games'), true);
+eq(
+  'Judge reasons include L2 phrasing "2 HR over last 2 HR games"',
+  judgeReasons.some((r) => r === '2 HR over last 2 HR games'),
+  true,
+);
 // With pitcher_starts data (starts_known=8 ≥3), prefer L5-starts phrasing for the HR-prone pitcher.
 eq('Judge reasons include L5-starts pitcher count', judgeReasons.some((r) => r === 'Pitcher allowed 8 HR in last 5 starts'), true);
 eq('Judge reasons include meta tag when signals stack', judgeReasons.some((r) => r === 'Hot streak + favorable matchup'), true);
-// New pitcher-quality narrative tag should surface when L5 starts allowed ≥5
-eq('Judge reasons include RHP elevated tag', judgeReasons.some((r) => r === 'RHP allowing elevated HR rate'), true);
 // We surface up to 4, prioritized by weight — each must be either numeric-specific
 // or a known narrative tag.
 eq('Judge has at most 4 reasons', judge.reasons.length <= 4, true);
 const KNOWN_META = new Set([
   'Hot streak + favorable matchup',
-  'RHP allowing elevated HR rate',
-  'LHP allowing elevated HR rate',
-  'Pitcher allowing elevated HR rate',
-  'Weak HR suppression recently',
-  'Strong vs RHP',
-  'Strong vs LHP',
 ]);
 const allSpecificOrMeta = judge.reasons.every((r) => /\d/.test(r) || KNOWN_META.has(r));
 eq('Judge reasons all specific or known meta', allSpecificOrMeta, true);

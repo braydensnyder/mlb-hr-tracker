@@ -881,13 +881,21 @@ export interface HrTargetBreakdown {
   handedness_score: number;      // handedness vs probable
   venue_score: number;           // park contribution
   weather_score: number;         // 0 today; placeholder
+  /** Combined negative-weighting adjustment applied to this target.
+   *  Sum of all penalties (≤ 0). Examples:
+   *    - Cold-streak (elite slugger gone quiet for L5+L7d) → -10
+   *    - Cold-streak (moderate power gone quiet) → -5
+   *    - Facing dominant pitcher (K/9 ≥ 11 with 0-1 HR allowed L5 starts) → -8
+   *    - Facing high-K pitcher (K/9 ≥ 11) with no HR boost → -4
+   *  Adjustments list below contains the human-readable breakdown. */
+  cold_penalty: number;
   /** Multiplier (0.35..1.0) applied to recent-form contributions when
    *  season HR baseline is low. Lower = stronger dampening. */
   stability_factor: number;
-  /** Heat score BEFORE Power Floor or Low-power cap. Shown for transparency. */
+  /** Heat score BEFORE Power Floor, Low-power cap, or cold/pitcher penalties. */
   raw_score: number;
   /** Human-readable list of adjustments applied between raw_score and final_heat_score.
-   *  Positive delta = boost (Power Floor); negative delta = cap. */
+   *  Positive delta = boost (Power Floor); negative delta = cap or penalty. */
   adjustments: { label: string; delta: number }[];
   final_heat_score: number;      // mirror of HrTarget.heat_score (post-adjustments)
 }
@@ -950,6 +958,10 @@ export interface HrTarget {
   pitcher_season_allowed: number;
   /** How many starts we have on file for this pitcher. 0 = approximation from home_runs. */
   pitcher_starts_known: number;
+  /** Recent K/9. undefined when starts data is too thin to compute. */
+  pitcher_k_per_9: number | null;
+  /** Recent BB/9. undefined when starts data is too thin to compute. */
+  pitcher_bb_per_9: number | null;
   venue_l14d_hrs: number;
   /** 1-based rank of this venue in the league by L14d HRs. null if no venue. */
   venue_l14d_rank: number | null;
@@ -1058,36 +1070,44 @@ function pickReasons(t: HrTarget): string[] {
   const c = t.subscores.contributions;
 
   // ----- recent form: pick the SHARPEST window that is non-trivial -----
+  // Phrasing note: "last N HR games" is honest — these counts are computed
+  // across the player's N most recent distinct HR-DATES, NOT the literal last
+  // N MLB games played (we have HR-event data only, not at-bat data).
   if (t.hrs_l2 >= 2) {
-    // "3 HR in last 2 games" — the user's example
-    candidates.push({ weight: 30 + 5 * t.hrs_l2, text: `${t.hrs_l2} HR in last 2 games` });
+    candidates.push({ weight: 30 + 5 * t.hrs_l2, text: `${t.hrs_l2} HR over last 2 HR games` });
   } else if (t.hrs_l3 >= 2) {
-    candidates.push({ weight: 25 + 3 * t.hrs_l3, text: `${t.hrs_l3} HR in last 3 games` });
+    candidates.push({ weight: 25 + 3 * t.hrs_l3, text: `${t.hrs_l3} HR over last 3 HR games` });
   } else if (t.hrs_l5 >= 3) {
-    candidates.push({ weight: 18 + 2 * t.hrs_l5, text: `${t.hrs_l5} HR in last 5 games` });
+    candidates.push({ weight: 18 + 2 * t.hrs_l5, text: `${t.hrs_l5} HR over last 5 HR games` });
   } else if (t.hrs_l7d >= 3) {
-    candidates.push({ weight: 15 + t.hrs_l7d, text: `${t.hrs_l7d} HR in last 7 days` });
+    candidates.push({ weight: 15 + t.hrs_l7d, text: `${t.hrs_l7d} HR in last 7 calendar days` });
   } else if (t.hrs_l5 >= 2) {
-    candidates.push({ weight: 10 + t.hrs_l5, text: `${t.hrs_l5} HR in last 5 games` });
+    candidates.push({ weight: 10 + t.hrs_l5, text: `${t.hrs_l5} HR over last 5 HR games` });
   }
 
-  // Consecutive HR-day streak — distinct signal from L3 HR count
+  // Consecutive HR-DAY streak — distinct signal from L3 HR count.
+  // "Straight games" was misleading because off-days break calendar streaks
+  // without breaking real game streaks. Use precise wording.
   if (t.hr_streak >= 3) {
-    candidates.push({ weight: 18 + t.hr_streak, text: `HR in ${t.hr_streak} straight games` });
+    candidates.push({ weight: 18 + t.hr_streak, text: `HR on ${t.hr_streak} consecutive calendar days` });
   }
 
   // ----- season power -----
   if (t.season_hr >= 25) {
-    // Elite power profile: gets its own narrative tag in addition to the count.
     candidates.push({ weight: c.season + 4, text: `Elite power profile (${t.season_hr} season HR)` });
   } else if (t.season_hr >= 15) {
     candidates.push({ weight: c.season + t.season_hr / 8, text: `${t.season_hr} season HR` });
-  } else if (t.season_hr >= 5 && c.season >= 1) {
-    // Mid-power batters still get a reason if nothing flashier is there
+  } else if (t.season_hr >= 8 && c.season >= 1) {
+    // Mid-power batters with a meaningful contribution get a reason.
+    // Tightened the floor from 5 → 8 so a 5-HR slap hitter doesn't get
+    // a season-power reason fluff-attached to the row.
     candidates.push({ weight: c.season, text: `${t.season_hr} season HR` });
   }
 
-  // ----- handedness edge -----
+  // ----- handedness edge — STRICT data backing -----
+  // Removed the old "Strong vs LHP" wording. We now ONLY surface
+  // handedness when there's a concrete count to back it up, and we
+  // always include the count so the user can verify.
   if (t.pitcher_hand === 'L' || t.pitcher_hand === 'R') {
     const vsCount = t.pitcher_hand === 'L' ? t.vs_lhp_season : t.vs_rhp_season;
     if (vsCount >= 3 && c.hand >= 1.5) {
@@ -1095,41 +1115,54 @@ function pickReasons(t: HrTarget): string[] {
         weight: c.hand + 1.5,
         text: `${vsCount} HR vs ${t.pitcher_hand}HP this season`,
       });
-    } else if (c.hand >= 3.5) {
-      // Strong edge ratio even on a low absolute count → still worth surfacing
-      candidates.push({ weight: c.hand, text: `Strong vs ${t.pitcher_hand}HP` });
     }
   }
 
   // ----- pitcher weakness, with concrete count -----
-  // Prefer the L3-starts phrasing only when we have real starts data; otherwise
-  // the count can be misleadingly low for HR-suppressing pitchers (0-HR starts
-  // don't appear in home_runs). With real pitcher_starts data we trust both.
+  // STRICT change: "Pitcher allowed N HR in last 3/5 starts" now requires
+  // real pitcher_starts data (starts_known ≥ 3). Without it, the L3/L5
+  // counts come from the home_runs-only approximation, which counts
+  // "distinct HR-allowed dates" not "actual last 5 starts" — that was
+  // the source of misleading recent-form text for pitchers.
   const havePitcherStarts = t.pitcher_starts_known >= 3;
   if (havePitcherStarts && t.pitcher_l5_starts_allowed >= 4) {
     candidates.push({
       weight: c.pitcher + t.pitcher_l5_starts_allowed,
       text: `Pitcher allowed ${t.pitcher_l5_starts_allowed} HR in last 5 starts`,
     });
-  } else if (t.pitcher_l3_starts_allowed >= 3) {
+  } else if (havePitcherStarts && t.pitcher_l3_starts_allowed >= 3) {
     candidates.push({
       weight: c.pitcher + t.pitcher_l3_starts_allowed,
       text: `Pitcher allowed ${t.pitcher_l3_starts_allowed} HR in last 3 starts`,
     });
   } else if (t.pitcher_l14d_allowed >= 3) {
+    // L14d is calendar-honest and works without pitcher_starts data.
     candidates.push({
       weight: c.pitcher,
       text: `Pitcher allowed ${t.pitcher_l14d_allowed} HR in last 14 days`,
     });
   }
 
-  // Pitcher-quality narrative tag (no specific count needed).
-  // Elevated rate: a starter who's actively giving up HRs across recent starts.
-  const handLabel = t.pitcher_hand ? `${t.pitcher_hand}HP` : 'Pitcher';
-  if (havePitcherStarts && t.pitcher_l5_starts_allowed >= 5) {
-    candidates.push({ weight: c.pitcher + 0.5, text: `${handLabel} allowing elevated HR rate` });
-  } else if (t.pitcher_l14d_allowed >= 4) {
-    candidates.push({ weight: c.pitcher + 0.5, text: 'Weak HR suppression recently' });
+  // Pitcher quality — NEGATIVE side. When facing a dominant arm we
+  // surface that so the user understands why the model penalized the row.
+  if (t.pitcher_k_per_9 != null && havePitcherStarts) {
+    if (t.pitcher_k_per_9 >= 11 && t.pitcher_l5_starts_allowed <= 1) {
+      candidates.push({
+        weight: 20,
+        text: `Facing dominant pitcher (K/9 ${t.pitcher_k_per_9.toFixed(1)}, ${t.pitcher_l5_starts_allowed} HR L5 starts)`,
+      });
+    } else if (t.pitcher_k_per_9 >= 11) {
+      candidates.push({
+        weight: 12,
+        text: `Facing high-K pitcher (K/9 ${t.pitcher_k_per_9.toFixed(1)})`,
+      });
+    }
+  }
+  if (t.pitcher_bb_per_9 != null && havePitcherStarts && t.pitcher_bb_per_9 >= 4.5) {
+    candidates.push({
+      weight: 10,
+      text: `Wild pitcher (BB/9 ${t.pitcher_bb_per_9.toFixed(1)})`,
+    });
   }
 
   // ----- park boost: rank-based when in top 5 -----
@@ -1145,11 +1178,23 @@ function pickReasons(t: HrTarget): string[] {
     });
   }
 
+  // ----- cold-streak surface — NEGATIVE -----
+  // Mirror the scoring penalty so the user sees WHY a power hitter is
+  // ranked lower than usual. Same threshold as the scoring rule.
+  const isQuiet = t.hrs_l5 === 0 && t.hrs_l7d === 0;
+  if (isQuiet && t.season_hr >= HEAT_SCORE_STABILITY.auto_elite_hr) {
+    candidates.push({
+      weight: 16,
+      text: `Cold — 0 HR L5 games + 0 HR L7 days (${t.season_hr} season HR)`,
+    });
+  } else if (isQuiet && t.season_hr >= 8) {
+    candidates.push({
+      weight: 8,
+      text: `Cold — 0 HR L5 games + 0 HR L7 days`,
+    });
+  }
+
   // ----- META: two strong signals stacked -----
-  // "Recent form" here checks the UN-DAMPENED normalized subscores so the
-  // meta-tag still fires when a real streak exists even if the stability
-  // factor dropped the contributions. The matchup checks use contributions
-  // because those aren't dampened by stability.
   const W = HEAT_SCORE_WEIGHTS;
   const recentSignal  = (t.subscores.l3 + t.subscores.l5) >= 1.4; // ≥70% of 2.0 max
   const pitcherSignal = c.pitcher >= 0.6 * W.pitcher;
@@ -1162,8 +1207,10 @@ function pickReasons(t: HrTarget): string[] {
 
   candidates.sort((a, b) => b.weight - a.weight);
   if (candidates.length === 0) {
-    if (t.season_hr > 0) return [`${t.season_hr} season HR`];
-    return [];
+    // STRICT honesty rule: do NOT invent a season-HR fallback. If we
+    // genuinely have nothing specific to say, say so. The expanded row
+    // still shows the subscore numbers, so the user can verify directly.
+    return t.season_hr === 0 ? ['recent form unavailable'] : [];
   }
 
   // De-dup by text (meta tag can echo a recent-form theme; pick highest weight version)
@@ -1190,6 +1237,12 @@ export interface PitcherFormLite {
   season_hr_allowed?: number;
   /** How many starts we have data for. 0 = approximation from home_runs. */
   starts_known?: number;
+  /** Strikeouts per 9 innings across the starts we have on file.
+   *  Only meaningful when sourced from pitcher_starts AND starts_known ≥ 3
+   *  AND total innings_pitched ≥ 18 (≈3 full starts). undefined otherwise. */
+  k_per_9?: number;
+  /** Walks per 9 innings. Same caveats as k_per_9. */
+  bb_per_9?: number;
 }
 
 interface VenueFormLite {
@@ -1252,6 +1305,10 @@ export function computeHrTargets(
     const pitcher_l5_starts = pitcherForm?.allowed_last_5_starts ?? pitcher_l3_starts;
     const pitcher_season   = pitcherForm?.season_hr_allowed ?? 0;
     const pitcher_starts_known = pitcherForm?.starts_known ?? 0;
+    // K/9 and BB/9 — only meaningful when we have real pitcher_starts data.
+    // The home_runs approximation can't compute these (no IP / K / BB info).
+    const pitcher_k_per_9  = pitcher_starts_known >= 3 ? pitcherForm?.k_per_9 ?? null : null;
+    const pitcher_bb_per_9 = pitcher_starts_known >= 3 ? pitcherForm?.bb_per_9 ?? null : null;
 
     // Per-venue form — fallback 0
     const venueForm = venueName ? venueIndex.get(venueName) ?? null : null;
@@ -1394,6 +1451,74 @@ export function computeHrTargets(
         });
       }
 
+      // ---- NEGATIVE WEIGHTING ----
+      // Tracks penalties separately so the UI can show a single
+      // `cold_penalty` summary and the operator can see each component
+      // in `adjustments`. All deltas are ≤ 0.
+      let cold_penalty = 0;
+
+      // (a) Cold-streak penalty: power hitter has gone genuinely quiet
+      //     by both rolling-game and calendar measures. We require BOTH
+      //     hrs_l5 === 0 AND hrs_l7d === 0 so a single L5 stretch with
+      //     a recent calendar HR doesn't trigger it.
+      const isQuiet = hrs_l5 === 0 && hrs_l7d === 0;
+      if (isQuiet && season_hr >= HEAT_SCORE_STABILITY.auto_elite_hr) {
+        const penalty = -10;
+        heat += penalty;
+        cold_penalty += penalty;
+        adjustments.push({
+          label: `Cold streak — 0 HR L5 games + 0 HR L7 days (${season_hr} season HR)`,
+          delta: penalty,
+        });
+      } else if (isQuiet && season_hr >= 8) {
+        const penalty = -5;
+        heat += penalty;
+        cold_penalty += penalty;
+        adjustments.push({
+          label: `Cold streak — 0 HR L5 games + 0 HR L7 days (${season_hr} season HR)`,
+          delta: penalty,
+        });
+      }
+
+      // (b) Pitcher dominance penalty: facing a starter with elite
+      //     strikeout rate AND a clean HR-allowed record across L5
+      //     starts. Only fires when we have real pitcher_starts data
+      //     so the K/9 number is trustworthy.
+      if (pitcher_k_per_9 != null && pitcher_starts_known >= 3) {
+        if (pitcher_k_per_9 >= 11 && pitcher_l5_starts <= 1) {
+          const penalty = -8;
+          heat += penalty;
+          cold_penalty += penalty;
+          adjustments.push({
+            label: `Facing dominant pitcher (K/9 ${pitcher_k_per_9.toFixed(1)}, ${pitcher_l5_starts} HR L5 starts)`,
+            delta: penalty,
+          });
+        } else if (pitcher_k_per_9 >= 11) {
+          // High-K pitcher without the HR-suppression bonus → still a headwind
+          const penalty = -4;
+          heat += penalty;
+          cold_penalty += penalty;
+          adjustments.push({
+            label: `Facing high-K pitcher (K/9 ${pitcher_k_per_9.toFixed(1)})`,
+            delta: penalty,
+          });
+        }
+      }
+
+      // (c) Pitcher wildness boost: extreme BB/9 means lots of free
+      //     baserunners and mistakes in the zone. Small positive nudge.
+      if (pitcher_bb_per_9 != null && pitcher_starts_known >= 3 && pitcher_bb_per_9 >= 4.5) {
+        const boost = +2;
+        heat += boost;
+        adjustments.push({
+          label: `Wild pitcher (BB/9 ${pitcher_bb_per_9.toFixed(1)})`,
+          delta: boost,
+        });
+      }
+
+      // Heat never goes below 0
+      if (heat < 0) heat = 0;
+
       const subscores: HrTargetSubscores = {
         l3: round2(n_l3),
         l5: round2(n_l5),
@@ -1422,6 +1547,7 @@ export function computeHrTargets(
         handedness_score: round1(c_hand),
         venue_score: round1(c_park),
         weather_score: round1(c_weather),
+        cold_penalty: round1(cold_penalty),
         stability_factor: round2(stab),
         raw_score: round1(heat_raw),
         adjustments,
@@ -1455,6 +1581,8 @@ export function computeHrTargets(
         pitcher_l5_starts_allowed: pitcher_l5_starts,
         pitcher_season_allowed: pitcher_season,
         pitcher_starts_known: pitcher_starts_known,
+        pitcher_k_per_9,
+        pitcher_bb_per_9,
         venue_l14d_hrs: venue_l14d,
         venue_l14d_rank: venue_rank,
         venue_total,

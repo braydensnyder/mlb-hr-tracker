@@ -187,6 +187,16 @@ async function fetchPitcherFormForDate(pitcherIds: number[], asOf: string): Prom
     const sum = (rs: any[]) => rs.reduce((acc, r) => acc + (r.home_runs_allowed ?? 0), 0);
     const l14 = starts.filter((r) => r.game_date >= fourteenStart).reduce((acc, r) => acc + (r.home_runs_allowed ?? 0), 0);
     const hand = starts.find((s) => s.pitcher_hand)?.pitcher_hand ?? null;
+
+    // K/9 and BB/9 — require ≥ 3 starts AND ≥ 18 IP before the rate is
+    // trustworthy enough to drive the pitcher-quality adjustment.
+    const totalIp = starts.reduce((s, r: any) => s + (r.innings_pitched ?? 0), 0);
+    const totalK  = starts.reduce((s, r: any) => s + (r.strikeouts ?? 0), 0);
+    const totalBb = starts.reduce((s, r: any) => s + (r.walks ?? 0), 0);
+    const ratesValid = starts.length >= 3 && totalIp >= 18;
+    const k_per_9  = ratesValid ? Math.round((totalK  * 9 * 100) / totalIp) / 100 : undefined;
+    const bb_per_9 = ratesValid ? Math.round((totalBb * 9 * 100) / totalIp) / 100 : undefined;
+
     out.set(pid, {
       pitcher_id: pid,
       pitcher_throws: hand,
@@ -195,6 +205,8 @@ async function fetchPitcherFormForDate(pitcherIds: number[], asOf: string): Prom
       allowed_last_5_starts: sum(last5),
       season_hr_allowed: sum(starts),
       starts_known: starts.length,
+      k_per_9,
+      bb_per_9,
     });
   }
   return out;

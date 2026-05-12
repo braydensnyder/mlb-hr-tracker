@@ -197,6 +197,8 @@ export default function HrTargets() {
                 allowed_last_5_starts: f.hr_allowed_l5_starts,
                 season_hr_allowed: f.season_hr_allowed,
                 starts_known: f.starts_count,
+                k_per_9: f.k_per_9 ?? undefined,
+                bb_per_9: f.bb_per_9 ?? undefined,
               });
             }
             setPitcherStartsForm(m);
@@ -640,6 +642,11 @@ function MatchupDetail({ t }: { t: HrTarget }) {
         <ScoreCell label="Pitcher" value={b.pitcher_score} max={15} />
         <ScoreCell label="Handedness" value={b.handedness_score} max={10} />
         <ScoreCell label="Venue" value={b.venue_score} max={10} />
+        {/* Cold/penalty cell — only render when non-zero so the model
+            stays readable for clean rows. Negative deltas use a danger color. */}
+        {b.cold_penalty < 0 && (
+          <ScoreCell label="Cold / penalty" value={b.cold_penalty} max={-20} negative />
+        )}
         <ScoreCell label="Final heat" value={b.final_heat_score} max={100} highlight />
       </div>
 
@@ -692,12 +699,20 @@ function MatchupDetail({ t }: { t: HrTarget }) {
               {t.pitcher_l14d_allowed} HR L14d ·{' '}
               {t.pitcher_season_allowed} HR season
               <span style={{ marginLeft: 6, opacity: 0.6 }}>({t.pitcher_starts_known} starts on file)</span>
+              {(t.pitcher_k_per_9 != null || t.pitcher_bb_per_9 != null) && (
+                <div style={{ marginTop: 4 }}>
+                  {t.pitcher_k_per_9 != null && <>K/9 {t.pitcher_k_per_9.toFixed(1)}</>}
+                  {t.pitcher_k_per_9 != null && t.pitcher_bb_per_9 != null && ' · '}
+                  {t.pitcher_bb_per_9 != null && <>BB/9 {t.pitcher_bb_per_9.toFixed(1)}</>}
+                </div>
+              )}
             </>
           ) : (
             <>
               {t.pitcher_l3_starts_allowed} HR last 3 starts* · {t.pitcher_l14d_allowed} HR L14d
               <div style={{ fontSize: 11, marginTop: 2 }}>
                 * approximated from HR rows — run <code>npm run enrich:pitcher-starts</code> for accurate form.
+                K/9 + BB/9 are unavailable until pitcher_starts is backfilled.
               </div>
             </>
           )}
@@ -768,6 +783,7 @@ function ScoreCell({
   max,
   highlight,
   accent,
+  negative,
   subtle,
 }: {
   label: string;
@@ -775,8 +791,18 @@ function ScoreCell({
   max: number;
   highlight?: boolean;
   accent?: boolean;
+  /** Negative-weighting tile (cold penalty, pitcher dominance). Renders
+   *  in danger-red and shows the signed value. */
+  negative?: boolean;
   subtle?: string;
 }) {
+  const valueColor = highlight
+    ? '#1a1206'
+    : negative
+      ? '#ff8d8d'
+      : accent
+        ? 'var(--accent-2)'
+        : 'var(--text)';
   return (
     <div
       style={{
@@ -784,6 +810,7 @@ function ScoreCell({
         borderRadius: 6,
         background: highlight ? 'var(--accent)' : 'transparent',
         color: highlight ? '#1a1206' : undefined,
+        border: negative ? '1px dashed #ff8d8d' : undefined,
       }}
     >
       <div
@@ -797,9 +824,11 @@ function ScoreCell({
       >
         {label}
       </div>
-      <div style={{ fontSize: 16, fontWeight: 700, color: highlight ? '#1a1206' : (accent ? 'var(--accent-2)' : 'var(--text)') }}>
-        {value.toFixed(1)}
-        <span style={{ fontSize: 11, fontWeight: 400, opacity: 0.6, marginLeft: 2 }}>/{max}</span>
+      <div style={{ fontSize: 16, fontWeight: 700, color: valueColor }}>
+        {value >= 0 ? value.toFixed(1) : value.toFixed(1)}
+        <span style={{ fontSize: 11, fontWeight: 400, opacity: 0.6, marginLeft: 2 }}>
+          /{Math.abs(max)}
+        </span>
       </div>
       {subtle && (
         <div style={{ fontSize: 10, color: highlight ? '#1a1206' : 'var(--muted)', marginTop: 2 }}>

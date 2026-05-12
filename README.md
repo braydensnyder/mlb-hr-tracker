@@ -293,6 +293,93 @@ Raw score: 35.4  →  Final: 30.0
  - Low-power cap (≤30; <5 season HR + <2 HR L7d)  (-5.4)
 ```
 
+### Negative weighting — cold streaks + dominant pitchers
+
+Beyond Power Floor and the low-power cap, the model applies a
+**cold_penalty** that subtracts directly from the final heat score and
+is surfaced in the breakdown as its own tile (red dashed border, only
+shown when non-zero):
+
+| Trigger | Delta |
+| --- | ---: |
+| Elite slugger (12+ season HR) AND `hrs_l5 == 0` AND `hrs_l7d == 0` | **−10** |
+| Mid-power (8+ season HR) AND `hrs_l5 == 0` AND `hrs_l7d == 0` | **−5** |
+| Facing dominant pitcher (`k_per_9 ≥ 11` AND `hr_allowed_l5_starts ≤ 1`) | **−8** |
+| Facing high-K pitcher (`k_per_9 ≥ 11`, no HR-suppression bonus) | **−4** |
+| Wild pitcher boost (`bb_per_9 ≥ 4.5`) | **+2** |
+
+The K/9 and BB/9 numbers come from `pitcher_starts` directly — they
+require ≥ 3 starts on file AND ≥ 18 innings pitched before the rate is
+trusted. If a pitcher doesn't have enough innings, the penalty is
+skipped (no fluff).
+
+The expanded row shows K/9 and BB/9 alongside the existing HR-allowed
+counts, so the operator can verify the pitcher-strength penalty against
+the actual numbers.
+
+### Reason text — strict honesty rules
+
+After the audit in task #152, reason strings follow these rules:
+
+- **Numeric or nothing.** Every reason includes the actual count or
+  rate. No vague "Strong vs LHP" — must read `"5 HR vs LHP this season"`.
+- **Honest phrasing for HR-windows.** L2/L3/L5 are computed across the
+  player's most recent *distinct HR-dates*, NOT literal last N MLB
+  games played (we don't have at-bat data). Reasons say
+  `"3 HR over last 3 HR games"` — not `"3 HR in last 3 games"`.
+- **Pitcher last-N-starts requires real data.** The
+  `"Pitcher allowed N HR in last 3/5 starts"` line only fires when
+  `pitcher_starts_known ≥ 3`. Without that, the L3/L5 counts come from
+  the home_runs-only approximation, which counts "distinct HR-allowed
+  dates" not "actual last N starts" — that's now hidden until real data
+  is available.
+- **No season-HR fallback.** When the model has nothing specific to
+  surface, the reason list is empty rather than padded with
+  `"5 season HR"` fluff. A player whose season_hr is 0 gets
+  `"recent form unavailable"`.
+- **Cold-streak surfaced.** When the cold penalty fires, a reason like
+  `"Cold — 0 HR L5 games + 0 HR L7 days (18 season HR)"` is included so
+  the user can see *why* the row was ranked lower.
+
+### Data freshness — what the page reads
+
+The HR Targets page (`/targets`) reads from the *raw tables* every time
+it loads — `home_runs`, `games`, `pitcher_starts`, `players`, `venues`.
+There is no caching layer between the page and Supabase, so the
+"Live Preview" view always reflects the freshest data on file. The
+"Saved Snapshot" view reads from `hr_target_snapshots` — that's the
+honest baseline the morning cron locked in. The page surfaces four
+timestamps in its TimestampPanel:
+
+| Tile | Source |
+| --- | --- |
+| Saved Snapshot generated at | `hr_target_snapshots.snapshot_date` (newest for target_date) |
+| Snapshot type | `hr_target_snapshots.snapshot_type` (live / simulated) |
+| Live Preview rendered at | wall-clock of the in-browser computation |
+| Data last updated at | `MAX(home_runs.created_at)` |
+
+The two are intentionally separate so the operator can spot drift:
+if "Live Preview rendered at" is ten minutes ago but "Data last updated at"
+is from two days ago, that's a signal the cron isn't ingesting new HRs.
+
+### Future work — batter game logs
+
+The current schema stores only HR *events* (`home_runs`) and pitcher
+*starts* (`pitcher_starts`). It does **not** store per-game batter
+boxscore data (at-bats, hits, strikeouts, walks, total bases). That
+limits how granular the negative-weighting can be:
+
+- **Implementable now (this PR):** cold-streak detection via HR drought
+  (proxy for "going quiet"); pitcher dominance via real K/9 + BB/9.
+- **Requires a new ingestion path:** "0-for-4 last game", "3 Ks last
+  game", "BABIP collapsed last 7 days". These need a `batter_game_logs`
+  table populated from MLB's boxscore feed (already pulled today for
+  pitcher_starts — same feed has each hitter's line).
+
+When that data is added, the model can hot-swap in finer penalties
+(e.g. -3 for 2+ Ks last game, -2 for 0-fer last game) using the same
+`adjustments` plumbing already in place.
+
 Then: per-component contribution bars (Season, L3, L5, L7d, Pitcher,
 Park, Hand) and the probable pitcher's HR-allowed line, venue rank,
 and batter splits.

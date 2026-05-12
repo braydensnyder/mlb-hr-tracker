@@ -157,6 +157,11 @@ export async function fetchPitcherFormIndex(
   hr_allowed_l3_starts: number;
   hr_allowed_l5_starts: number;
   hr_allowed_l14d: number;
+  /** K/9 and BB/9 across all on-file starts (current season). Only set
+   *  when starts_count ≥ 3 AND total innings_pitched ≥ 18 (~3 full starts);
+   *  null otherwise so the model can skip the pitcher-quality adjustment. */
+  k_per_9: number | null;
+  bb_per_9: number | null;
 }>> {
   const result = new Map<number, {
     pitcher_id: number;
@@ -166,6 +171,8 @@ export async function fetchPitcherFormIndex(
     hr_allowed_l3_starts: number;
     hr_allowed_l5_starts: number;
     hr_allowed_l14d: number;
+    k_per_9: number | null;
+    bb_per_9: number | null;
   }>();
   if (pitcherIds.length === 0) return result;
 
@@ -211,6 +218,16 @@ export async function fetchPitcherFormIndex(
     // pitcher_hand — prefer most recent non-null value
     const hand = starts.find((s) => s.pitcher_hand)?.pitcher_hand ?? null;
 
+    // K/9 and BB/9 — require ≥ 3 starts AND ≥ 18 IP total before the
+    // ratio is published. Below that, the rate is too noisy to drive
+    // the negative-weighting heuristic.
+    const totalIp = starts.reduce((s, r) => s + (r.innings_pitched ?? 0), 0);
+    const totalK  = starts.reduce((s, r) => s + (r.strikeouts ?? 0), 0);
+    const totalBb = starts.reduce((s, r) => s + (r.walks ?? 0), 0);
+    const ratesValid = starts.length >= 3 && totalIp >= 18;
+    const k_per_9  = ratesValid ? round2((totalK  * 9) / totalIp) : null;
+    const bb_per_9 = ratesValid ? round2((totalBb * 9) / totalIp) : null;
+
     result.set(pid, {
       pitcher_id: pid,
       pitcher_throws: hand,
@@ -219,10 +236,14 @@ export async function fetchPitcherFormIndex(
       hr_allowed_l3_starts: sum(last3),
       hr_allowed_l5_starts: sum(last5),
       hr_allowed_l14d: l14,
+      k_per_9,
+      bb_per_9,
     });
   }
   return result;
 }
+
+function round2(n: number) { return Math.round(n * 100) / 100; }
 
 /**
  * Probe the freshest `home_runs.created_at` to show "Data last updated at"
