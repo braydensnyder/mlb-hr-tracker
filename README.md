@@ -695,67 +695,83 @@ npm run update:morning   # ~8 AM — yesterday's finals
 npm run update:night     # ~10 PM — today's finals
 ```
 
-#### GitHub Actions automation
+#### Vercel Cron automation (primary)
 
-The active workflow is [`.github/workflows/update-daily.yml`](./.github/workflows/update-daily.yml).
-It runs `npm run update:daily` four times per day on Pacific Time:
+The scheduled cron is hosted on **Vercel Cron**, not GitHub Actions —
+GH Actions' cron was firing unreliably for this repo. The configuration
+lives in [`vercel.json`](./vercel.json) and the endpoint is
+[`api/cron/update.ts`](./api/cron/update.ts).
 
-| Pacific time | UTC cron (PDT) | Job |
+| Pacific time | UTC cron (PDT) | Path |
 | --- | --- | --- |
-|  ~8:07 AM PT | `7 15 * * *` | `update:daily` |
-| ~12:07 PM PT | `7 19 * * *` | `update:daily` |
-|  ~3:07 PM PT | `7 22 * * *` | `update:daily` |
-| ~10:07 PM PT | `7 5 * * *`  | `update:daily` (UTC = next day) |
+|  ~8:07 AM PT | `7 15 * * *` | `/api/cron/update` |
+| ~12:07 PM PT | `7 19 * * *` | `/api/cron/update` |
+|  ~3:07 PM PT | `7 22 * * *` | `/api/cron/update` |
+| ~10:07 PM PT | `7 5 * * *`  | `/api/cron/update` (UTC = next day) |
 
-**Why minute 7 and not minute 0?** GitHub Actions cron is best-effort:
-top-of-hour ticks compete with millions of other repos and frequently
-get delayed by 5-15 minutes — sometimes dropped entirely. Offsetting
-to `:07` lands the schedule in a much less congested slot and makes
-the actual run times far more reliable.
+The endpoint:
 
-Pacific time mapping is calibrated to **PDT** (UTC-7), which covers the
-entire MLB regular season + postseason. During PST (early March, late
-November) the actual local trigger time will shift +1 hour. Since
-`update:daily` is idempotent, this drift is harmless.
+- Requires `Authorization: Bearer <CRON_SECRET>` — Vercel Cron sends
+  this header automatically when `CRON_SECRET` is set in the project env.
+- Calls the same `updateDaily()` orchestrator as `npm run update:daily`.
+- Returns JSON `{ ok, mode, durationMs, stepCount, failureCount,
+  failures, logSummary }` — the `logSummary` slice contains the exact
+  greppable phrases (`created snapshot`, `snapshot already exists, skipped`,
+  `live preview updated`, `results processed`, `snapshot diagnostics`).
+- Has `maxDuration: 300` so a multi-minute run fits inside one
+  invocation. **Requires Vercel Pro plan** (Hobby caps at 10s and 2 daily
+  cron jobs).
+- Never exposes `SUPABASE_SERVICE_ROLE_KEY` to the frontend bundle — it
+  lives only in Vercel's server-side env and is referenced from inside
+  the serverless function.
 
-The workflow also exposes `workflow_dispatch` so you can trigger a run
-manually from the GitHub Actions tab — with an optional `mode` dropdown
-(`daily` / `morning` / `night`) for one-off cases.
+##### Vercel environment variables — setup
 
-`concurrency: hr-tracker-update` ensures only one run is in flight at a
-time. If a manual dispatch overlaps a scheduled tick, the second one
-queues rather than running concurrently.
+In Vercel → **Project Settings → Environment Variables**, add the
+following for the `Production`, `Preview`, and (optionally)
+`Development` environments:
 
-> **Note:** the older `.github/workflows/update.yml` file is now
-> disabled (no triggers, no jobs). It's kept in the repo only as
-> historical context. Delete with
-> `git rm .github/workflows/update.yml` whenever convenient.
-
-#### GitHub Actions secrets — setup
-
-The scheduled workflow needs Supabase credentials. Add these in
-**GitHub → Settings → Secrets and variables → Actions → New repository secret**.
-
-| Secret name | Value | Used by |
+| Variable | Value | Scope |
 | --- | --- | --- |
-| `SUPABASE_URL` | your project URL (e.g. `https://abcd.supabase.co`) | backend script (`update:daily`) |
-| `SUPABASE_SERVICE_ROLE_KEY` | service-role key — **secret**, full DB write access | backend script (`update:daily`) |
-| `VITE_SUPABASE_URL` | same project URL | reserved for future build/deploy steps |
-| `VITE_SUPABASE_ANON_KEY` | anon (public) key | reserved for future build/deploy steps |
+| `SUPABASE_URL` | your project URL (e.g. `https://abcd.supabase.co`) | server (cron + API routes) |
+| `SUPABASE_SERVICE_ROLE_KEY` | service-role key — **secret**, full DB write access | server only |
+| `CRON_SECRET` | a long random string (e.g. `openssl rand -hex 32`) | server (used to authenticate cron pings) |
+| `VITE_SUPABASE_URL` | same project URL | frontend bundle |
+| `VITE_SUPABASE_ANON_KEY` | anon (public) key | frontend bundle |
 
-**Step-by-step:**
+Only the `VITE_…` vars are exposed to the browser. The service-role
+key and the cron secret are server-only.
 
-1. In the Supabase dashboard, open **Project Settings → API**.
-2. Copy the **Project URL** → paste into both `SUPABASE_URL` and `VITE_SUPABASE_URL`.
-3. Copy the **service_role** secret → paste into `SUPABASE_SERVICE_ROLE_KEY`. Treat this like a password; it bypasses RLS.
-4. Copy the **anon** public key → paste into `VITE_SUPABASE_ANON_KEY`.
-5. In your GitHub repo, go to **Settings → Secrets and variables → Actions → New repository secret** and add each one by name.
-6. Trigger the workflow manually from the **Actions** tab → **HR Tracker — update:daily** → **Run workflow**, to verify it works before relying on the cron.
+To verify the endpoint manually:
 
-GitHub auto-masks any secret value in workflow logs, so the service-role
-key never appears in plaintext output even if a step accidentally
-echoes it. The workflow's first step explicitly checks that the
-required secrets are set and fails fast with a clear message if they're missing.
+```bash
+curl -X POST 'https://<your-project>.vercel.app/api/cron/update' \
+  -H "Authorization: Bearer $CRON_SECRET"
+```
+
+A successful run returns JSON with `ok: true` and a `logSummary` array
+showing whether snapshots were created or skipped.
+
+#### GitHub Actions — manual backup only
+
+The GH Actions workflow [`.github/workflows/scheduled-update.yml`](./.github/workflows/scheduled-update.yml)
+is now **manual-only** (no `schedule:` triggers). It's retained as a
+fallback in case Vercel Cron is unavailable or the endpoint is failing —
+you can trigger it from **GitHub → Actions → HR Tracker — update:daily
+(manual backup) → Run workflow** with the same `daily` / `morning` /
+`night` mode dropdown.
+
+The required GitHub secrets are the same Supabase credentials as the
+Vercel env vars above:
+
+| Secret name | Value |
+| --- | --- |
+| `SUPABASE_URL` | your project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | service-role key |
+| `VITE_SUPABASE_URL` | same project URL |
+| `VITE_SUPABASE_ANON_KEY` | anon (public) key |
+
+GitHub auto-masks any secret value in workflow logs.
 
 #### Non-GitHub hosts (cron / Railway / Render / Fly / VPS)
 

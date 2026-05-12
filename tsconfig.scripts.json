@@ -13,6 +13,7 @@
   },
   "include": [
     "scripts",
+    "api",
     "src/lib/stats.ts"
   ]
 }

@@ -372,13 +372,13 @@ function TimestampPanel({
         fontSize: 12,
       }}
     >
-      <div>
+      <div title="When the persisted Top-N snapshot for this date was written to hr_target_snapshots. Backtest reads exclusively from this row — never a live recompute.">
         <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
-          Snapshot generated at
+          Saved Snapshot generated at
         </div>
         <div style={{ marginTop: 2 }}>{fmt(snapshotGeneratedAt)}</div>
       </div>
-      <div>
+      <div title="Honest pre-game snapshot ('live') or historical backfill ('simulated').">
         <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
           Snapshot type
         </div>
@@ -386,7 +386,7 @@ function TimestampPanel({
           {snapshotType ? <SnapshotTypeBadge type={snapshotType} /> : <span className="subtle">—</span>}
         </div>
       </div>
-      <div>
+      <div title="Most recent home_runs.created_at — when the data layer last received a HR row.">
         <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
           Data last updated at
         </div>

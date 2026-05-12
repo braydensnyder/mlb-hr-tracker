@@ -106,6 +106,11 @@ export default function HrTargets() {
   const [savedSnapshot, setSavedSnapshot] = useState<HrTargetSnapshotRow[]>([]);
   // Most-recent home_runs.created_at — drives "Data last updated at" tile.
   const [dataLastUpdated, setDataLastUpdated] = useState<string | null>(null);
+  // Wall-clock at which the most recent successful Live Preview computation
+  // finished. Distinct from "Snapshot generated at" — the snapshot is a
+  // persisted, immutable row in hr_target_snapshots, whereas the live
+  // preview is recomputed in-browser on every fetch.
+  const [livePreviewRenderedAt, setLivePreviewRenderedAt] = useState<string | null>(null);
   // 'saved' = use saved snapshot rows (default when one exists).
   // 'live'  = recompute live (default when no snapshot).
   // 'compare' = paired Saved vs Live ranks side-by-side.
@@ -160,6 +165,10 @@ export default function HrTargets() {
         setGames(gs);
         setSavedSnapshot(snap);
         setDataLastUpdated(lu);
+        // Mark the moment we finished pulling fresh inputs — the boards
+        // memo recomputes immediately after, so this is effectively when
+        // the live preview was rendered for the user.
+        setLivePreviewRenderedAt(new Date().toISOString());
 
         // Default view: 'saved' when a snapshot exists, 'live' otherwise.
         // Respects the URL override (?view=...) so refreshes preserve user intent.
@@ -427,7 +436,9 @@ export default function HrTargets() {
         </div>
       )}
 
-      {/* Snapshot status — three timestamps the user asked for, in one row. */}
+      {/* Snapshot status — four timestamps, in one row. The user explicitly
+          wants Saved Snapshot and Live Preview tracked separately so it's
+          obvious which view the dashboard is showing. */}
       <TimestampPanel
         snapshotGeneratedAt={savedSnapshot[0]?.snapshot_date ?? null}
         snapshotType={
@@ -435,6 +446,7 @@ export default function HrTargets() {
             ? 'live-preview'
             : (savedSnapshot[0]?.snapshot_type as 'live' | 'simulated' | undefined)
         }
+        livePreviewRenderedAt={livePreviewRenderedAt}
         dataLastUpdated={dataLastUpdated}
       />
 
@@ -840,10 +852,12 @@ function SnapshotTypeBadge({ type }: { type: 'live' | 'simulated' | 'live-previe
 function TimestampPanel({
   snapshotGeneratedAt,
   snapshotType,
+  livePreviewRenderedAt,
   dataLastUpdated,
 }: {
   snapshotGeneratedAt: string | null;
   snapshotType: 'live' | 'simulated' | 'live-preview' | undefined;
+  livePreviewRenderedAt: string | null;
   dataLastUpdated: string | null;
 }) {
   const fmt = (s: string | null) =>
@@ -853,7 +867,7 @@ function TimestampPanel({
       style={{
         display: 'grid',
         gap: 6,
-        gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
         padding: 10,
         marginBottom: 12,
         background: 'var(--panel)',
@@ -862,13 +876,13 @@ function TimestampPanel({
         fontSize: 12,
       }}
     >
-      <div>
+      <div title="When the persisted Top-N snapshot for this date was written to hr_target_snapshots. Empty when no snapshot exists.">
         <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
-          Snapshot generated at
+          Saved Snapshot generated at
         </div>
         <div style={{ marginTop: 2 }}>{fmt(snapshotGeneratedAt)}</div>
       </div>
-      <div>
+      <div title="Honest pre-game snapshot ('live'), historical backfill ('simulated'), or unsaved live recompute ('live preview').">
         <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
           Snapshot type
         </div>
@@ -876,7 +890,13 @@ function TimestampPanel({
           {snapshotType ? <SnapshotTypeBadge type={snapshotType} /> : <span className="subtle">—</span>}
         </div>
       </div>
-      <div>
+      <div title="Wall-clock at which the in-browser Live Preview computation finished. Refreshes on every page load / focus / hourly revalidation.">
+        <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
+          Live Preview rendered at
+        </div>
+        <div style={{ marginTop: 2 }}>{fmt(livePreviewRenderedAt)}</div>
+      </div>
+      <div title="Most recent home_runs.created_at — i.e. when the data layer last received a HR row (independent of snapshot).">
         <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
           Data last updated at
         </div>

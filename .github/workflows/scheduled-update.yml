@@ -1,16 +1,14 @@
-name: HR Tracker — update:daily
+name: HR Tracker — update:daily (manual backup)
+
+# NOTE: Scheduled cron has been moved to Vercel Cron (see vercel.json
+# and api/cron/update.ts). This workflow remains as a MANUAL-ONLY backup
+# so you can still kick off an update pipeline from the GitHub UI if
+# Vercel is down or the cron endpoint is failing.
+#
+# To run: GitHub → Actions → "HR Tracker — update:daily (manual backup)"
+#  → Run workflow → pick mode.
 
 on:
-  schedule:
-    # TEMPORARY: every 15 minutes for debugging the schedule trigger.
-    # Once we confirm scheduled runs are firing reliably, remove this line.
-    - cron: '*/15 * * * *'
-
-    # Permanent production schedule (offset to :07 to avoid top-of-hour congestion).
-    - cron: '7 15 * * *'   # ~8:07 AM PT (PDT)
-    - cron: '7 19 * * *'   # ~12:07 PM PT (PDT)
-    - cron: '7 22 * * *'   # ~3:07 PM PT (PDT)
-    - cron: '7 5 * * *'    # ~10:07 PM PT (PDT) — UTC is "next day"
   workflow_dispatch:
     inputs:
       mode:
@@ -49,7 +47,6 @@ jobs:
       - name: Log trigger
         run: |
           echo "Triggered by: ${{ github.event_name }}"
-          echo "  Cron schedule (if any): ${{ github.event.schedule || 'n/a' }}"
           echo "  Manual mode (if any):   ${{ github.event.inputs.mode || 'n/a' }}"
           echo "  UTC now: $(date -u +'%Y-%m-%d %H:%M:%S')"
 

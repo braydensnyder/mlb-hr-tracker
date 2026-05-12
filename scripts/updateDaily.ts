@@ -37,6 +37,7 @@ import { enrichPitcherStarts } from './enrichPitcherStarts.js';
 import { enrichPlayers } from './enrichPlayers.js';
 import { rebuildPlayerSummaries } from './rebuildPlayerSummaries.js';
 import { snapshotHrTargets } from './snapshotHrTargets.js';
+import { supabaseAdmin } from './lib/supabaseAdmin.js';
 
 export type UpdateMode = 'daily' | 'morning' | 'night';
 
@@ -180,6 +181,12 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
     console.log(`    (skipping enrich:players on night mode)`);
   }
 
+  // Marker phrase the operator can grep for. After phase 3 the underlying
+  // tables (games, pitcher_starts, players, venues) that the HR Targets
+  // "Live Preview" view reads from have been freshened. The saved snapshot
+  // — phase 4 below — remains untouched unless --force is supplied.
+  console.log(`    live preview updated — underlying data refreshed (saved snapshot untouched)`);
+
   // -------------------------------------------------------------
   // 4. Snapshot HR Targets — persists Top-N rankings for TODAY and TOMORROW
   //    into hr_target_snapshots. Skip-if-exists by default so an early-
@@ -219,6 +226,12 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
   );
 
   // -------------------------------------------------------------
+  // Diagnostic — read back what actually landed in Supabase so the operator
+  // can confirm whether snapshots were created, skipped, or never written.
+  // -------------------------------------------------------------
+  await logSnapshotDiagnostics(today, tomorrow);
+
+  // -------------------------------------------------------------
   // Wrap-up
   // -------------------------------------------------------------
   const totalDurationMs = Date.now() - t0;
@@ -252,4 +265,58 @@ function logProcessResult(r: ProcessDateResult) {
     `    games: ${r.processedGames}/${r.totalGames} processed, ` +
       `${r.homeRunsInserted} HRs, ${r.pitcherStartsInserted} starter row(s)`,
   );
+}
+
+/**
+ * End-of-run sanity dump: query hr_target_snapshots for today and tomorrow
+ * and print exactly what landed in Supabase. Gives the operator proof-
+ * positive that an update:daily run either created a snapshot or
+ * deliberately skipped one — instead of having to guess from earlier logs.
+ * Also reads the freshest home_runs.created_at as "Data last updated."
+ */
+async function logSnapshotDiagnostics(today: string, tomorrow: string): Promise<void> {
+  console.log(`\n--- snapshot diagnostics (read-back from Supabase)`);
+  for (const d of [today, tomorrow]) {
+    try {
+      const { data, error, count } = await supabaseAdmin
+        .from('hr_target_snapshots')
+        .select('snapshot_date, snapshot_type', { count: 'exact' })
+        .eq('target_date', d)
+        .order('snapshot_date', { ascending: false })
+        .limit(1);
+      if (error) {
+        console.warn(`    [${d}] read-back FAILED: ${error.message}`);
+        continue;
+      }
+      const rows = (data ?? []) as { snapshot_date: string; snapshot_type: string }[];
+      if (rows.length === 0 || (count ?? 0) === 0) {
+        console.log(`    [${d}] no snapshot rows in DB`);
+        continue;
+      }
+      const newest = rows[0];
+      console.log(
+        `    [${d}] ${count} row(s) — snapshot_date=${newest.snapshot_date} ` +
+          `snapshot_type=${newest.snapshot_type}`,
+      );
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      console.warn(`    [${d}] read-back threw: ${m}`);
+    }
+  }
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('home_runs')
+      .select('created_at')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error || !data) {
+      console.log(`    home_runs newest created_at: (unavailable)`);
+    } else {
+      console.log(`    home_runs newest created_at: ${(data as { created_at: string }).created_at}`);
+    }
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err);
+    console.warn(`    home_runs read-back threw: ${m}`);
+  }
 }

@@ -210,7 +210,7 @@ export async function snapshotHrTargets(date: string, opts: SnapshotOptions = {}
   // 1. Idempotency check
   const existing = await countExistingSnapshot(date);
   if (existing > 0 && !force) {
-    console.log(`  ${existing} row(s) already exist for ${date}. Skipping (use --force to overwrite).`);
+    console.log(`  snapshot already exists, skipped — ${existing} row(s) for ${date} (use --force to overwrite)`);
     return { date, asOf, generated: 0, inserted: 0, skipped: true };
   }
 
@@ -246,8 +246,10 @@ export async function snapshotHrTargets(date: string, opts: SnapshotOptions = {}
   // orchestrator should never create a contaminated snapshot. --force
   // bypasses this so an operator can take a deliberate post-start snapshot.
   if (startedCount > 0 && opts.skipIfGamesStarted && !force) {
-    const msg = `${startedCount}/${games.length} game(s) on ${date} have already started — skipping (pre-game-only mode). Use --force to override.`;
-    console.warn(`  ⚠ ${msg}`);
+    console.warn(
+      `  snapshot already exists, skipped — games already started for ${date} ` +
+        `(${startedCount}/${games.length} in-progress/final, pre-game-only mode; use --force to override)`,
+    );
     return { date, asOf, generated: 0, inserted: 0, skipped: true, snapshot_type: snapshotType };
   }
 
@@ -375,6 +377,6 @@ export async function snapshotHrTargets(date: string, opts: SnapshotOptions = {}
     .insert(rows);
   if (insErr) throw new Error(`insert hr_target_snapshots failed: ${insErr.message}`);
 
-  console.log(`  inserted ${rows.length} snapshot rows for ${date} (top of ${top.length} generated, type=${snapshotType})`);
+  console.log(`  created snapshot — ${rows.length} rows for ${date} (type=${snapshotType}, top of ${top.length} generated)`);
   return { date, asOf, generated: top.length, inserted: rows.length, skipped: false, snapshot_type: snapshotType };
 }

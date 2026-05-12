@@ -132,6 +132,11 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
     }
   }
 
+  console.log(
+    `  results processed — ${processedCount} game(s), ${totalHRs} HR(s), ` +
+      `${totalStarts} starter row(s) for ${date}`,
+  );
+
   return {
     date,
     totalGames: games.length,
