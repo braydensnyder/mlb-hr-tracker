@@ -72,10 +72,13 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Set up Node 20
+      - name: Set up Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Node 22 is required because @supabase/supabase-js (via realtime-js)
+          # uses native WebSocket at client construction time. Node ≤ 21 has
+          # no native WebSocket and the constructor throws immediately.
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies (clean, lockfile-driven)

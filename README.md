@@ -17,7 +17,10 @@ This MVP intentionally skips: auth, paid subscriptions, betting odds.
 
 ## 1. Prerequisites
 
-- Node.js 18+ (for built-in `fetch`)
+- **Node.js 22+** — required because `@supabase/supabase-js` uses native
+  WebSocket at client construction (added to Node in v22). Anything ≤ 21
+  will throw `Node.js 20 detected without native WebSocket support` at
+  startup.
 - npm
 - A Supabase project (free tier works) — note its URL, **anon** key, and
   **service-role** key from `Project Settings → API`.
