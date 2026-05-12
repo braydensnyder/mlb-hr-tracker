@@ -104,11 +104,14 @@ function normHand(v: unknown): string | null {
 
 function toPlayerSeed(personId: number, person: any): PlayerSeed | null {
   if (!person) return null;
+  // Parens are required: ES2020 forbids mixing ?? and || at the same level
+  // without explicit grouping. The ?? chain walks the API's name aliases;
+  // the || at the end catches the empty-string case (which `??` would not).
   const fullName: string =
-    person.fullName ??
-    person.fullFMLName ??
-    person.lastFirstName ??
-    [person.firstName, person.lastName].filter(Boolean).join(' ') ||
+    (person.fullName ??
+      person.fullFMLName ??
+      person.lastFirstName ??
+      [person.firstName, person.lastName].filter(Boolean).join(' ')) ||
     `Player ${personId}`;
 
   return {
