@@ -540,14 +540,33 @@ Run `npm run update:daily`. This:
 #### 2. Pre-game snapshot (also in morning update)
 
 The morning run also takes a **Saved Snapshot** of HR Targets for **today**
-and **tomorrow**, with skip-if-exists semantics. The first snapshot of the
-day is the canonical pre-game record. Later same-day runs see it already
-exists and leave it alone — so Backtest always has an honest pre-game
-ranking to compare against actual results.
+and **tomorrow**. Two guard rails enforce "pre-game only" semantics:
 
-Each snapshot row carries a `snapshot_type` that auto-detects to `live`
-when taken before first pitch on a future/today date, or `simulated` when
-backfilled for a past date.
+1. **Skip-if-exists** — once the day's snapshot is saved, later same-day
+   ticks leave it alone. The first snapshot of the day is canonical.
+2. **Skip-if-games-started** — if any game on the target date has
+   already moved past `Pre-Game` status by the time the orchestrator
+   runs, the snapshot is *not* created. (Backtest should never compare
+   against a snapshot that was informed by same-day results.)
+
+To override both rails for a deliberate snapshot — e.g., taking a
+post-start "simulated" record on purpose — use `--force`:
+
+```bash
+npm run snapshot:targets -- 2026-05-13 --force
+```
+
+Each snapshot row carries a `snapshot_type` that the UI surfaces as:
+
+- **Pre-game** (DB `live`) — green badge, taken before first pitch
+- **Simulated historical** (DB `simulated`) — orange badge, backfilled
+- **Live preview** — muted badge, shown on HR Targets when no saved
+  snapshot exists OR when the user toggles to live mode
+
+Both HR Targets and Backtest show a three-column timestamp panel:
+**Snapshot generated at** · **Snapshot type** · **Data last updated at**
+(the most-recent `home_runs.created_at`). At a glance you can tell
+whether the page is showing fresh data and how old the saved ranking is.
 
 ```bash
 npm run snapshot:today              # explicit shortcut (also skip-if-exists)

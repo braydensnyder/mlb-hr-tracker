@@ -48,6 +48,12 @@ export interface SnapshotOptions {
   limit?: number;
   /** Overwrite an existing snapshot for the date. */
   force?: boolean;
+  /** If true (and !force), abort without inserting when any game on
+   *  target_date has already started. Enforces "pre-game only" semantics
+   *  for the orchestrator — Backtest needs honest pre-game rankings, not
+   *  ones contaminated by same-day results. The manual CLI defaults to
+   *  false so an operator can deliberately take a simulated snapshot. */
+  skipIfGamesStarted?: boolean;
   /** Override the auto-detected snapshot_type. If omitted, auto-detected:
    *  'simulated' when target_date is in the past OR any game already started;
    *  'live' otherwise. */
@@ -234,6 +240,17 @@ export async function snapshotHrTargets(date: string, opts: SnapshotOptions = {}
   const startedCount = games.filter((g) => STARTED_STATUSES.has(g.status)).length;
   const snapshotType: 'live' | 'simulated' =
     opts.snapshotType ?? deriveSnapshotType(date, games);
+
+  // Pre-game-only enforcement: when called from update:daily (which sets
+  // skipIfGamesStarted=true), abort entirely if games have started. The
+  // orchestrator should never create a contaminated snapshot. --force
+  // bypasses this so an operator can take a deliberate post-start snapshot.
+  if (startedCount > 0 && opts.skipIfGamesStarted && !force) {
+    const msg = `${startedCount}/${games.length} game(s) on ${date} have already started — skipping (pre-game-only mode). Use --force to override.`;
+    console.warn(`  ⚠ ${msg}`);
+    return { date, asOf, generated: 0, inserted: 0, skipped: true, snapshot_type: snapshotType };
+  }
+
   if (startedCount > 0 && snapshotType === 'simulated') {
     console.warn(
       `  ⚠ Snapshot may not be clean pre-game — ${startedCount}/${games.length} game(s) on ${date} have already started/finished. Tagged as snapshot_type='simulated'.`,

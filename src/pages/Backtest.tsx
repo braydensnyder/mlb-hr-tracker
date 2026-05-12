@@ -14,7 +14,7 @@
  */
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { supabase, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
+import { supabase, fetchDataLastUpdated, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
 
 function todayISO() { return new Date().toISOString().slice(0, 10); }
@@ -62,6 +62,7 @@ export default function Backtest() {
 
   const [snapshot, setSnapshot] = useState<HrTargetSnapshotRow[]>([]);
   const [hrs, setHrs] = useState<HomeRunRow[]>([]);
+  const [dataLastUpdated, setDataLastUpdated] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -79,11 +80,12 @@ export default function Backtest() {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    Promise.all([fetchSnapshot(date), fetchHrsOn(date)])
-      .then(([s, h]) => {
+    Promise.all([fetchSnapshot(date), fetchHrsOn(date), fetchDataLastUpdated()])
+      .then(([s, h, lu]) => {
         if (cancelled) return;
         setSnapshot(s);
         setHrs(h);
+        setDataLastUpdated(lu);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -120,6 +122,12 @@ export default function Backtest() {
         <Kpi label="HRs on date" value={hrs.length} />
         <Kpi label="Top 10 hits" value={`${rate10.hits} / ${rate10.total}`} />
       </div>
+
+      <TimestampPanel
+        snapshotGeneratedAt={snapshot[0]?.snapshot_date ?? null}
+        snapshotType={snapshot[0]?.snapshot_type}
+        dataLastUpdated={dataLastUpdated}
+      />
 
       <div className="filters" style={{ marginBottom: 12 }}>
         <div className="filter-presets" style={{ alignSelf: 'flex-start' }}>
@@ -307,16 +315,20 @@ function Kpi({ label, value }: { label: string; value: string | number }) {
   );
 }
 
-function SnapshotTypeBadge({ type }: { type: 'live' | 'simulated' | undefined }) {
+function SnapshotTypeBadge({ type }: { type: 'live' | 'simulated' | 'live-preview' | undefined }) {
   if (!type) return null;
-  const isLive = type === 'live';
+  // Three discrete states the user requested:
+  //   'live'         → DB snapshot_type='live'      → "Pre-game"
+  //   'simulated'    → DB snapshot_type='simulated' → "Simulated historical"
+  //   'live-preview' → no saved snapshot in DB      → "Live preview"
+  const config = {
+    'live':         { label: '● Pre-game',              color: 'var(--good)',    bg: 'rgba(74, 222, 128, 0.15)', tip: 'Honest pre-game snapshot — taken before first pitch on target_date.' },
+    'simulated':    { label: '○ Simulated historical', color: 'var(--accent)',  bg: 'rgba(255, 122, 24, 0.15)', tip: 'Simulated historical backfill — approximates what the model would have said using data ≤ target_date - 1.' },
+    'live-preview': { label: '◇ Live preview',          color: 'var(--muted)',   bg: 'rgba(133, 147, 184, 0.15)', tip: 'Live model output — not saved. May change as data updates.' },
+  }[type];
   return (
     <span
-      title={
-        isLive
-          ? 'Honest pre-game snapshot — taken before first pitch.'
-          : 'Simulated historical backfill — approximates what the model would have said using data ≤ target_date - 1.'
-      }
+      title={config.tip}
       style={{
         display: 'inline-block',
         padding: '2px 8px',
@@ -325,13 +337,62 @@ function SnapshotTypeBadge({ type }: { type: 'live' | 'simulated' | undefined })
         fontWeight: 700,
         textTransform: 'uppercase',
         letterSpacing: 0.4,
-        background: isLive ? 'rgba(74, 222, 128, 0.15)' : 'rgba(255, 122, 24, 0.15)',
-        color: isLive ? 'var(--good)' : 'var(--accent)',
-        border: `1px solid ${isLive ? 'var(--good)' : 'var(--accent)'}`,
+        background: config.bg,
+        color: config.color,
+        border: `1px solid ${config.color}`,
       }}
     >
-      {isLive ? '● Live pre-game' : '○ Simulated historical'}
+      {config.label}
     </span>
+  );
+}
+
+function TimestampPanel({
+  snapshotGeneratedAt,
+  snapshotType,
+  dataLastUpdated,
+}: {
+  snapshotGeneratedAt: string | null;
+  snapshotType: 'live' | 'simulated' | 'live-preview' | undefined;
+  dataLastUpdated: string | null;
+}) {
+  const fmt = (s: string | null) =>
+    s ? new Date(s).toLocaleString() : <span className="subtle">—</span>;
+  return (
+    <div
+      style={{
+        display: 'grid',
+        gap: 6,
+        gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+        padding: 10,
+        marginBottom: 12,
+        background: 'var(--panel)',
+        border: '1px solid var(--border)',
+        borderRadius: 8,
+        fontSize: 12,
+      }}
+    >
+      <div>
+        <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
+          Snapshot generated at
+        </div>
+        <div style={{ marginTop: 2 }}>{fmt(snapshotGeneratedAt)}</div>
+      </div>
+      <div>
+        <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
+          Snapshot type
+        </div>
+        <div style={{ marginTop: 2 }}>
+          {snapshotType ? <SnapshotTypeBadge type={snapshotType} /> : <span className="subtle">—</span>}
+        </div>
+      </div>
+      <div>
+        <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
+          Data last updated at
+        </div>
+        <div style={{ marginTop: 2 }}>{fmt(dataLastUpdated)}</div>
+      </div>
+    </div>
   );
 }
 

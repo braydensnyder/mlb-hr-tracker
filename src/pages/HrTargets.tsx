@@ -17,7 +17,7 @@
  */
 import React, { Fragment, useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { supabase, fetchPlayerIndex, fetchPitcherFormIndex, type GameRow, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
+import { supabase, fetchPlayerIndex, fetchPitcherFormIndex, fetchDataLastUpdated, type GameRow, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
 import {
   addDays,
@@ -104,6 +104,8 @@ export default function HrTargets() {
   // Saved snapshot for the target date (if one exists). Drives the default
   // view so HR Targets and Backtest show the same Top 10.
   const [savedSnapshot, setSavedSnapshot] = useState<HrTargetSnapshotRow[]>([]);
+  // Most-recent home_runs.created_at — drives "Data last updated at" tile.
+  const [dataLastUpdated, setDataLastUpdated] = useState<string | null>(null);
   // 'saved' = use saved snapshot rows (default when one exists).
   // 'live'  = recompute live (default when no snapshot).
   // 'compare' = paired Saved vs Live ranks side-by-side.
@@ -147,15 +149,17 @@ export default function HrTargets() {
 
     (async () => {
       try {
-        const [hrs, gs, snap] = await Promise.all([
+        const [hrs, gs, snap, lu] = await Promise.all([
           fetchSeasonHrs(asOf),
           fetchGamesOn(targetDate),
           fetchSavedSnapshot(targetDate).catch(() => [] as HrTargetSnapshotRow[]),
+          fetchDataLastUpdated().catch(() => null),
         ]);
         if (cancelled) return;
         setSeasonHrs(hrs);
         setGames(gs);
         setSavedSnapshot(snap);
+        setDataLastUpdated(lu);
 
         // Default view: 'saved' when a snapshot exists, 'live' otherwise.
         // Respects the URL override (?view=...) so refreshes preserve user intent.
@@ -422,6 +426,17 @@ export default function HrTargets() {
           </div>
         </div>
       )}
+
+      {/* Snapshot status — three timestamps the user asked for, in one row. */}
+      <TimestampPanel
+        snapshotGeneratedAt={savedSnapshot[0]?.snapshot_date ?? null}
+        snapshotType={
+          viewMode === 'live'
+            ? 'live-preview'
+            : (savedSnapshot[0]?.snapshot_type as 'live' | 'simulated' | undefined)
+        }
+        dataLastUpdated={dataLastUpdated}
+      />
 
       {/* Saved / live / compare banner — the key consistency signal */}
       <ViewModeBanner
@@ -794,16 +809,16 @@ function Kpi({ label, value }: { label: string; value: string | number }) {
 
 // =================== Saved-snapshot consistency UI ===================
 
-function SnapshotTypeBadge({ type }: { type: 'live' | 'simulated' | undefined }) {
+function SnapshotTypeBadge({ type }: { type: 'live' | 'simulated' | 'live-preview' | undefined }) {
   if (!type) return null;
-  const isLive = type === 'live';
+  const config = {
+    'live':         { label: '● Pre-game',              color: 'var(--good)',   bg: 'rgba(74, 222, 128, 0.15)', tip: 'Honest pre-game snapshot — taken before first pitch on target_date.' },
+    'simulated':    { label: '○ Simulated historical', color: 'var(--accent)', bg: 'rgba(255, 122, 24, 0.15)', tip: 'Simulated historical backfill — approximates what the model would have said using data ≤ target_date - 1.' },
+    'live-preview': { label: '◇ Live preview',          color: 'var(--muted)',  bg: 'rgba(133, 147, 184, 0.15)', tip: 'Live model output — not saved. May change as data updates.' },
+  }[type];
   return (
     <span
-      title={
-        isLive
-          ? 'Honest pre-game snapshot — taken before first pitch.'
-          : 'Simulated historical backfill — approximates what the model would have said using data ≤ target_date - 1.'
-      }
+      title={config.tip}
       style={{
         display: 'inline-block',
         padding: '2px 8px',
@@ -812,13 +827,62 @@ function SnapshotTypeBadge({ type }: { type: 'live' | 'simulated' | undefined })
         fontWeight: 700,
         textTransform: 'uppercase',
         letterSpacing: 0.4,
-        background: isLive ? 'rgba(74, 222, 128, 0.15)' : 'rgba(255, 122, 24, 0.15)',
-        color: isLive ? 'var(--good)' : 'var(--accent)',
-        border: `1px solid ${isLive ? 'var(--good)' : 'var(--accent)'}`,
+        background: config.bg,
+        color: config.color,
+        border: `1px solid ${config.color}`,
       }}
     >
-      {isLive ? '● Live pre-game' : '○ Simulated historical'}
+      {config.label}
     </span>
+  );
+}
+
+function TimestampPanel({
+  snapshotGeneratedAt,
+  snapshotType,
+  dataLastUpdated,
+}: {
+  snapshotGeneratedAt: string | null;
+  snapshotType: 'live' | 'simulated' | 'live-preview' | undefined;
+  dataLastUpdated: string | null;
+}) {
+  const fmt = (s: string | null) =>
+    s ? new Date(s).toLocaleString() : <span className="subtle">—</span>;
+  return (
+    <div
+      style={{
+        display: 'grid',
+        gap: 6,
+        gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+        padding: 10,
+        marginBottom: 12,
+        background: 'var(--panel)',
+        border: '1px solid var(--border)',
+        borderRadius: 8,
+        fontSize: 12,
+      }}
+    >
+      <div>
+        <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
+          Snapshot generated at
+        </div>
+        <div style={{ marginTop: 2 }}>{fmt(snapshotGeneratedAt)}</div>
+      </div>
+      <div>
+        <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
+          Snapshot type
+        </div>
+        <div style={{ marginTop: 2 }}>
+          {snapshotType ? <SnapshotTypeBadge type={snapshotType} /> : <span className="subtle">—</span>}
+        </div>
+      </div>
+      <div>
+        <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
+          Data last updated at
+        </div>
+        <div style={{ marginTop: 2 }}>{fmt(dataLastUpdated)}</div>
+      </div>
+    </div>
   );
 }
 

@@ -187,16 +187,16 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
   //    `npm run snapshot:targets -- <date> --force` to deliberately
   //    overwrite. Non-fatal: failure here doesn't block summary rebuilds.
   // -------------------------------------------------------------
-  console.log(`\n[4/5] Snapshot HR Targets (today + tomorrow, skip-if-exists)`);
+  console.log(`\n[4/5] Snapshot HR Targets (today + tomorrow, pre-game-only, skip-if-exists)`);
   const tomorrow = addDays(today, 1);
   await runStep(
     `snapshot:hr-targets(${today})`,
-    () => snapshotHrTargets(today, { force: false }),
+    () => snapshotHrTargets(today, { force: false, skipIfGamesStarted: true }),
     steps,
   );
   await runStep(
     `snapshot:hr-targets(${tomorrow})`,
-    () => snapshotHrTargets(tomorrow, { force: false }),
+    () => snapshotHrTargets(tomorrow, { force: false, skipIfGamesStarted: true }),
     steps,
   );
 

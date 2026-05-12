@@ -224,6 +224,23 @@ export async function fetchPitcherFormIndex(
   return result;
 }
 
+/**
+ * Probe the freshest `home_runs.created_at` to show "Data last updated at"
+ * timestamps in the UI. Single round-trip; fast.
+ *
+ * Returns null if the table is empty or the request fails (soft).
+ */
+export async function fetchDataLastUpdated(): Promise<string | null> {
+  const { data, error } = await supabase
+    .from('home_runs')
+    .select('created_at')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error || !data) return null;
+  return (data as { created_at: string }).created_at;
+}
+
 /** One row from hr_target_snapshots — a persisted Top-N HR target ranking
  *  for a target_date. Drives the Backtest page (compares ranking vs. actual HRs). */
 export interface HrTargetSnapshotRow {
