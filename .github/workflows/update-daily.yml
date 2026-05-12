@@ -1,34 +1,16 @@
 name: HR Tracker — update:daily
 
-# ─────────────────────────────────────────────────────────────────────────
-# Runs `npm run update:daily` on a Pacific-Time cadence.
-#
-# GitHub Actions cron is UTC. The mappings below are calibrated to PDT
-# (UTC-7), which covers ~all of MLB regular season + postseason. During
-# PST (early March + November), the actual local trigger time will shift
-# +1 hour (e.g., the "8 AM PT" line will fire at 9 AM PST).
-#
-# Pacific time → UTC cron
-#    8:00 AM PT   →   15 UTC
-#   12:00 PM PT   →   19 UTC
-#    3:00 PM PT   →   22 UTC
-#   10:00 PM PT   →   05 UTC (next calendar day)
-#
-# update:daily is idempotent and safe to re-run, so any drift around DST
-# transitions is harmless — the worst case is one extra-early or
-# extra-late run during the changeover week.
-# ─────────────────────────────────────────────────────────────────────────
-
 on:
-  # Cron minutes are offset to ":07" instead of ":00" because GitHub
-  # Actions cron is notoriously delayed (or sometimes outright dropped)
-  # for jobs scheduled at the top of the hour due to massive cross-org
-  # contention. Off-by-seven gets us into a much less congested slot.
   schedule:
-    - cron: '7 15 * * *'   #  ~8:07 AM PT (PDT)
+    # TEMPORARY: every 15 minutes for debugging the schedule trigger.
+    # Once we confirm scheduled runs are firing reliably, remove this line.
+    - cron: '*/15 * * * *'
+
+    # Permanent production schedule (offset to :07 to avoid top-of-hour congestion).
+    - cron: '7 15 * * *'   # ~8:07 AM PT (PDT)
     - cron: '7 19 * * *'   # ~12:07 PM PT (PDT)
-    - cron: '7 22 * * *'   #  ~3:07 PM PT (PDT)
-    - cron: '7  5 * * *'   # ~10:07 PM PT (PDT) — UTC is "next day"
+    - cron: '7 22 * * *'   # ~3:07 PM PT (PDT)
+    - cron: '7 5 * * *'    # ~10:07 PM PT (PDT) — UTC is "next day"
   workflow_dispatch:
     inputs:
       mode:
@@ -41,9 +23,6 @@ on:
           - morning
           - night
 
-# A single in-flight run at a time. If a manual dispatch and a scheduled
-# tick collide, GitHub queues the second one rather than running both
-# concurrently — protects against duplicate writes.
 concurrency:
   group: hr-tracker-update
   cancel-in-progress: false
@@ -57,18 +36,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    # ──────────────────────────────────────────────────────────────────
-    # Secrets are exposed ONLY via env (job-level), and only to the run
-    # step that needs them. GitHub automatically masks secret values in
-    # all log output. The service role key is never echoed or persisted.
-    # See the README for how to add these in repo Settings → Secrets.
-    # ──────────────────────────────────────────────────────────────────
     env:
-      # Backend script needs these — service role can write to the DB.
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      # Frontend (browser) values — included so future build/deploy steps
-      # can use them too. Not actually consumed by update:daily.
       VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
       VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
 
@@ -76,8 +46,6 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      # Visible first thing in every run log so you can immediately tell
-      # whether it was a scheduled cron tick or a manual dispatch.
       - name: Log trigger
         run: |
           echo "Triggered by: ${{ github.event_name }}"
@@ -88,17 +56,12 @@ jobs:
       - name: Set up Node 22
         uses: actions/setup-node@v4
         with:
-          # Node 22 is required because @supabase/supabase-js (via realtime-js)
-          # uses native WebSocket at client construction time. Node ≤ 21 has
-          # no native WebSocket and the constructor throws immediately.
           node-version: '22'
           cache: 'npm'
 
-      - name: Install dependencies (clean, lockfile-driven)
+      - name: Install dependencies
         run: npm ci
 
-      # Pick which mode to run. Cron triggers always run 'daily'; manual
-      # workflow_dispatch can override via the input dropdown.
       - name: Pick mode
         id: pick
         run: |
