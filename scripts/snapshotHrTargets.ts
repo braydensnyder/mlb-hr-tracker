@@ -363,13 +363,14 @@ export async function snapshotHrTargets(date: string, opts: SnapshotOptions = {}
   }
 
   // 8. Persist
-  if (force && existing > 0) {
+  const isOverwrite = force && existing > 0;
+  if (isOverwrite) {
     const { error: delErr } = await supabaseAdmin
       .from('hr_target_snapshots')
       .delete()
       .eq('target_date', date);
     if (delErr) throw new Error(`force-delete existing failed: ${delErr.message}`);
-    console.log(`  cleared ${existing} existing rows (--force)`);
+    console.log(`  snapshot overwritten — cleared ${existing} existing row(s) for ${date} (force=true)`);
   }
 
   const { error: insErr } = await supabaseAdmin
@@ -377,6 +378,10 @@ export async function snapshotHrTargets(date: string, opts: SnapshotOptions = {}
     .insert(rows);
   if (insErr) throw new Error(`insert hr_target_snapshots failed: ${insErr.message}`);
 
-  console.log(`  created snapshot — ${rows.length} rows for ${date} (type=${snapshotType}, top of ${top.length} generated)`);
+  // Emit a clear, greppable line. When this run was a force-replace, prefix
+  // with the "snapshot overwritten" phrase so log scrapers can tell the
+  // difference between "fresh create" and "overwrite-then-create".
+  const verb = isOverwrite ? 'snapshot overwritten — created' : 'created snapshot —';
+  console.log(`  ${verb} ${rows.length} rows for ${date} (type=${snapshotType}, top of ${top.length} generated)`);
   return { date, asOf, generated: top.length, inserted: rows.length, skipped: false, snapshot_type: snapshotType };
 }

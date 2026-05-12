@@ -48,7 +48,7 @@ function isAuthorized(req: VercelReqLike): boolean {
 function parseMode(req: VercelReqLike): UpdateMode {
   const raw = req.query['mode'];
   const v = Array.isArray(raw) ? raw[0] : raw;
-  if (v === 'morning' || v === 'night' || v === 'daily') return v;
+  if (v === 'morning' || v === 'live' || v === 'night' || v === 'daily') return v;
   return 'daily';
 }
 
@@ -110,7 +110,7 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
     const result = await updateDaily(mode);
 
     const greppable = capturedLines.filter((l) =>
-      /created snapshot|snapshot already exists, skipped|live preview updated|results processed|snapshot diagnostics/i.test(l),
+      /active mode|created snapshot|snapshot overwritten|snapshot already exists, skipped|live mode — preserving|live preview updated|results processed|snapshot diagnostics/i.test(l),
     );
 
     res.status(200).json({

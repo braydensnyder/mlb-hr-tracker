@@ -5,8 +5,12 @@
  *
  * Three modes (all safe to re-run):
  *   - daily   — full pass; processes BOTH yesterday and today
- *   - morning — assumes yesterday's games are now final; processes yesterday only
- *   - night   — assumes today's games are wrapping up; processes today only
+ *   - morning — pregame baseline; processes yesterday's finals + FORCE-rebuilds
+ *               today's snapshot (clean baseline for the day)
+ *   - live    — midday refresh; processes today only; preserves the morning
+ *               baseline snapshot (NO snapshot writes)
+ *   - night   — postgame finalization; processes today only + FORCE-updates
+ *               today's snapshot with final post-game model output
  *
  * Pipeline (each step is isolated — a failure in one doesn't kill the run):
  *
@@ -39,7 +43,7 @@ import { rebuildPlayerSummaries } from './rebuildPlayerSummaries.js';
 import { snapshotHrTargets } from './snapshotHrTargets.js';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
 
-export type UpdateMode = 'daily' | 'morning' | 'night';
+export type UpdateMode = 'daily' | 'morning' | 'live' | 'night';
 
 export interface StepLog {
   step: string;
@@ -117,7 +121,10 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
   //    Final/Game Over/Completed Early and not already processed.
   // -------------------------------------------------------------
   console.log(`\n[2/4] Process completed games`);
-  if (mode !== 'night') {
+  // yesterday's HR rows are needed for morning baselines + the full-pass daily
+  // mode. Skip on live (mid-day) and night (yesterday is already final from
+  // the morning run).
+  if (mode === 'daily' || mode === 'morning') {
     await runStep(
       `processDate(yesterday=${yesterday})`,
       async () => {
@@ -128,8 +135,10 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
       steps,
     );
   } else {
-    console.log(`    (skipped — mode=night)`);
+    console.log(`    (yesterday skipped — mode=${mode})`);
   }
+  // today's HR rows are needed any time we expect games to be in-progress
+  // or wrapping. Morning skips because games haven't happened yet.
   if (mode !== 'morning') {
     await runStep(
       `processDate(today=${today})`,
@@ -141,7 +150,7 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
       steps,
     );
   } else {
-    console.log(`    (skipped — mode=morning)`);
+    console.log(`    (today skipped — mode=morning, games not yet played)`);
   }
 
   // -------------------------------------------------------------
@@ -188,24 +197,76 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
   console.log(`    live preview updated — underlying data refreshed (saved snapshot untouched)`);
 
   // -------------------------------------------------------------
-  // 4. Snapshot HR Targets — persists Top-N rankings for TODAY and TOMORROW
-  //    into hr_target_snapshots. Skip-if-exists by default so an early-
-  //    morning snapshot is preserved when later same-day runs fire. Use
-  //    `npm run snapshot:targets -- <date> --force` to deliberately
-  //    overwrite. Non-fatal: failure here doesn't block summary rebuilds.
+  // 4. Snapshot HR Targets — mode-aware lifecycle.
+  //
+  //    morning → FORCE rebuild today's snapshot. Clean pregame baseline.
+  //              Tomorrow: skip-if-exists, pre-game-only (don't overwrite
+  //              a tomorrow-baseline that a prior night/daily run already laid down).
+  //    live    → NO-OP. Preserve the morning baseline so the dashboard's
+  //              Saved-Snapshot view stays stable through the day. Live
+  //              Preview on the UI still updates because the underlying
+  //              data (games, pitcher_starts, players) was just refreshed
+  //              in phase 3.
+  //    night   → FORCE update today's snapshot with the post-game-final
+  //              model output (useful for Backtest accuracy + late-night
+  //              comparison). Tomorrow: skip-if-exists, pre-game-only.
+  //    daily   → legacy generic full-pass. Skip-if-exists, pre-game-only
+  //              for both dates. Used by manual `npm run update:daily`.
+  //
+  //    Non-fatal: failure here doesn't block summary rebuilds.
   // -------------------------------------------------------------
-  console.log(`\n[4/5] Snapshot HR Targets (today + tomorrow, pre-game-only, skip-if-exists)`);
   const tomorrow = addDays(today, 1);
-  await runStep(
-    `snapshot:hr-targets(${today})`,
-    () => snapshotHrTargets(today, { force: false, skipIfGamesStarted: true }),
-    steps,
-  );
-  await runStep(
-    `snapshot:hr-targets(${tomorrow})`,
-    () => snapshotHrTargets(tomorrow, { force: false, skipIfGamesStarted: true }),
-    steps,
-  );
+  console.log(`\n[4/5] Snapshot HR Targets — mode=${mode}`);
+
+  if (mode === 'morning') {
+    console.log(`    morning baseline — FORCE rebuild today, skip-if-exists tomorrow`);
+    await runStep(
+      `snapshot:hr-targets(${today}) [force=true mode=morning]`,
+      () => snapshotHrTargets(today, { force: true, skipIfGamesStarted: false }),
+      steps,
+    );
+    await runStep(
+      `snapshot:hr-targets(${tomorrow})`,
+      () => snapshotHrTargets(tomorrow, { force: false, skipIfGamesStarted: true }),
+      steps,
+    );
+  } else if (mode === 'live') {
+    console.log(
+      `    live mode — preserving morning baseline (no snapshot writes). ` +
+        `Live Preview on /targets still reflects the refreshed underlying data.`,
+    );
+    steps.push({
+      step: `snapshot:hr-targets — skipped (mode=live, preserving baseline)`,
+      durationMs: 0,
+      ok: true,
+      detail: { skipped: true, reason: 'live mode preserves morning baseline' },
+    });
+  } else if (mode === 'night') {
+    console.log(`    night finalization — FORCE update today, skip-if-exists tomorrow`);
+    await runStep(
+      `snapshot:hr-targets(${today}) [force=true mode=night]`,
+      () => snapshotHrTargets(today, { force: true, skipIfGamesStarted: false }),
+      steps,
+    );
+    await runStep(
+      `snapshot:hr-targets(${tomorrow})`,
+      () => snapshotHrTargets(tomorrow, { force: false, skipIfGamesStarted: true }),
+      steps,
+    );
+  } else {
+    // 'daily' — legacy full-pass behavior. Idempotent, pre-game-only.
+    console.log(`    daily full-pass — skip-if-exists + pre-game-only for both dates`);
+    await runStep(
+      `snapshot:hr-targets(${today})`,
+      () => snapshotHrTargets(today, { force: false, skipIfGamesStarted: true }),
+      steps,
+    );
+    await runStep(
+      `snapshot:hr-targets(${tomorrow})`,
+      () => snapshotHrTargets(tomorrow, { force: false, skipIfGamesStarted: true }),
+      steps,
+    );
+  }
 
   // -------------------------------------------------------------
   // 5. Rebuild summaries
@@ -240,6 +301,7 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
     .map((s) => ({ step: s.step, error: String(s.detail) }));
 
   console.log(`\n████████████████████████████████████████████████████`);
+  console.log(`  active mode: ${mode}`);
   console.log(`  update:${mode} complete in ${(totalDurationMs / 1000).toFixed(1)}s`);
   console.log(`  ${steps.length} step(s) run, ${failures.length} failed`);
   if (failures.length > 0) {

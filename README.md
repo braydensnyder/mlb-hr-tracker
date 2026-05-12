@@ -702,12 +702,35 @@ GH Actions' cron was firing unreliably for this repo. The configuration
 lives in [`vercel.json`](./vercel.json) and the endpoint is
 [`api/cron/update.ts`](./api/cron/update.ts).
 
-| Pacific time | UTC cron (PDT) | Path |
-| --- | --- | --- |
-|  ~8:07 AM PT | `7 15 * * *` | `/api/cron/update` |
-| ~12:07 PM PT | `7 19 * * *` | `/api/cron/update` |
-|  ~3:07 PM PT | `7 22 * * *` | `/api/cron/update` |
-| ~10:07 PM PT | `7 5 * * *`  | `/api/cron/update` (UTC = next day) |
+| Pacific time | UTC cron (PDT) | Mode | Path | Snapshot behavior |
+| --- | --- | --- | --- | --- |
+|  ~8:07 AM PT | `7 15 * * *` | **morning** | `/api/cron/update?mode=morning` | **FORCE rebuild** today's snapshot (clean pregame baseline) |
+| ~12:07 PM PT | `7 19 * * *` | **live**    | `/api/cron/update?mode=live`    | **NO-OP** — preserves morning baseline |
+|  ~3:07 PM PT | `7 22 * * *` | **live**    | `/api/cron/update?mode=live`    | **NO-OP** — preserves morning baseline |
+| ~10:07 PM PT | `7 5 * * *`  | **night**   | `/api/cron/update?mode=night`   | **FORCE update** today's snapshot (final post-game) |
+
+##### Mode lifecycle
+
+The orchestrator runs the same pipeline across all four crons, but each
+mode tunes which steps fire and how the snapshot is written. The intent
+is that *each day starts with a clean refreshed baseline* and the
+afternoon live runs never silently overwrite that baseline with stale
+mid-day model output.
+
+| Mode    | process(yesterday) | process(today) | snapshot(today)             | snapshot(tomorrow)             |
+| ---     | ---                | ---            | ---                         | ---                            |
+| morning | ✓                  | skip           | **FORCE rebuild**           | skip-if-exists, pre-game-only  |
+| live    | skip               | ✓              | NO-OP (preserve baseline)   | NO-OP (preserve baseline)      |
+| night   | skip               | ✓              | **FORCE update** (post-game) | skip-if-exists, pre-game-only |
+| daily   | ✓                  | ✓              | skip-if-exists, pre-game-only | skip-if-exists, pre-game-only |
+
+The JSON response from `/api/cron/update` echoes the active mode plus a
+`logSummary` array containing the operator-friendly phrases:
+`active mode: <mode>`, `created snapshot — ...`,
+`snapshot overwritten — created ...`, `snapshot already exists, skipped`,
+`live mode — preserving morning baseline`, `live preview updated`,
+`results processed`, and `snapshot diagnostics`. Grep on those strings
+to confirm what each cron tick actually did.
 
 The endpoint:
 
