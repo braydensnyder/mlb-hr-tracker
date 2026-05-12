@@ -18,6 +18,7 @@
 import React, { Fragment, useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { supabase, fetchPlayerIndex, fetchPitcherFormIndex, type GameRow, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
+import { useRevalidationKey } from '../lib/useRevalidationKey';
 import {
   addDays,
   applyCanonicalTeams,
@@ -135,6 +136,9 @@ export default function HrTargets() {
     return () => { cancelled = true; };
   }, []);
 
+  // Auto-revalidation key — bumps on tab-visible + hourly.
+  const refreshKey = useRevalidationKey();
+
   useEffect(() => {
     if (!targetDate) return;
     let cancelled = false;
@@ -200,7 +204,7 @@ export default function HrTargets() {
       }
     })();
     return () => { cancelled = true; };
-  }, [asOf, targetDate]);
+  }, [asOf, targetDate, refreshKey]);
 
   const canonHrs = useMemo(() => applyCanonicalTeams(seasonHrs, playerIndex), [seasonHrs, playerIndex]);
 

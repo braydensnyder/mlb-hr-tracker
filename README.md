@@ -488,6 +488,37 @@ If the dashboard is empty, run a backfill (see above). All raw HRs stay in
 | `npm run snapshot:targets -- YYYY-MM-DD` | persist a Top-50 HR target snapshot for a date (for the Backtest page) |
 | `npm run typecheck` | run `tsc --noEmit` for both frontend and scripts |
 
+### Auto-refresh + mobile behavior
+
+**Pages auto-refresh their data** in three situations, without the user
+needing to hit reload:
+
+1. **When the tab becomes visible.** Switch to another Safari tab on
+   your phone and come back → all queries re-run. Open the app from
+   the home screen after it's been in the background → fresh data.
+2. **When the window regains focus.** Alt-tab back to the browser → refresh.
+3. **Every hour** as a safety net for tabs left open all day.
+
+The mechanism is a small custom hook (`src/lib/useRevalidationKey.ts`)
+that adds a "revalidation key" to each page's existing fetch effect.
+When the key bumps, the fetch re-runs. No new requests when the page is
+hidden — Supabase costs stay flat.
+
+**Mobile refresh fix.** If you hit a broken/404 page when refreshing on
+your phone, that's the standard SPA-routing problem: Vercel doesn't
+know about `/targets`, `/backtest`, etc. as static files. The fix lives
+in [`vercel.json`](./vercel.json) with the rewrite rule:
+
+```json
+{ "source": "/(.*)", "destination": "/" }
+```
+
+This tells Vercel: for any URL that isn't `/api/*`, serve `index.html`
+and let React Router handle it from the client. After deploying that
+file, deep-link refreshes work everywhere (desktop, iOS Safari, Android
+Chrome). If you ever hit it again, the diagnosis is always: is
+`vercel.json` deployed?
+
 ### Long-term prediction workflow
 
 The app has four named phases in a daily cycle. Running `npm run update:daily`

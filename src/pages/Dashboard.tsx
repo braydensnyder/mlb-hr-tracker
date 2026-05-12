@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { supabase, fetchPlayerIndex, type HomeRunRow } from '../lib/supabase';
+import { useRevalidationKey } from '../lib/useRevalidationKey';
 import HomeRunCard from '../components/HomeRunCard';
 import Leaderboard, { type LeaderRow } from '../components/Leaderboard';
 import TeamLeaderboard from '../components/TeamLeaderboard';
@@ -99,7 +100,10 @@ export default function Dashboard() {
     return () => { cancelled = true; };
   }, []);
 
-  // ---- fetch season-to-date whenever asOf changes ----
+  // Auto-revalidation key — bumps on tab-visible + hourly.
+  const refreshKey = useRevalidationKey();
+
+  // ---- fetch season-to-date whenever asOf changes OR auto-refresh fires ----
   useEffect(() => {
     if (!asOf) return;
     let cancelled = false;
@@ -122,7 +126,7 @@ export default function Dashboard() {
     return () => {
       cancelled = true;
     };
-  }, [asOf]);
+  }, [asOf, refreshKey]);
 
   // ---- canonical team remap: replace per-HR team strings with the player's
   //      current MLB team. Falls back to per-HR team if the player isn't in

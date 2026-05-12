@@ -15,6 +15,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { supabase, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
+import { useRevalidationKey } from '../lib/useRevalidationKey';
 
 function todayISO() { return new Date().toISOString().slice(0, 10); }
 function addDays(s: string, d: number): string {
@@ -71,6 +72,9 @@ export default function Backtest() {
     setSearchParams(next, { replace: true });
   }
 
+  // Auto-revalidation key — bumps on tab-visible + hourly.
+  const refreshKey = useRevalidationKey();
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -87,7 +91,7 @@ export default function Backtest() {
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [date]);
+  }, [date, refreshKey]);
 
   // ---- join snapshot rows with HRs for the date ----
   const resolved: ResolvedRow[] = useMemo(() => {

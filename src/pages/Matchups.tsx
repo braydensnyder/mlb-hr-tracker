@@ -13,6 +13,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { supabase, fetchPlayerIndex, type GameRow, type HomeRunRow } from '../lib/supabase';
+import { useRevalidationKey } from '../lib/useRevalidationKey';
 import {
   addDays,
   aggregateByPlayer,
@@ -105,6 +106,9 @@ export default function Matchups() {
     setSearchParams(next, { replace: true });
   }
 
+  // Auto-revalidation key — bumps on tab-visible + hourly.
+  const refreshKey = useRevalidationKey();
+
   useEffect(() => {
     if (!asOf) return;
     let cancelled = false;
@@ -122,7 +126,7 @@ export default function Matchups() {
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [asOf]);
+  }, [asOf, refreshKey]);
 
   // ---- precompute league-level views once (all use canonical-team rows) ----
   const pitcherIndex = useMemo(() => {
