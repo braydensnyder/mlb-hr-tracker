@@ -639,31 +639,76 @@ npm run update:morning   # ~8 AM — yesterday's finals
 npm run update:night     # ~10 PM — today's finals
 ```
 
-#### GitHub Actions / cron
+#### GitHub Actions automation
 
-`.github/workflows/update.yml` ships as a reference workflow that runs:
+The active workflow is [`.github/workflows/update-daily.yml`](./.github/workflows/update-daily.yml).
+It runs `npm run update:daily` four times per day on Pacific Time:
 
-| ET time | UTC cron | Mode |
+| Pacific time | UTC cron (PDT) | Job |
 | --- | --- | --- |
-|  8:00 AM | `0 12 * * *` | `update:morning` |
-| 12:00 PM | `0 16 * * *` | `update:daily`   |
-|  3:00 PM | `0 19 * * *` | `update:daily`   |
-| 10:00 PM | `0 2 * * *`  | `update:night`   |
+|  8:00 AM PT | `0 15 * * *` | `update:daily` |
+| 12:00 PM PT | `0 19 * * *` | `update:daily` |
+|  3:00 PM PT | `0 22 * * *` | `update:daily` |
+| 10:00 PM PT | `0 5 * * *`  | `update:daily` (UTC = next day) |
 
-Configure `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` as repo Actions
-secrets and the workflow picks them up. The workflow uses
-`concurrency: hr-tracker-update` so two cron ticks never trample each
-other, and exposes a `workflow_dispatch` button for one-off manual runs.
+Pacific time mapping is calibrated to **PDT** (UTC-7), which covers the
+entire MLB regular season + postseason. During PST (early March, late
+November) the actual local trigger time will shift +1 hour. Since
+`update:daily` is idempotent, this drift is harmless.
 
-For a non-GitHub host (Railway/Render/Fly/VPS), the equivalent crontab is:
+The workflow also exposes `workflow_dispatch` so you can trigger a run
+manually from the GitHub Actions tab — with an optional `mode` dropdown
+(`daily` / `morning` / `night`) for one-off cases.
+
+`concurrency: hr-tracker-update` ensures only one run is in flight at a
+time. If a manual dispatch overlaps a scheduled tick, the second one
+queues rather than running concurrently.
+
+> **Note:** the older `.github/workflows/update.yml` file is now
+> disabled (no triggers, no jobs). It's kept in the repo only as
+> historical context. Delete with
+> `git rm .github/workflows/update.yml` whenever convenient.
+
+#### GitHub Actions secrets — setup
+
+The scheduled workflow needs Supabase credentials. Add these in
+**GitHub → Settings → Secrets and variables → Actions → New repository secret**.
+
+| Secret name | Value | Used by |
+| --- | --- | --- |
+| `SUPABASE_URL` | your project URL (e.g. `https://abcd.supabase.co`) | backend script (`update:daily`) |
+| `SUPABASE_SERVICE_ROLE_KEY` | service-role key — **secret**, full DB write access | backend script (`update:daily`) |
+| `VITE_SUPABASE_URL` | same project URL | reserved for future build/deploy steps |
+| `VITE_SUPABASE_ANON_KEY` | anon (public) key | reserved for future build/deploy steps |
+
+**Step-by-step:**
+
+1. In the Supabase dashboard, open **Project Settings → API**.
+2. Copy the **Project URL** → paste into both `SUPABASE_URL` and `VITE_SUPABASE_URL`.
+3. Copy the **service_role** secret → paste into `SUPABASE_SERVICE_ROLE_KEY`. Treat this like a password; it bypasses RLS.
+4. Copy the **anon** public key → paste into `VITE_SUPABASE_ANON_KEY`.
+5. In your GitHub repo, go to **Settings → Secrets and variables → Actions → New repository secret** and add each one by name.
+6. Trigger the workflow manually from the **Actions** tab → **HR Tracker — update:daily** → **Run workflow**, to verify it works before relying on the cron.
+
+GitHub auto-masks any secret value in workflow logs, so the service-role
+key never appears in plaintext output even if a step accidentally
+echoes it. The workflow's first step explicitly checks that the
+required secrets are set and fails fast with a clear message if they're missing.
+
+#### Non-GitHub hosts (cron / Railway / Render / Fly / VPS)
+
+If you run elsewhere, the equivalent crontab is:
 
 ```cron
-# UTC times
-0 12 * * *  cd /app && npm run update:morning  >> logs/update.log 2>&1
-0 16 * * *  cd /app && npm run update:daily    >> logs/update.log 2>&1
-0 19 * * *  cd /app && npm run update:daily    >> logs/update.log 2>&1
-0  2 * * *  cd /app && npm run update:night    >> logs/update.log 2>&1
+# UTC times — adjust to PDT/PST as needed
+0 15 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # 8 AM PT
+0 19 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # 12 PM PT
+0 22 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # 3 PM PT
+0  5 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # 10 PM PT (next UTC day)
 ```
+
+Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in the host's env
+variables (never commit them to the repo).
 
 ### Enrichment pipeline
 
