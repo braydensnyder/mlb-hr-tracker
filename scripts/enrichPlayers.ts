@@ -43,6 +43,9 @@ export interface EnrichPlayersResult {
   fetched: number;
   upserted: number;
   failures: { id: number; error: string }[];
+  /** True when we skipped because `players` table doesn't exist (optional). */
+  skipped?: boolean;
+  skipReason?: string;
 }
 
 const PAGE = 1000;
@@ -82,6 +85,38 @@ async function listFreshPlayers(refreshDays: number): Promise<Set<number>> {
     if (rows.length < PAGE) break;
   }
   return fresh;
+}
+
+/**
+ * Probe Supabase for the `players` table. Returns true if reachable,
+ * false if the schema cache says it doesn't exist. Anything else
+ * (network, auth) is propagated as-is so genuine errors aren't masked.
+ *
+ * The `players` table is OPTIONAL — the rest of the pipeline (snapshots,
+ * Heat Score model) derives canonical name/team from `home_runs` directly.
+ * Operators who haven't applied migration 003 should see this script
+ * cleanly skip rather than fail the orchestrator.
+ */
+function isMissingTableError(msg: string): boolean {
+  const m = msg.toLowerCase();
+  return (
+    m.includes("could not find the table 'public.players'") ||
+    m.includes('relation "public.players" does not exist') ||
+    // PostgREST schema-cache miss: PGRST205 = table not in cache
+    m.includes('pgrst205')
+  );
+}
+
+async function isPlayersTableAvailable(): Promise<boolean> {
+  const { error } = await supabaseAdmin
+    .from('players')
+    .select('player_id', { head: true, count: 'exact' })
+    .limit(1);
+  if (!error) return true;
+  if (isMissingTableError(error.message)) return false;
+  // Some other error — propagate it so the operator sees a real problem
+  // instead of silently skipping.
+  throw new Error(`probe players table failed: ${error.message}`);
 }
 
 interface PlayerSeed {
@@ -151,6 +186,27 @@ export async function enrichPlayers(opts: EnrichPlayersOptions = {}): Promise<En
   const refreshDays = opts.refreshDays ?? 7;
   const dryRun = !!opts.dryRun;
   const force = !!opts.force;
+
+  // 0. Soft-skip when the optional `players` table doesn't exist.
+  //    The rest of the pipeline doesn't depend on it — snapshots derive
+  //    name/team from home_runs directly. Apply migration 003 to enable.
+  const tableExists = await isPlayersTableAvailable();
+  if (!tableExists) {
+    const msg =
+      "skipped: 'public.players' table not found. " +
+      'This table is optional. To enable canonical player metadata, apply ' +
+      'supabase/migrations/003_players.sql, then re-run enrich:players.';
+    console.log(`[enrichPlayers] ${msg}`);
+    return {
+      candidates: 0,
+      toFetch: 0,
+      fetched: 0,
+      upserted: 0,
+      failures: [],
+      skipped: true,
+      skipReason: msg,
+    };
+  }
 
   // 1. universe of IDs we want resolved
   const [batters, pitchers] = await Promise.all([

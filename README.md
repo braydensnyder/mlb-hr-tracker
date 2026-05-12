@@ -67,10 +67,13 @@ order instead of re-running the full schema. They are idempotent:
    — adds `venue_id` to `home_runs` and `games`, plus the `venues`
    catalog and the `venue_hr_summary` derived cache.
 3. [`supabase/migrations/003_players.sql`](./supabase/migrations/003_players.sql)
-   — adds the canonical `players` catalog so the frontend can resolve a
-   hitter's *current MLB team* instead of falling back to whatever team
-   string was on their last HR row (which can be a non-MLB name like
-   "United States" if a WBC row was ever ingested).
+   — **Optional.** Adds the canonical `players` catalog so the frontend
+   can resolve a hitter's *current MLB team* instead of falling back to
+   whatever team string was on their last HR row (which can be a non-MLB
+   name like "United States" if a WBC row was ever ingested). The rest
+   of the pipeline works without this table — `enrich:players` will
+   detect its absence and cleanly skip. Apply only if you want canonical
+   team display on the dashboard.
 4. [`supabase/migrations/004_weather_gametype.sql`](./supabase/migrations/004_weather_gametype.sql)
    — adds `game_type` (used by `processDate` to skip non-MLB types) and
    `weather` placeholder columns (no fetcher wired yet; the HR Heat
