@@ -702,10 +702,16 @@ It runs `npm run update:daily` four times per day on Pacific Time:
 
 | Pacific time | UTC cron (PDT) | Job |
 | --- | --- | --- |
-|  8:00 AM PT | `0 15 * * *` | `update:daily` |
-| 12:00 PM PT | `0 19 * * *` | `update:daily` |
-|  3:00 PM PT | `0 22 * * *` | `update:daily` |
-| 10:00 PM PT | `0 5 * * *`  | `update:daily` (UTC = next day) |
+|  ~8:07 AM PT | `7 15 * * *` | `update:daily` |
+| ~12:07 PM PT | `7 19 * * *` | `update:daily` |
+|  ~3:07 PM PT | `7 22 * * *` | `update:daily` |
+| ~10:07 PM PT | `7 5 * * *`  | `update:daily` (UTC = next day) |
+
+**Why minute 7 and not minute 0?** GitHub Actions cron is best-effort:
+top-of-hour ticks compete with millions of other repos and frequently
+get delayed by 5-15 minutes — sometimes dropped entirely. Offsetting
+to `:07` lands the schedule in a much less congested slot and makes
+the actual run times far more reliable.
 
 Pacific time mapping is calibrated to **PDT** (UTC-7), which covers the
 entire MLB regular season + postseason. During PST (early March, late
@@ -757,10 +763,10 @@ If you run elsewhere, the equivalent crontab is:
 
 ```cron
 # UTC times — adjust to PDT/PST as needed
-0 15 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # 8 AM PT
-0 19 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # 12 PM PT
-0 22 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # 3 PM PT
-0  5 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # 10 PM PT (next UTC day)
+7 15 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # ~8 AM PT
+7 19 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # ~12 PM PT
+7 22 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # ~3 PM PT
+7  5 * * *  cd /app && npm run update:daily  >> logs/update.log 2>&1   # ~10 PM PT (next UTC day)
 ```
 
 Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in the host's env

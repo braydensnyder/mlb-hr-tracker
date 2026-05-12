@@ -20,11 +20,15 @@ name: HR Tracker — update:daily
 # ─────────────────────────────────────────────────────────────────────────
 
 on:
+  # Cron minutes are offset to ":07" instead of ":00" because GitHub
+  # Actions cron is notoriously delayed (or sometimes outright dropped)
+  # for jobs scheduled at the top of the hour due to massive cross-org
+  # contention. Off-by-seven gets us into a much less congested slot.
   schedule:
-    - cron: '0 15 * * *'   #  8:00 AM PT (PDT)
-    - cron: '0 19 * * *'   # 12:00 PM PT (PDT)
-    - cron: '0 22 * * *'   #  3:00 PM PT (PDT)
-    - cron: '0  5 * * *'   # 10:00 PM PT (PDT)  — UTC is "next day"
+    - cron: '7 15 * * *'   #  ~8:07 AM PT (PDT)
+    - cron: '7 19 * * *'   # ~12:07 PM PT (PDT)
+    - cron: '7 22 * * *'   #  ~3:07 PM PT (PDT)
+    - cron: '7  5 * * *'   # ~10:07 PM PT (PDT) — UTC is "next day"
   workflow_dispatch:
     inputs:
       mode:
@@ -71,6 +75,15 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+
+      # Visible first thing in every run log so you can immediately tell
+      # whether it was a scheduled cron tick or a manual dispatch.
+      - name: Log trigger
+        run: |
+          echo "Triggered by: ${{ github.event_name }}"
+          echo "  Cron schedule (if any): ${{ github.event.schedule || 'n/a' }}"
+          echo "  Manual mode (if any):   ${{ github.event.inputs.mode || 'n/a' }}"
+          echo "  UTC now: $(date -u +'%Y-%m-%d %H:%M:%S')"
 
       - name: Set up Node 22
         uses: actions/setup-node@v4
