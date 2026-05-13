@@ -575,7 +575,10 @@ function Top10Table({ targets, asOf }: { targets: HrTarget[]; asOf: string }) {
                   <td className="num">{t.hrs_l5}</td>
                   <td className="num">{t.hrs_l7d}</td>
                   <td className="num">{t.season_hr}</td>
-                  <td className="num"><strong>{t.heat_score.toFixed(1)}</strong></td>
+                  <td className="num">
+                    <strong>{t.heat_score.toFixed(1)}</strong>
+                    <ConfidenceBadge confidence={t.confidence} compact />
+                  </td>
                   <td className="subtle" style={{ fontSize: 12 }}>
                     {t.reasons.length > 0 ? t.reasons.join(' · ') : '—'}
                   </td>
@@ -599,13 +602,13 @@ function Top10Table({ targets, asOf }: { targets: HrTarget[]; asOf: string }) {
 function MatchupDetail({ t }: { t: HrTarget }) {
   const c = t.subscores.contributions;
   // Per-component bars use the configured weights so they stay accurate if
-  // HEAT_SCORE_WEIGHTS changes.
+  // HEAT_SCORE_WEIGHTS changes. Updated 2026 task #155 (season 35, pitcher 20).
   const bars: { label: string; value: number; max: number }[] = [
-    { label: 'Season',  value: c.season,  max: 40 },
+    { label: 'Season',  value: c.season,  max: 35 },
     { label: 'L3',      value: c.l3,      max: 14 },
     { label: 'L5',      value: c.l5,      max: 8  },
     { label: 'L7d',     value: c.l7d,     max: 3  },
-    { label: 'Pitcher', value: c.pitcher, max: 15 },
+    { label: 'Pitcher', value: c.pitcher, max: 20 },
     { label: 'Park',    value: c.park,    max: 10 },
     { label: 'Hand',    value: c.hand,    max: 10 },
   ];
@@ -629,7 +632,7 @@ function MatchupDetail({ t }: { t: HrTarget }) {
         <ScoreCell
           label="Season power (base)"
           value={b.season_power_score}
-          max={40}
+          max={35}
           accent
           subtle={t.is_elite_power ? '★ elite (power floor)' : undefined}
         />
@@ -639,7 +642,7 @@ function MatchupDetail({ t }: { t: HrTarget }) {
           max={25}
           subtle={b.stability_factor < 1 ? `× stability ${b.stability_factor}` : undefined}
         />
-        <ScoreCell label="Pitcher" value={b.pitcher_score} max={15} />
+        <ScoreCell label="Pitcher" value={b.pitcher_score} max={20} />
         <ScoreCell label="Handedness" value={b.handedness_score} max={10} />
         <ScoreCell label="Venue" value={b.venue_score} max={10} />
         {/* Cold/penalty cell — only render when non-zero so the model
@@ -648,6 +651,29 @@ function MatchupDetail({ t }: { t: HrTarget }) {
           <ScoreCell label="Cold / penalty" value={b.cold_penalty} max={-20} negative />
         )}
         <ScoreCell label="Final heat" value={b.final_heat_score} max={100} highlight />
+      </div>
+
+      {/* Confidence + completeness summary — the user-facing answer to
+          "is this score broad-based, or is one factor doing all the work?" */}
+      <div
+        style={{
+          marginBottom: 8,
+          padding: '8px 10px',
+          background: 'var(--panel)',
+          border: '1px solid var(--border)',
+          borderRadius: 8,
+          display: 'flex',
+          flexWrap: 'wrap',
+          gap: 12,
+          alignItems: 'center',
+          fontSize: 12,
+        }}
+      >
+        <ConfidenceBadge confidence={t.confidence} />
+        <span className="subtle">
+          {b.factors_firing}/5 factors firing · completeness ×{b.completeness_multiplier.toFixed(2)}
+          {b.ceiling_compression > 0 && ` · ceiling shaved ${b.ceiling_compression.toFixed(1)} pts`}
+        </span>
       </div>
 
       {/* Raw → adjusted explanation */}
@@ -849,6 +875,60 @@ function Kpi({ label, value }: { label: string; value: string | number }) {
 }
 
 // =================== Saved-snapshot consistency UI ===================
+
+/**
+ * Confidence badge — High / Medium / Low. Shown next to Heat Score on
+ * each row + in the expanded detail. `compact` mode renders just the
+ * colored dot for the table cell; expanded mode shows the full label.
+ */
+function ConfidenceBadge({
+  confidence,
+  compact,
+}: {
+  confidence: 'high' | 'medium' | 'low';
+  compact?: boolean;
+}) {
+  const config = {
+    high:   { label: 'High confidence',   color: 'var(--good)',   bg: 'rgba(74, 222, 128, 0.15)' },
+    medium: { label: 'Medium confidence', color: 'var(--accent-2)', bg: 'rgba(255, 122, 24, 0.15)' },
+    low:    { label: 'Low confidence',    color: 'var(--muted)',  bg: 'rgba(133, 147, 184, 0.18)' },
+  }[confidence];
+  if (compact) {
+    return (
+      <span
+        title={config.label}
+        aria-label={config.label}
+        style={{
+          display: 'inline-block',
+          width: 8,
+          height: 8,
+          borderRadius: '50%',
+          marginLeft: 6,
+          verticalAlign: 'middle',
+          background: config.color,
+        }}
+      />
+    );
+  }
+  return (
+    <span
+      style={{
+        display: 'inline-block',
+        padding: '2px 8px',
+        borderRadius: 999,
+        fontSize: 11,
+        fontWeight: 700,
+        textTransform: 'uppercase',
+        letterSpacing: 0.4,
+        background: config.bg,
+        color: config.color,
+        border: `1px solid ${config.color}`,
+      }}
+    >
+      {config.label}
+    </span>
+  );
+}
 
 function SnapshotTypeBadge({ type }: { type: 'live' | 'simulated' | 'live-preview' | undefined }) {
   if (!type) return null;

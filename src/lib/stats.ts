@@ -724,24 +724,73 @@ export function venueLeaderboard(rows: HomeRunRow[], anchor: string): VenueStats
  *     unless they've hit 2+ HR in last 3 games.
  */
 export const HEAT_SCORE_WEIGHTS = {
-  season: 40,   // was 30 — Season Power is now the structural base
-  l3: 14,       // was 18
-  l5: 8,        // was 12
-  l7d: 3,       // was 8
-  pitcher: 15,  // was 14
+  // Rebalanced 2026 (task #155): 35/25/20/10/10 — drop season slightly
+  // (was 40), raise pitcher (was 15) so matchup matters more, keep park
+  // + hand at 10. Recent form unchanged at 25 (l3+l5+l7d).
+  season: 35,   // was 40
+  l3: 14,       // unchanged
+  l5: 8,        // unchanged
+  l7d: 3,       // unchanged
+  pitcher: 20,  // was 15
   park: 10,     // unchanged
-  hand: 10,     // was 8
+  hand: 10,     // unchanged
   weather: 0,   // placeholder
 } as const;
 
 export const HEAT_SCORE_SATURATION = {
+  // Tightened (task #155) so individual components are harder to max
+  // out and thus typical scores land in the user's target 55-70 range.
   l3: 3,
   l5: 4,
   l7d: 5,
-  season: 30,
-  pitcher_l14d: 6,
-  park_l14d: 12,
+  season: 35,        // was 30 — Schwarber/Judge territory
+  pitcher_l14d: 8,   // was 6 — need 8 HR allowed in 14d to fully max
+  park_l14d: 15,     // was 12 — tougher park cap
   hand: 5,
+} as const;
+
+/**
+ * Ceiling compression — applied AFTER all per-component contributions
+ * and penalties so even a perfectly-aligned slugger can't trivially hit
+ * 100. Above `soft_cap`, every point gets multiplied by `compression`,
+ * yielding diminishing returns:
+ *   raw 70  → 70
+ *   raw 80  → 70 + (80-70)*0.4 = 74
+ *   raw 90  → 70 + (90-70)*0.4 = 78
+ *   raw 100 → 70 + (100-70)*0.4 = 82
+ *
+ * Means 85+ requires every major factor extremely strong AND a high
+ * completeness multiplier — exactly what the user asked for.
+ */
+export const HEAT_SCORE_CEILING = {
+  soft_cap: 70,
+  compression: 0.4,
+} as const;
+
+/**
+ * Completeness multiplier — counts how many of the 5 independent
+ * factors (season power, recent form composite, pitcher, hand, park)
+ * are firing meaningfully (≥ `factor_threshold` of their saturation),
+ * then scales the heat by `base + per_factor * count`.
+ *
+ *   0 factors firing → 0.75x (heavy haircut — one-factor wonder)
+ *   1 factors firing → 0.80x
+ *   2 factors firing → 0.85x
+ *   3 factors firing → 0.90x
+ *   4 factors firing → 0.95x
+ *   5 factors firing → 1.00x (full credit — true alignment)
+ *
+ * Elite power hitters get +1 to factorsFiring (handled inline) so a
+ * slugger with only season power still scores in the "respectable"
+ * band — the user explicitly asked that names like Judge / Ohtani not
+ * get buried by one-factor outlier rows.
+ */
+export const HEAT_SCORE_COMPLETENESS = {
+  factor_threshold: 0.5,
+  base: 0.75,
+  per_factor: 0.05,
+  /** Bonus +N to factorsFiring count for ELITE_POWER profile. */
+  elite_bonus: 1,
 } as const;
 
 /**
@@ -892,6 +941,15 @@ export interface HrTargetBreakdown {
   /** Multiplier (0.35..1.0) applied to recent-form contributions when
    *  season HR baseline is low. Lower = stronger dampening. */
   stability_factor: number;
+  /** How many of the 5 independent factors are firing strongly. Drives
+   *  the completeness multiplier and contributes to the confidence label. */
+  factors_firing: number;
+  /** Multiplier applied for factor agreement (0.75..1.0). The user-
+   *  facing "this score is broad-based vs single-factor" knob. */
+  completeness_multiplier: number;
+  /** Amount subtracted by the ceiling-compression step. 0 when raw ≤ 70.
+   *  Positive value here = how many points were shaved off the top. */
+  ceiling_compression: number;
   /** Heat score BEFORE Power Floor, Low-power cap, or cold/pitcher penalties. */
   raw_score: number;
   /** Human-readable list of adjustments applied between raw_score and final_heat_score.
@@ -969,6 +1027,11 @@ export interface HrTarget {
   venue_total: number;
   /** True when the player is in the curated ELITE_POWER_NAMES set (or caller-supplied elitePowerIds). */
   is_elite_power: boolean;
+  /** Confidence in this ranking, derived from data completeness +
+   *  factor agreement. Drives the small badge next to Heat Score on
+   *  /targets so the user can tell whether a high score is broad-based
+   *  or built on thin data. */
+  confidence: 'high' | 'medium' | 'low';
 }
 
 export interface HrTargetsBoard {
@@ -1073,47 +1136,42 @@ function pickReasons(t: HrTarget): string[] {
   // Phrasing note: "last N HR games" is honest — these counts are computed
   // across the player's N most recent distinct HR-DATES, NOT the literal last
   // N MLB games played (we have HR-event data only, not at-bat data).
+  //
+  // Narrative-prefix format (task #155) — "Recent HR form: ..." so the
+  // reason lists scan more like a scout's notes than a stat-line dump.
   if (t.hrs_l2 >= 2) {
-    candidates.push({ weight: 30 + 5 * t.hrs_l2, text: `${t.hrs_l2} HR over last 2 HR games` });
+    candidates.push({ weight: 30 + 5 * t.hrs_l2, text: `Recent HR form — ${t.hrs_l2} HR over last 2 HR games` });
   } else if (t.hrs_l3 >= 2) {
-    candidates.push({ weight: 25 + 3 * t.hrs_l3, text: `${t.hrs_l3} HR over last 3 HR games` });
+    candidates.push({ weight: 25 + 3 * t.hrs_l3, text: `Recent HR form — ${t.hrs_l3} HR over last 3 HR games` });
   } else if (t.hrs_l5 >= 3) {
-    candidates.push({ weight: 18 + 2 * t.hrs_l5, text: `${t.hrs_l5} HR over last 5 HR games` });
+    candidates.push({ weight: 18 + 2 * t.hrs_l5, text: `Recent HR form — ${t.hrs_l5} HR over last 5 HR games` });
   } else if (t.hrs_l7d >= 3) {
-    candidates.push({ weight: 15 + t.hrs_l7d, text: `${t.hrs_l7d} HR in last 7 calendar days` });
+    candidates.push({ weight: 15 + t.hrs_l7d, text: `Recent HR form — ${t.hrs_l7d} HR in last 7 calendar days` });
   } else if (t.hrs_l5 >= 2) {
-    candidates.push({ weight: 10 + t.hrs_l5, text: `${t.hrs_l5} HR over last 5 HR games` });
+    candidates.push({ weight: 10 + t.hrs_l5, text: `Recent HR form — ${t.hrs_l5} HR over last 5 HR games` });
   }
 
   // Consecutive HR-DAY streak — distinct signal from L3 HR count.
-  // "Straight games" was misleading because off-days break calendar streaks
-  // without breaking real game streaks. Use precise wording.
   if (t.hr_streak >= 3) {
     candidates.push({ weight: 18 + t.hr_streak, text: `HR on ${t.hr_streak} consecutive calendar days` });
   }
 
-  // ----- season power -----
+  // ----- season power — narrative categories -----
   if (t.season_hr >= 25) {
-    candidates.push({ weight: c.season + 4, text: `Elite power profile (${t.season_hr} season HR)` });
+    candidates.push({ weight: c.season + 4, text: `Elite season power (${t.season_hr} HR)` });
   } else if (t.season_hr >= 15) {
-    candidates.push({ weight: c.season + t.season_hr / 8, text: `${t.season_hr} season HR` });
+    candidates.push({ weight: c.season + t.season_hr / 8, text: `Strong season power (${t.season_hr} HR)` });
   } else if (t.season_hr >= 8 && c.season >= 1) {
-    // Mid-power batters with a meaningful contribution get a reason.
-    // Tightened the floor from 5 → 8 so a 5-HR slap hitter doesn't get
-    // a season-power reason fluff-attached to the row.
-    candidates.push({ weight: c.season, text: `${t.season_hr} season HR` });
+    candidates.push({ weight: c.season, text: `Mid-tier season power (${t.season_hr} HR)` });
   }
 
-  // ----- handedness edge — STRICT data backing -----
-  // Removed the old "Strong vs LHP" wording. We now ONLY surface
-  // handedness when there's a concrete count to back it up, and we
-  // always include the count so the user can verify.
+  // ----- handedness edge — narrative + count -----
   if (t.pitcher_hand === 'L' || t.pitcher_hand === 'R') {
     const vsCount = t.pitcher_hand === 'L' ? t.vs_lhp_season : t.vs_rhp_season;
     if (vsCount >= 3 && c.hand >= 1.5) {
       candidates.push({
         weight: c.hand + 1.5,
-        text: `${vsCount} HR vs ${t.pitcher_hand}HP this season`,
+        text: `Good matchup vs ${t.pitcher_hand}HP (${vsCount} HR vs ${t.pitcher_hand}HP this season)`,
       });
     }
   }
@@ -1128,18 +1186,17 @@ function pickReasons(t: HrTarget): string[] {
   if (havePitcherStarts && t.pitcher_l5_starts_allowed >= 4) {
     candidates.push({
       weight: c.pitcher + t.pitcher_l5_starts_allowed,
-      text: `Pitcher allowed ${t.pitcher_l5_starts_allowed} HR in last 5 starts`,
+      text: `Pitcher HR weakness — allowed ${t.pitcher_l5_starts_allowed} HR in last 5 starts`,
     });
   } else if (havePitcherStarts && t.pitcher_l3_starts_allowed >= 3) {
     candidates.push({
       weight: c.pitcher + t.pitcher_l3_starts_allowed,
-      text: `Pitcher allowed ${t.pitcher_l3_starts_allowed} HR in last 3 starts`,
+      text: `Pitcher HR weakness — allowed ${t.pitcher_l3_starts_allowed} HR in last 3 starts`,
     });
   } else if (t.pitcher_l14d_allowed >= 3) {
-    // L14d is calendar-honest and works without pitcher_starts data.
     candidates.push({
       weight: c.pitcher,
-      text: `Pitcher allowed ${t.pitcher_l14d_allowed} HR in last 14 days`,
+      text: `Pitcher HR weakness — allowed ${t.pitcher_l14d_allowed} HR in last 14 days`,
     });
   }
 
@@ -1169,12 +1226,12 @@ function pickReasons(t: HrTarget): string[] {
   if (t.venue_l14d_rank != null && t.venue_l14d_rank <= 5 && t.venue_l14d_hrs >= 2) {
     candidates.push({
       weight: c.park + (6 - t.venue_l14d_rank),
-      text: `Venue top ${t.venue_l14d_rank} HR park in L14d`,
+      text: `Power-friendly park (top ${t.venue_l14d_rank} in L14d HRs)`,
     });
   } else if (t.venue_l14d_hrs >= 4) {
     candidates.push({
       weight: c.park,
-      text: `Hitter-friendly venue (${t.venue_l14d_hrs} HR L14d)`,
+      text: `Power-friendly park (${t.venue_l14d_hrs} HR L14d)`,
     });
   }
 
@@ -1203,6 +1260,17 @@ function pickReasons(t: HrTarget): string[] {
   const heavyMatchup  = pitcherSignal || parkSignal || handSignal;
   if (recentSignal && heavyMatchup) {
     candidates.push({ weight: 28, text: 'Hot streak + favorable matchup' });
+  }
+
+  // ----- LOW-CONFIDENCE NOTE -----
+  // Surface the confidence label as a reason so the user sees WHY the
+  // model is being cautious. Only fires on 'low' so we don't clutter
+  // high/medium rows. Weight 4 puts it near the end of the list.
+  if (t.confidence === 'low') {
+    candidates.push({
+      weight: 4,
+      text: 'Lower confidence — limited sample / few factors agreeing',
+    });
   }
 
   candidates.sort((a, b) => b.weight - a.weight);
@@ -1516,8 +1584,67 @@ export function computeHrTargets(
         });
       }
 
+      // ---- COMPLETENESS MULTIPLIER ----
+      // Count how many of the 5 independent factors are firing
+      // meaningfully. Recent form is treated as one composite factor
+      // using the weighted average of l3/l5/l7d normalized values, so
+      // we don't triple-count it. Elite power profiles get a +1 bonus
+      // to keep proven sluggers competitive when other factors are weak.
+      const recentCombined = (n_l3 * W.l3 + n_l5 * W.l5 + n_l7d * W.l7d) / (W.l3 + W.l5 + W.l7d);
+      const factorValues = [n_season, recentCombined, n_pitcher, n_hand, n_park];
+      const CFG = HEAT_SCORE_COMPLETENESS;
+      let factorsFiring = factorValues.filter((v) => v >= CFG.factor_threshold).length;
+      if (isElitePower) factorsFiring += CFG.elite_bonus;
+      // Cap factorsFiring at 5 for the multiplier so the elite bonus
+      // doesn't inflate above 1.0 — it's a safety net, not a boost.
+      const factorsForMultiplier = Math.min(factorsFiring, 5);
+      const completenessMultiplier = clamp(
+        CFG.base + factorsForMultiplier * CFG.per_factor,
+        CFG.base,
+        1.0,
+      );
+      const heatBeforeMultiplier = heat;
+      heat = heat * completenessMultiplier;
+      if (completenessMultiplier < 1.0) {
+        adjustments.push({
+          label: `Completeness ×${completenessMultiplier.toFixed(2)} (${factorsForMultiplier}/5 factors firing${isElitePower ? ', incl. elite-power bonus' : ''})`,
+          delta: round1(heat - heatBeforeMultiplier),
+        });
+      }
+
+      // ---- CEILING COMPRESSION ----
+      // Above the soft cap, every point gets multiplied by `compression`,
+      // yielding diminishing returns and making 80+ scores genuinely rare.
+      const CEIL = HEAT_SCORE_CEILING;
+      let ceilingCompressionDelta = 0;
+      if (heat > CEIL.soft_cap) {
+        const heatBeforeCompression = heat;
+        heat = CEIL.soft_cap + (heat - CEIL.soft_cap) * CEIL.compression;
+        ceilingCompressionDelta = round1(heat - heatBeforeCompression);
+        adjustments.push({
+          label: `Ceiling compression — diminishing returns above ${CEIL.soft_cap}`,
+          delta: ceilingCompressionDelta,
+        });
+      }
+
       // Heat never goes below 0
       if (heat < 0) heat = 0;
+
+      // ---- CONFIDENCE LABEL ----
+      // Combine factor agreement (how many independent signals agree)
+      // with data quality (do we have real pitcher_starts? meaningful
+      // season sample?). Score 0-7, mapped to high/medium/low.
+      let dataQualityScore = 0;
+      if (pitcher_starts_known >= 3) dataQualityScore += 2;
+      else if (pitcher_l14d > 0) dataQualityScore += 1;
+      if (season_hr >= 12) dataQualityScore += 2;
+      else if (season_hr >= 6) dataQualityScore += 1;
+      if (venue_l14d > 0) dataQualityScore += 1;
+      const confidenceScore = factorsFiring + dataQualityScore; // 0..10
+      const confidence: 'high' | 'medium' | 'low' =
+        confidenceScore >= 6 ? 'high' :
+        confidenceScore >= 3 ? 'medium' :
+        'low';
 
       const subscores: HrTargetSubscores = {
         l3: round2(n_l3),
@@ -1549,6 +1676,9 @@ export function computeHrTargets(
         weather_score: round1(c_weather),
         cold_penalty: round1(cold_penalty),
         stability_factor: round2(stab),
+        factors_firing: factorsForMultiplier,
+        completeness_multiplier: round2(completenessMultiplier),
+        ceiling_compression: round1(Math.abs(ceilingCompressionDelta)),
         raw_score: round1(heat_raw),
         adjustments,
         final_heat_score: round1(heat),
@@ -1587,6 +1717,7 @@ export function computeHrTargets(
         venue_l14d_rank: venue_rank,
         venue_total,
         is_elite_power: isElitePower,
+        confidence,
       };
       target.reasons = pickReasons(target);
       return target;

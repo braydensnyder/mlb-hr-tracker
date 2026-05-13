@@ -181,14 +181,71 @@ saturation cap, then multiplied by its weight:
 
 | Component | Weight | Saturation cap | Source                                |
 | --------- | -----: | -------------: | ------------------------------------- |
-| **Season**| **40** | 30 HRs         | **structural base** — season-to-date totals |
-| Pitcher   | 15     |  6 HR allowed  | probable pitcher's L14d HR allowed    |
+| **Season**| **35** | 35 HRs         | **structural base** — season-to-date totals |
+| Pitcher   | 20     |  8 HR allowed  | probable pitcher's L14d HR allowed    |
 | L3 games  | 14     |  3 HRs         | player's last 3 distinct HR-dates     |
-| Park      | 10     | 12 HRs         | venue's L14d HRs                      |
+| Park      | 10     | 15 HRs         | venue's L14d HRs                      |
 | Hand      | 10     |  1.0 share     | (HRs vs probable's hand) / known-hand |
 | L5 games  |  8     |  4 HRs         | player's last 5 distinct HR-dates     |
 | L7d       |  3     |  5 HRs         | calendar days [asOf-6, asOf]          |
 | Weather   |  0     |  —             | **placeholder** (no fetcher yet)      |
+
+### Ceiling control — completeness multiplier + soft cap (task #155)
+
+The raw weighted sum is multiplied by a **completeness factor** before
+ceiling compression, so a one-factor wonder can't ride a single hot
+signal to a top score.
+
+```
+factorsFiring = how many of (season, recent_form, pitcher, hand, park) are ≥ 0.5 normalized
+elite power profiles get +1 factor as a "respect the hitter" bias
+completeness = clamp(0.75 + 0.05 × factorsFiring, 0.75, 1.00)
+heat *= completeness
+```
+
+Then a **soft cap** at 70 with 0.4 compression past it pulls the top
+end down so 85+ scores require everything to align:
+
+```
+if (heat > 70) heat = 70 + (heat - 70) × 0.4
+```
+
+| Raw heat | After soft cap |
+| -------: | -------------: |
+| 60       | 60 |
+| 70       | 70 |
+| 80       | 74 |
+| 90       | 78 |
+| 100      | 82 |
+
+Practical result: a fully-aligned elite slugger lands ~70–82, a typical
+"good" target lands 55–70, a single-factor outlier lands 30–50. Matches
+the user's target distribution.
+
+### Confidence label
+
+Every target carries a `confidence: 'high' | 'medium' | 'low'` label.
+Computed from `factorsFiring + dataQuality`:
+
+| Signal | Score |
+| --- | ---: |
+| `pitcher_starts_known ≥ 3` | +2 |
+| `pitcher_l14d_allowed > 0` (no real starts data) | +1 |
+| `season_hr ≥ 12` | +2 |
+| `season_hr ≥ 6` | +1 |
+| `venue_l14d_hrs > 0` | +1 |
+
+Plus the factor-agreement count (0–6 with the elite-power bonus).
+Total ≥ 6 → high, ≥ 3 → medium, else low.
+
+A small colored dot next to the Heat Score column makes the confidence
+visible at a glance:
+- 🟢 high — broad data + multiple factors agreeing
+- 🟠 medium — partial data or mixed signals
+- ⚪ low — thin sample / one-factor lean
+
+A low-confidence row also gets an explicit reason tag:
+`"Lower confidence — limited sample / few factors agreeing"`.
 
 **Priority order** (as configured):
 
