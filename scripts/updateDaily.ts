@@ -137,24 +137,31 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
   console.log(`\n[2/4] Process games (live + final)`);
   let yesterdayResult: ProcessDateResult | null = null;
   let todayResult: ProcessDateResult | null = null;
-  // yesterday's HR rows are needed for morning baselines + the full-pass daily
-  // mode. Skip on live (mid-day) and night (yesterday is already final from
-  // the morning run).
-  if (mode === 'daily' || mode === 'morning') {
-    yesterdayResult = await runStep(
-      `processDate(yesterday=${yesterday})`,
-      async () => {
-        const r = await processDate(yesterday);
-        logProcessResult(r);
-        return r;
-      },
-      steps,
-    );
-  } else {
-    console.log(`    (yesterday skipped — mode=${mode})`);
-  }
-  // today's HR rows are needed any time we expect games to be in-progress
-  // or wrapping. Morning skips because games haven't happened yet.
+  // YESTERDAY: processed on EVERY mode. Late-finishing west-coast games or
+  // games that wrapped after the morning cron need a fallback ingest path,
+  // and processDate is idempotent — once all of yesterday's games are
+  // marked processed=true it's a near-no-op (just a schedule fetch + a
+  // SELECT to find pending games, both of which return zero pending).
+  yesterdayResult = await runStep(
+    `processDate(yesterday=${yesterday})`,
+    async () => {
+      const r = await processDate(yesterday);
+      logProcessResult(r);
+      // Surface a clean "yesterday is fully ingested" line when there's
+      // nothing left to do — easier than scanning per-game logs.
+      if (r.liveGamesChecked === 0 && r.finalGamesProcessed === 0 && r.alreadyProcessed === r.totalGames) {
+        console.log(`    yesterday fully ingested — all ${r.totalGames} game(s) processed`);
+      } else if (r.liveGamesChecked + r.pendingPregame > 0) {
+        console.log(
+          `    yesterday still has ${r.liveGamesChecked + r.pendingPregame} game(s) not yet final — will re-check next tick`,
+        );
+      }
+      return r;
+    },
+    steps,
+  );
+  // TODAY: skipped on morning (games not yet played); processed on
+  // live / night / daily. event_key dedup makes re-ingestion safe.
   if (mode !== 'morning') {
     todayResult = await runStep(
       `processDate(today=${today})`,

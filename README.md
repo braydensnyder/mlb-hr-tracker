@@ -878,9 +878,15 @@ mid-day model output.
 | Mode    | process(yesterday) | process(today) | snapshot(today)             | snapshot(tomorrow)             |
 | ---     | ---                | ---            | ---                         | ---                            |
 | morning | ✓                  | skip           | **FORCE rebuild**           | skip-if-exists, pre-game-only  |
-| live    | skip               | ✓              | NO-OP (preserve baseline)   | NO-OP (preserve baseline)      |
-| night   | skip               | ✓              | **FORCE update** (post-game) | skip-if-exists, pre-game-only |
+| live    | ✓                  | ✓              | NO-OP (preserve baseline)   | NO-OP (preserve baseline)      |
+| night   | ✓                  | ✓              | **FORCE update** (post-game) | skip-if-exists, pre-game-only |
 | daily   | ✓                  | ✓              | skip-if-exists, pre-game-only | skip-if-exists, pre-game-only |
+
+**Yesterday is processed on every cron mode** so late-finalizing west-coast
+games or games that wrapped between cron ticks always get a second
+chance to ingest. `processDate` is idempotent: once all of yesterday's
+games are marked `processed=true`, the call short-circuits to a single
+schedule-fetch + an empty pending-games query. Effectively free.
 
 The JSON response from `/api/cron/update` echoes the active mode plus a
 `logSummary` array containing the operator-friendly phrases:
