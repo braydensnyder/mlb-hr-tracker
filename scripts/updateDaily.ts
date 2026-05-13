@@ -53,6 +53,18 @@ export interface StepLog {
   detail?: unknown;
 }
 
+/** Roll-up of the actual-results ingest across yesterday + today, fed
+ *  to the cron-response JSON and used by the Dashboard status card. */
+export interface ActualResultsSummary {
+  /** Snapshot of the date this summary represents (today's actuals). */
+  date: string;
+  /** Same metrics for yesterday — useful when the user opens the
+   *  Dashboard in the morning. null when yesterday wasn't processed. */
+  yesterday: ProcessDateResult | null;
+  /** Today's metrics. null when today wasn't processed (e.g. mode=morning). */
+  today: ProcessDateResult | null;
+}
+
 export interface UpdateDailyResult {
   mode: UpdateMode;
   today: string;
@@ -61,6 +73,7 @@ export interface UpdateDailyResult {
   totalDurationMs: number;
   steps: StepLog[];
   failures: { step: string; error: string }[];
+  actualResults: ActualResultsSummary;
 }
 
 function todayISO() {
@@ -116,16 +129,19 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
   );
 
   // -------------------------------------------------------------
-  // 2. Process completed games
-  //    processDate is idempotent: it only touches games whose status is
-  //    Final/Game Over/Completed Early and not already processed.
+  // 2. Process games — BOTH live + final.
+  //    processDate is idempotent: completed games marked processed are
+  //    skipped on subsequent runs; live games are re-checked every run
+  //    and event_key dedup prevents duplicate HRs.
   // -------------------------------------------------------------
-  console.log(`\n[2/4] Process completed games`);
+  console.log(`\n[2/4] Process games (live + final)`);
+  let yesterdayResult: ProcessDateResult | null = null;
+  let todayResult: ProcessDateResult | null = null;
   // yesterday's HR rows are needed for morning baselines + the full-pass daily
   // mode. Skip on live (mid-day) and night (yesterday is already final from
   // the morning run).
   if (mode === 'daily' || mode === 'morning') {
-    await runStep(
+    yesterdayResult = await runStep(
       `processDate(yesterday=${yesterday})`,
       async () => {
         const r = await processDate(yesterday);
@@ -140,7 +156,7 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
   // today's HR rows are needed any time we expect games to be in-progress
   // or wrapping. Morning skips because games haven't happened yet.
   if (mode !== 'morning') {
-    await runStep(
+    todayResult = await runStep(
       `processDate(today=${today})`,
       async () => {
         const r = await processDate(today);
@@ -319,14 +335,23 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
     totalDurationMs,
     steps,
     failures,
+    actualResults: {
+      date: today,
+      yesterday: yesterdayResult,
+      today: todayResult,
+    },
   };
 }
 
 function logProcessResult(r: ProcessDateResult) {
   console.log(
-    `    games: ${r.processedGames}/${r.totalGames} processed, ` +
-      `${r.homeRunsInserted} HRs, ${r.pitcherStartsInserted} starter row(s)`,
+    `    games: ${r.finalGamesProcessed} final newly processed (${r.alreadyProcessed} already done), ` +
+      `${r.liveGamesChecked} live checked, ${r.pendingPregame} pregame · ` +
+      `${r.homeRunsInserted} new HR(s), ${r.pitcherStartsInserted} starter row(s)`,
   );
+  if (r.latestHrCreatedAt) {
+    console.log(`    latest HR created_at — ${r.latestHrCreatedAt}`);
+  }
 }
 
 /**

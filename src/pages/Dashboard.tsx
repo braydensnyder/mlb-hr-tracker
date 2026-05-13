@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { supabase, fetchPlayerIndex, type HomeRunRow } from '../lib/supabase';
+import { supabase, fetchPlayerIndex, fetchTodayStatus, type HomeRunRow, type TodayStatus } from '../lib/supabase';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
 import HomeRunCard from '../components/HomeRunCard';
 import Leaderboard, { type LeaderRow } from '../components/Leaderboard';
@@ -84,6 +84,10 @@ export default function Dashboard() {
 
   const [seasonHrs, setSeasonHrs] = useState<HomeRunRow[]>([]);
   const [playerIndex, setPlayerIndex] = useState<PlayerTeamIndex>(new Map());
+  /** Today's actual-results snapshot — drives the Dashboard status card.
+   *  Re-fetched on every refresh tick so the card stays current as the
+   *  cron lands new live-game HRs into Supabase. */
+  const [todayStatus, setTodayStatus] = useState<TodayStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -122,6 +126,14 @@ export default function Dashboard() {
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
+
+    // Fetch today's actual-results status for the Dashboard status card.
+    // Independent of the season fetch so a soft failure here doesn't
+    // hide the rest of the dashboard. Re-runs on every refreshKey bump
+    // so the card stays fresh during live games.
+    fetchTodayStatus(asOf)
+      .then((s) => { if (!cancelled) setTodayStatus(s); })
+      .catch(() => { if (!cancelled) setTodayStatus(null); });
 
     return () => {
       cancelled = true;
@@ -275,6 +287,12 @@ export default function Dashboard() {
         <Kpi label="Season HRs (filtered)" value={filteredHrs.length} />
       </div>
 
+      {/* ---- Today's actual results status card ----
+          Reads from the `games` table (status counts) + home_runs
+          (HR count + freshest created_at on game_date == asOf). The
+          card answers "is the cron actually pulling today's games?". */}
+      <TodayStatusCard status={todayStatus} asOf={asOf} />
+
       {/* ---- HRs today ---- */}
       <h3 className="section">HRs on {asOf}</h3>
       <div className="panel" style={{ marginBottom: 16 }}>
@@ -374,6 +392,139 @@ function Kpi({ label, value }: { label: string; value: string | number }) {
     <div className="kpi">
       <div className="kpi-label">{label}</div>
       <div className="kpi-value">{value}</div>
+    </div>
+  );
+}
+
+/**
+ * "Today's actual results" status card. Six tiles plus a freshness
+ * timestamp. Re-fetched alongside everything else on tab focus + hourly.
+ *
+ * The card answers a single operational question: "is the cron actually
+ * pulling today's games, or is the dashboard frozen?"
+ *
+ * Tile values:
+ *   - Today's games checked: total games on date (live + final + pregame + processed)
+ *   - Today's HRs found: SELECT COUNT(*) FROM home_runs WHERE game_date = asOf
+ *   - Final games processed: games marked processed=true
+ *   - Live games still in progress: games whose status is in LIVE_STATUSES
+ *   - Finals awaiting ingest: status=Final but processed=false (next cron picks them up)
+ *   - Pregame: games not yet started
+ *   - Last actual results update: MAX(home_runs.created_at) where game_date = asOf
+ */
+function TodayStatusCard({ status, asOf }: { status: TodayStatus | null; asOf: string }) {
+  if (!status) {
+    return (
+      <div className="panel" style={{ marginBottom: 12, padding: 10 }}>
+        <div className="subtle" style={{ fontSize: 12 }}>
+          Today's actual results — loading…
+        </div>
+      </div>
+    );
+  }
+
+  const fmt = (s: string | null) =>
+    s ? new Date(s).toLocaleString() : <span className="subtle">—</span>;
+
+  // Color the live tile differently so an "is anything happening right now?"
+  // glance is obvious.
+  const liveStyle = status.liveGames > 0
+    ? { color: 'var(--good)', fontWeight: 700 as const }
+    : undefined;
+
+  return (
+    <div
+      className="panel"
+      style={{ marginBottom: 16, padding: 10 }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'baseline',
+          flexWrap: 'wrap',
+          gap: 8,
+          marginBottom: 8,
+        }}
+      >
+        <strong style={{ fontSize: 13 }}>Today's actual results — {asOf}</strong>
+        <span className="subtle" style={{ fontSize: 11 }}>
+          (refreshed from Supabase on tab-focus and hourly)
+        </span>
+      </div>
+      <div
+        style={{
+          display: 'grid',
+          gap: 8,
+          gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+          fontSize: 12,
+        }}
+      >
+        <StatusTile label="Games checked"     value={status.totalGames} />
+        <StatusTile label="HRs found today"   value={status.hrsToday} accent />
+        <StatusTile label="Final processed"   value={status.processedGames} />
+        <StatusTile label="Live in progress"  value={status.liveGames} valueStyle={liveStyle} />
+        <StatusTile label="Finals awaiting"   value={status.finalsAwaitingIngest} />
+        <StatusTile label="Pregame"           value={status.pregameGames} />
+      </div>
+      <div
+        style={{
+          marginTop: 8,
+          paddingTop: 8,
+          borderTop: '1px solid var(--border)',
+          fontSize: 11,
+        }}
+      >
+        <span className="subtle" style={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>
+          Last actual results update
+        </span>
+        <span style={{ marginLeft: 8 }}>{fmt(status.lastActualHrCreatedAt)}</span>
+        {status.liveGames > 0 && (
+          <span className="subtle" style={{ marginLeft: 12 }}>
+            (next cron tick will re-check the {status.liveGames} live game{status.liveGames === 1 ? '' : 's'})
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function StatusTile({
+  label,
+  value,
+  accent,
+  valueStyle,
+}: {
+  label: string;
+  value: number;
+  accent?: boolean;
+  valueStyle?: React.CSSProperties;
+}) {
+  return (
+    <div
+      style={{
+        padding: '6px 8px',
+        borderRadius: 6,
+        background: 'var(--panel-2)',
+        border: '1px solid var(--border)',
+      }}
+    >
+      <div
+        className="subtle"
+        style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}
+      >
+        {label}
+      </div>
+      <div
+        style={{
+          marginTop: 2,
+          fontSize: 18,
+          fontWeight: 700,
+          color: accent ? 'var(--accent-2)' : 'var(--text)',
+          ...valueStyle,
+        }}
+      >
+        {value}
+      </div>
     </div>
   );
 }

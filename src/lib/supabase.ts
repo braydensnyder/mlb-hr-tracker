@@ -246,6 +246,105 @@ export async function fetchPitcherFormIndex(
 function round2(n: number) { return Math.round(n * 100) / 100; }
 
 /**
+ * One-shot "today's actual results" status read for the Dashboard
+ * status card. Aggregates:
+ *   - games on `date` grouped by status bucket (live / final / pregame / processed)
+ *   - HR count on `date`
+ *   - latest home_runs.created_at among rows whose game_date == `date`
+ *     (i.e. "when did we last ingest a HR that happened today?")
+ *
+ * Single-purpose helper — three small queries — so the Dashboard can
+ * render a status panel without sucking down all of today's HR rows
+ * twice.
+ */
+export interface TodayStatus {
+  date: string;
+  totalGames: number;
+  liveGames: number;
+  finalGames: number;
+  /** Games marked processed=true (Final + we already ingested them). */
+  processedGames: number;
+  /** Final games NOT yet processed (next cron will pick them up). */
+  finalsAwaitingIngest: number;
+  pregameGames: number;
+  hrsToday: number;
+  /** MAX(home_runs.created_at) where game_date = date. The "last actual
+   *  results update" timestamp the user wants on the Dashboard. */
+  lastActualHrCreatedAt: string | null;
+}
+
+const LIVE_STATUSES_SET = new Set([
+  'In Progress',
+  'Manager Challenge',
+  'Delayed',
+  'Delayed: Rain',
+  'Suspended',
+  'Suspended: Rain',
+  'Warmup',
+]);
+const FINAL_STATUSES_SET = new Set([
+  'Final',
+  'Game Over',
+  'Completed Early',
+]);
+
+export async function fetchTodayStatus(date: string): Promise<TodayStatus> {
+  // ---- 1) games on the date with status + processed flag ----
+  const { data: gameRows, error: gErr } = await supabase
+    .from('games')
+    .select('status, processed')
+    .eq('game_date', date);
+  if (gErr) throw new Error(gErr.message);
+
+  const games = (gameRows ?? []) as { status: string; processed: boolean }[];
+  let liveGames = 0;
+  let finalGames = 0;
+  let processedGames = 0;
+  let finalsAwaitingIngest = 0;
+  let pregameGames = 0;
+  for (const g of games) {
+    if (FINAL_STATUSES_SET.has(g.status)) {
+      finalGames++;
+      if (g.processed) processedGames++;
+      else finalsAwaitingIngest++;
+    } else if (LIVE_STATUSES_SET.has(g.status)) {
+      liveGames++;
+    } else {
+      pregameGames++;
+    }
+  }
+
+  // ---- 2) HR count for the date ----
+  const { count: hrCount, error: cErr } = await supabase
+    .from('home_runs')
+    .select('*', { count: 'exact', head: true })
+    .eq('game_date', date);
+  if (cErr) throw new Error(cErr.message);
+
+  // ---- 3) latest HR created_at among today's rows ----
+  const { data: latest, error: lErr } = await supabase
+    .from('home_runs')
+    .select('created_at')
+    .eq('game_date', date)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (lErr) throw new Error(lErr.message);
+
+  return {
+    date,
+    totalGames: games.length,
+    liveGames,
+    finalGames,
+    processedGames,
+    finalsAwaitingIngest,
+    pregameGames,
+    hrsToday: hrCount ?? 0,
+    lastActualHrCreatedAt: (latest as { created_at: string } | null)?.created_at ?? null,
+  };
+}
+
+/**
  * Probe the freshest `home_runs.created_at` to show "Data last updated at"
  * timestamps in the UI. Single round-trip; fast.
  *

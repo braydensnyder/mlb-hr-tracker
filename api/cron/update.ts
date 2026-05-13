@@ -110,8 +110,27 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
     const result = await updateDaily(mode);
 
     const greppable = capturedLines.filter((l) =>
-      /active mode|created snapshot|snapshot overwritten|snapshot already exists, skipped|live mode — preserving|live preview updated|results processed|snapshot diagnostics/i.test(l),
+      /active mode|created snapshot|snapshot overwritten|snapshot already exists, skipped|live mode — preserving|live preview updated|results processed|live games checked|finals newly processed|home runs ingested|latest HR created_at|snapshot diagnostics/i.test(l),
     );
+
+    // Pull out a compact, dashboard-friendly view of actual-results
+    // ingest. The Dashboard status card on the frontend reads the same
+    // shape from Supabase directly; we surface it here so curl-testing
+    // can see at a glance what the pipeline accomplished.
+    const summarize = (r: typeof result.actualResults.today) =>
+      r
+        ? {
+            date: r.date,
+            totalGames: r.totalGames,
+            liveGamesChecked: r.liveGamesChecked,
+            finalGamesProcessed: r.finalGamesProcessed,
+            alreadyProcessed: r.alreadyProcessed,
+            pendingPregame: r.pendingPregame,
+            homeRunsInserted: r.homeRunsInserted,
+            pitcherStartsInserted: r.pitcherStartsInserted,
+            latestHrCreatedAt: r.latestHrCreatedAt,
+          }
+        : null;
 
     res.status(200).json({
       ok: result.failures.length === 0,
@@ -128,7 +147,11 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
       stepCount: result.steps.length,
       failureCount: result.failures.length,
       failures: result.failures,
-      logSummary: greppable.slice(-50),
+      actualResults: {
+        today: summarize(result.actualResults.today),
+        yesterday: summarize(result.actualResults.yesterday),
+      },
+      logSummary: greppable.slice(-60),
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

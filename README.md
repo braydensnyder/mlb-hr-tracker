@@ -362,6 +362,77 @@ The two are intentionally separate so the operator can spot drift:
 if "Live Preview rendered at" is ten minutes ago but "Data last updated at"
 is from two days ago, that's a signal the cron isn't ingesting new HRs.
 
+### Dashboard — live actual results during the day
+
+`processDate(date)` now ingests HRs from BOTH **final** games AND
+**in-progress** games. The two paths are split so live updates are safe
+without corrupting downstream consumers that depend on completed-game data:
+
+| Status bucket | Behavior | Why |
+| --- | --- | --- |
+| `Final` / `Game Over` / `Completed Early` (`!processed`) | Extract HRs **+** extract pitcher_starts; mark `processed=true` | Standard "game's over, finalize it" path |
+| `In Progress` / `Manager Challenge` / `Delayed*` / `Suspended*` / `Warmup` | Extract HRs only; **leave `processed=false`** | We want the HR rows on the Dashboard as they happen, but `pitcher_starts` needs final innings_pitched / decision, so wait until the game ends |
+| `processed=true` | Skip entirely | Already done |
+| `Scheduled` / `Preview` / etc. | Skip entirely | Game hasn't started — no HRs yet |
+
+Dedup is via `home_runs.event_key` (`${game_pk}-${batter_id}-${atBatIndex}`),
+which is unique within a game. Re-ingesting the same in-progress game
+on every cron tick is safe: existing rows update in place; new HRs land
+as fresh rows. The `pitcher_starts` constraint `(game_id, pitcher_id)`
+gives the same idempotency for completed starts.
+
+#### Dashboard status card
+
+The Dashboard (`/`) now renders a "Today's actual results" panel
+between the KPI strip and the HRs-today list. Six tiles fed live from
+Supabase on every page load + tab focus + hourly tick:
+
+| Tile | Source |
+| --- | --- |
+| Games checked | `COUNT(*) FROM games WHERE game_date = asOf` |
+| HRs found today | `COUNT(*) FROM home_runs WHERE game_date = asOf` |
+| Final processed | games with `status` IN final-set AND `processed = true` |
+| Live in progress | games with `status` IN live-set (green when > 0) |
+| Finals awaiting | games with `status` IN final-set AND `processed = false` |
+| Pregame | games not yet started |
+
+A "Last actual results update" line below shows
+`MAX(home_runs.created_at) WHERE game_date = asOf` — i.e. when the
+pipeline last actually ingested a HR that occurred today. If that
+timestamp is hours stale during the day, that's the signal the cron
+isn't doing live ingest.
+
+The Dashboard reads from the raw `home_runs` and `games` tables, so the
+HRs-today list and status card always reflect the freshest data on file.
+There is no caching layer between the page and Supabase, and the
+status card re-fetches on every refresh tick.
+
+#### Cron response — actual-results block
+
+The `/api/cron/update` JSON response now includes an `actualResults`
+object alongside `logSummary`:
+
+```json
+"actualResults": {
+  "today": {
+    "date": "2026-05-13",
+    "totalGames": 15,
+    "liveGamesChecked": 5,
+    "finalGamesProcessed": 3,
+    "alreadyProcessed": 4,
+    "pendingPregame": 3,
+    "homeRunsInserted": 7,
+    "pitcherStartsInserted": 6,
+    "latestHrCreatedAt": "2026-05-13T22:14:08.412Z"
+  },
+  "yesterday": { ... }
+}
+```
+
+The `logSummary` array also picks up the granular phrases:
+`live games checked — N for {date}`, `finals newly processed — N for {date}`,
+`home runs ingested — N new row(s) for {date}`, `latest HR created_at — {ts}`.
+
 ### Future work — batter game logs
 
 The current schema stores only HR *events* (`home_runs`) and pitcher

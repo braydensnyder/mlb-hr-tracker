@@ -64,10 +64,10 @@ export async function backfillSeason(
     try {
       const r: ProcessDateResult = await processDate(date);
       summary.daysSucceeded++;
-      summary.totalGamesProcessed += r.processedGames;
+      summary.totalGamesProcessed += r.finalGamesProcessed;
       summary.totalHomeRunsInserted += r.homeRunsInserted;
       console.log(
-        `${tag} done: ${r.processedGames}/${r.totalGames} games, ${r.homeRunsInserted} HRs`,
+        `${tag} done: ${r.finalGamesProcessed}/${r.totalGames} games, ${r.homeRunsInserted} HRs`,
       );
 
       if (opts.rebuildPerDay) {
