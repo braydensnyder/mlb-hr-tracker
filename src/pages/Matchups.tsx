@@ -18,6 +18,7 @@ import {
   addDays,
   aggregateByPlayer,
   applyCanonicalTeams,
+  formatWeatherLine,
   pitcherHrLeaderboard,
   hotHittersLastNGames,
   venueLeaderboard,
@@ -252,6 +253,13 @@ export default function Matchups() {
             }
           }
 
+          const weatherLine = formatWeatherLine({
+            condition: g.weather?.condition ?? null,
+            temp_f: g.weather_temp_f,
+            wind_mph: g.weather_wind_mph,
+            wind_dir: g.weather_wind_dir,
+          });
+
           return (
             <div key={g.game_pk} className="panel">
               <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
@@ -262,6 +270,11 @@ export default function Matchups() {
                   {g.venue_name ? `${g.venue_name} · ` : ''}{g.status}
                 </div>
               </div>
+              {weatherLine && (
+                <div className="subtle" style={{ fontSize: 12, marginTop: 4 }}>
+                  🌤 {weatherLine}
+                </div>
+              )}
 
               <div className="grid" style={{ marginTop: 12, gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))' }}>
                 <SidePanel side={home} venueRow={venueRow} asOf={asOf} sideLabel="Home" />

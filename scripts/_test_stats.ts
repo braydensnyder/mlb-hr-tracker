@@ -23,6 +23,8 @@ import {
   venueLeaderboard,
   applyCanonicalTeams,
   computeHrTargets,
+  computeWeatherAdjustment,
+  formatWeatherLine,
   HEAT_SCORE_WEIGHTS,
   type HrTargetGame,
 } from '../src/lib/stats.ts';
@@ -671,6 +673,56 @@ eq('HEAT_SCORE_WEIGHTS sum to 100', wSum, 100);
 // Weather subscore is structurally present even though weight is 0
 eq('Weather subscore exists on every target', typeof judge.subscores.weather, 'number');
 eq('Weather contribution = 0 (weight is 0)', judge.subscores.contributions.weather, 0);
+
+// ---- WEATHER ADJUSTMENT (light, task #156) ----
+// computeWeatherAdjustment is the gentle ± nudge applied last.
+{
+  // warm + wind out → positive, bounded
+  const warmOut = computeWeatherAdjustment({ condition: 'Clear', temp_f: 88, wind_mph: 14, wind_dir: 'Out To LF' });
+  eq('Warm + wind-out → positive weather delta', warmOut.delta > 0, true);
+  eq('Warm + wind-out is included', warmOut.included, true);
+  // cold + wind in → negative
+  const coldIn = computeWeatherAdjustment({ condition: 'Cloudy', temp_f: 44, wind_mph: 16, wind_dir: 'In From CF' });
+  eq('Cold + wind-in → negative weather delta', coldIn.delta < 0, true);
+  // dome → neutral, NOT included
+  const dome = computeWeatherAdjustment({ condition: 'Roof Closed', temp_f: 72, wind_mph: 0, wind_dir: 'Calm' });
+  eq('Dome → weather delta 0', dome.delta, 0);
+  eq('Dome → weather NOT included', dome.included, false);
+  // missing → neutral, NOT included
+  const missing = computeWeatherAdjustment({ condition: null, temp_f: null, wind_mph: null, wind_dir: null });
+  eq('Missing weather → delta 0 + not included', missing.delta === 0 && missing.included === false, true);
+  // delta is bounded to [-3, +5] even with extreme inputs
+  const extreme = computeWeatherAdjustment({ condition: 'Hot', temp_f: 110, wind_mph: 40, wind_dir: 'Out To CF' });
+  eq('Weather delta clamped to ≤ +5', extreme.delta <= 5, true);
+}
+
+// Weather flows through computeHrTargets onto the target + breakdown.
+{
+  const wxSched: HrTargetGame[] = [{
+    game_pk: 9500, game_date: '2026-05-10',
+    away_team: 'NYM', home_team: 'PHI', venue_name: null,
+    home_probable_pitcher_id: null, home_probable_pitcher_name: null, home_probable_pitcher_hand: null,
+    away_probable_pitcher_id: null, away_probable_pitcher_name: null, away_probable_pitcher_hand: null,
+    weather_condition: 'Clear', weather_temp_f: 89, weather_wind_mph: 13, weather_wind_dir: 'Out To LF',
+  }];
+  const wxBoards = computeHrTargets(eliteFixture, '2026-05-09', wxSched);
+  const wxSchwarber = wxBoards[0].home_targets.find((t) => t.player_id === 555)!;
+  eq('Weather fields populated on target', wxSchwarber.weather_temp_f, 89);
+  eq('Weather included flag true for warm+out game', wxSchwarber.weather_included, true);
+  eq('Weather adjustment positive in breakdown', wxSchwarber.breakdown.weather_adjustment > 0, true);
+  eq('Board carries weather context', wxBoards[0].weather_temp_f, 89);
+  // formatWeatherLine renders the user-facing string.
+  eq(
+    'formatWeatherLine renders temp + wind',
+    formatWeatherLine({ condition: 'Clear', temp_f: 82, wind_mph: 12, wind_dir: 'Out To LF' }),
+    '82°F • Wind 12 mph out to lf',
+  );
+  eq(
+    'formatWeatherLine handles dome',
+    formatWeatherLine({ condition: 'Roof Closed', temp_f: 72, wind_mph: 0, wind_dir: 'Calm' }),
+    'Roof Closed • 72°F',
+  );
+}
 
 // ---- summary ----
 if (failures > 0) {

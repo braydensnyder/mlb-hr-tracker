@@ -916,6 +916,130 @@ export interface HrTargetGame {
   away_probable_pitcher_id: number | null;
   away_probable_pitcher_name: string | null;
   away_probable_pitcher_hand: string | null;
+  // Weather context (null until enrich:weather populates it).
+  weather_condition?: string | null;
+  weather_temp_f?: number | null;
+  weather_wind_mph?: number | null;
+  weather_wind_dir?: string | null;
+}
+
+/**
+ * Light weather adjustment for the Heat Score. The user explicitly
+ * asked to keep this gentle — it nudges, it never dominates. Bounded
+ * to roughly [-3, +5].
+ *
+ *   warm temp     → small boost   (≥85°F +2, ≥75°F +1, ≤45°F -1)
+ *   wind blowing OUT → small boost   (+1, +2 if ≥10 mph, +3 if ≥15 mph)
+ *   wind blowing IN  → small penalty (-1, -2 if ≥10 mph, -3 if ≥15 mph)
+ *   crosswind / calm → neutral
+ *   dome / roof closed → neutral (indoors — weather is a non-factor)
+ *   missing weather    → neutral
+ *
+ * `included` tells the UI whether weather actually moved the score, so
+ * the expanded row can say "weather: neutral / not included" honestly.
+ */
+export interface WeatherAdjustment {
+  delta: number;        // points added to heat (can be negative)
+  included: boolean;    // false when dome / missing → score untouched
+  label: string;        // human-readable summary for the adjustments list
+}
+
+/**
+ * Format weather for display, e.g.:
+ *   "82°F • Wind 12 mph out to LF"
+ *   "72°F • Wind 8 mph in from CF"
+ *   "Roof Closed"          (dome — wind omitted)
+ *   "68°F • Calm"
+ * Returns null when there's nothing meaningful to show.
+ */
+export function formatWeatherLine(opts: {
+  condition?: string | null;
+  temp_f?: number | null;
+  wind_mph?: number | null;
+  wind_dir?: string | null;
+}): string | null {
+  const condition = opts.condition ?? null;
+  const temp = opts.temp_f ?? null;
+  const windMph = opts.wind_mph ?? null;
+  const windDir = opts.wind_dir ?? null;
+
+  const isDome = condition != null && /roof closed|dome|indoor/i.test(condition);
+  if (isDome) {
+    // Indoors — temp may still be reported, but wind is moot.
+    return temp != null ? `${condition} • ${temp}°F` : condition;
+  }
+
+  const parts: string[] = [];
+  if (temp != null) parts.push(`${temp}°F`);
+
+  if (windMph != null && windDir) {
+    if (/^calm$/i.test(windDir) || windMph === 0) {
+      parts.push('Calm');
+    } else {
+      // Lower-case the direction phrase for the "out to LF" reading.
+      parts.push(`Wind ${windMph} mph ${windDir.toLowerCase()}`);
+    }
+  } else if (windMph != null) {
+    parts.push(`Wind ${windMph} mph`);
+  }
+
+  if (parts.length === 0) return condition; // last resort
+  return parts.join(' • ');
+}
+
+export function computeWeatherAdjustment(opts: {
+  condition?: string | null;
+  temp_f?: number | null;
+  wind_mph?: number | null;
+  wind_dir?: string | null;
+}): WeatherAdjustment {
+  const condition = opts.condition ?? null;
+  const temp = opts.temp_f ?? null;
+  const windMph = opts.wind_mph ?? null;
+  const windDir = (opts.wind_dir ?? '').toLowerCase();
+
+  // Dome / roof closed → weather is not a factor. Neutral, not included.
+  const isDome = condition != null && /roof closed|dome|indoor/i.test(condition);
+  if (isDome) {
+    return { delta: 0, included: false, label: 'Weather neutral — dome / roof closed' };
+  }
+
+  // No usable data at all → neutral, not included.
+  if (temp == null && windMph == null) {
+    return { delta: 0, included: false, label: 'Weather neutral — no data' };
+  }
+
+  let delta = 0;
+  const parts: string[] = [];
+
+  // Temperature contribution.
+  if (temp != null) {
+    if (temp >= 85) { delta += 2; parts.push(`${temp}°F warm (+2)`); }
+    else if (temp >= 75) { delta += 1; parts.push(`${temp}°F mild (+1)`); }
+    else if (temp <= 45) { delta -= 1; parts.push(`${temp}°F cold (-1)`); }
+    else parts.push(`${temp}°F neutral`);
+  }
+
+  // Wind contribution — only "out" / "in" matter; crosswind is neutral.
+  if (windMph != null && windMph > 0 && windDir) {
+    const windOut = windDir.includes('out');
+    const windIn = windDir.includes('in from') || /\bin\b/.test(windDir);
+    const mag = windMph >= 15 ? 3 : windMph >= 10 ? 2 : 1;
+    if (windOut) { delta += mag; parts.push(`wind ${windMph}mph out (+${mag})`); }
+    else if (windIn) { delta -= mag; parts.push(`wind ${windMph}mph in (-${mag})`); }
+    else parts.push(`wind ${windMph}mph crosswind`);
+  }
+
+  // Clamp so weather can never swing a ranking on its own.
+  delta = clamp(delta, -3, 5);
+
+  return {
+    delta,
+    included: delta !== 0,
+    label: delta === 0
+      ? `Weather neutral — ${parts.join(', ') || 'no swing'}`
+      : `Weather ${delta > 0 ? '+' : ''}${delta} — ${parts.join(', ')}`,
+  };
 }
 
 /**
@@ -929,7 +1053,12 @@ export interface HrTargetBreakdown {
   pitcher_score: number;         // pitcher contribution only
   handedness_score: number;      // handedness vs probable
   venue_score: number;           // park contribution
-  weather_score: number;         // 0 today; placeholder
+  weather_score: number;         // legacy weight-0 component contribution (always 0)
+  /** Light weather adjustment applied to the final heat score (≈ -3..+5).
+   *  0 when weather is missing or the game is in a dome. See
+   *  computeWeatherAdjustment(). The `weather_included` flag on HrTarget
+   *  says whether this actually moved the score. */
+  weather_adjustment: number;
   /** Combined negative-weighting adjustment applied to this target.
    *  Sum of all penalties (≤ 0). Examples:
    *    - Cold-streak (elite slugger gone quiet for L5+L7d) → -10
@@ -1032,6 +1161,15 @@ export interface HrTarget {
    *  /targets so the user can tell whether a high score is broad-based
    *  or built on thin data. */
   confidence: 'high' | 'medium' | 'low';
+
+  // Weather context, denormalized for display in the expanded row.
+  weather_condition: string | null;
+  weather_temp_f: number | null;
+  weather_wind_mph: number | null;
+  weather_wind_dir: string | null;
+  /** True when weather actually moved the heat score (false = dome /
+   *  missing data / net-zero swing). */
+  weather_included: boolean;
 }
 
 export interface HrTargetsBoard {
@@ -1046,6 +1184,11 @@ export interface HrTargetsBoard {
   home_facing: { id: number | null; name: string; hand: string | null };
   away_targets: HrTarget[];
   home_targets: HrTarget[];
+  // Weather context for the whole game (null until enrich:weather runs).
+  weather_condition: string | null;
+  weather_temp_f: number | null;
+  weather_wind_mph: number | null;
+  weather_wind_dir: string | null;
 }
 
 interface InternalAgg {
@@ -1362,7 +1505,19 @@ export function computeHrTargets(
   const sevenStart = addDays(asOf, -6);
   const yearStart = `${asOf.slice(0, 4)}-01-01`;
 
-  function rankForTeam(team: string, opponent: string, venueName: string | null, pitcher: { id: number | null; name: string; hand: string | null }): HrTarget[] {
+  function rankForTeam(
+    team: string,
+    opponent: string,
+    venueName: string | null,
+    pitcher: { id: number | null; name: string; hand: string | null },
+    weather: {
+      adjustment: WeatherAdjustment;
+      condition: string | null;
+      temp_f: number | null;
+      wind_mph: number | null;
+      wind_dir: string | null;
+    },
+  ): HrTarget[] {
     const pool = candidatesByTeam.get(team) ?? [];
 
     // Per-pitcher form — prefer pitcher_starts data when present, else
@@ -1627,6 +1782,18 @@ export function computeHrTargets(
         });
       }
 
+      // ---- WEATHER ADJUSTMENT (light) ----
+      // A small, bounded environmental nudge applied LAST so it never
+      // swings a ranking on its own. Neutral (delta 0) when the game is
+      // in a dome or weather data is missing.
+      if (weather.adjustment.delta !== 0) {
+        heat += weather.adjustment.delta;
+        adjustments.push({
+          label: weather.adjustment.label,
+          delta: weather.adjustment.delta,
+        });
+      }
+
       // Heat never goes below 0
       if (heat < 0) heat = 0;
 
@@ -1674,6 +1841,7 @@ export function computeHrTargets(
         handedness_score: round1(c_hand),
         venue_score: round1(c_park),
         weather_score: round1(c_weather),
+        weather_adjustment: round1(weather.adjustment.delta),
         cold_penalty: round1(cold_penalty),
         stability_factor: round2(stab),
         factors_firing: factorsForMultiplier,
@@ -1718,6 +1886,11 @@ export function computeHrTargets(
         venue_total,
         is_elite_power: isElitePower,
         confidence,
+        weather_condition: weather.condition,
+        weather_temp_f: weather.temp_f,
+        weather_wind_mph: weather.wind_mph,
+        weather_wind_dir: weather.wind_dir,
+        weather_included: weather.adjustment.included,
       };
       target.reasons = pickReasons(target);
       return target;
@@ -1744,6 +1917,22 @@ export function computeHrTargets(
       hand: g.home_probable_pitcher_hand ?? (g.home_probable_pitcher_id != null ? pitcherIndex.get(g.home_probable_pitcher_id)?.pitcher_throws ?? null : null),
     };
 
+    // Weather is per-game — compute the light adjustment once and share
+    // it across both teams' targets. Optional fields on HrTargetGame
+    // default to null so games without weather data stay fully neutral.
+    const weatherCtx = {
+      adjustment: computeWeatherAdjustment({
+        condition: g.weather_condition ?? null,
+        temp_f: g.weather_temp_f ?? null,
+        wind_mph: g.weather_wind_mph ?? null,
+        wind_dir: g.weather_wind_dir ?? null,
+      }),
+      condition: g.weather_condition ?? null,
+      temp_f: g.weather_temp_f ?? null,
+      wind_mph: g.weather_wind_mph ?? null,
+      wind_dir: g.weather_wind_dir ?? null,
+    };
+
     return {
       game_pk: g.game_pk,
       game_date: g.game_date,
@@ -1752,8 +1941,12 @@ export function computeHrTargets(
       venue_name: g.venue_name,
       away_facing: awayFacing,
       home_facing: homeFacing,
-      away_targets: rankForTeam(g.away_team, g.home_team, g.venue_name, awayFacing),
-      home_targets: rankForTeam(g.home_team, g.away_team, g.venue_name, homeFacing),
+      away_targets: rankForTeam(g.away_team, g.home_team, g.venue_name, awayFacing, weatherCtx),
+      home_targets: rankForTeam(g.home_team, g.away_team, g.venue_name, homeFacing, weatherCtx),
+      weather_condition: weatherCtx.condition,
+      weather_temp_f: weatherCtx.temp_f,
+      weather_wind_mph: weatherCtx.wind_mph,
+      weather_wind_dir: weatherCtx.wind_dir,
     };
   });
 }

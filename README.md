@@ -490,6 +490,51 @@ The `logSummary` array also picks up the granular phrases:
 `live games checked — N for {date}`, `finals newly processed — N for {date}`,
 `home runs ingested — N new row(s) for {date}`, `latest HR created_at — {ts}`.
 
+### Weather
+
+Each game carries weather pulled from the MLB live feed's
+`gameData.weather` block — no external weather API, no API key. The
+four `games` columns (`weather`, `weather_temp_f`, `weather_wind_mph`,
+`weather_wind_dir`, all from migration 004) are populated by
+`npm run enrich:weather`, which runs automatically inside `update:daily`
+phase 3.
+
+**Caveat:** the feed only carries weather a few hours before first
+pitch — games further out simply have no weather block, and the
+enrichment skips them gracefully (logged as `no weather block yet`).
+The step runs every cron tick with `--refresh-all`, so weather lands
+as soon as MLB publishes it and updates as conditions change during a
+live game. A per-game failure never blocks the rest of the update.
+
+**Where weather shows up:**
+- **Matchups** (`/matchups`) — a `🌤 82°F • Wind 12 mph out to lf` line
+  on each game panel.
+- **HR Targets** (`/targets`) — the same line on each game card, plus a
+  dedicated "Weather" tile in the expanded row showing temp, wind, and
+  whether weather moved the heat score.
+- **Dashboard** (`/`) — each "HRs today" card is tagged with the
+  conditions that HR was hit in.
+
+**Scoring — deliberately light.** Weather is a small bounded nudge
+applied *last*, after every other adjustment, so it can never swing a
+ranking on its own (`computeWeatherAdjustment`, range ≈ -3..+5):
+
+| Condition | Effect |
+| --- | ---: |
+| Temp ≥ 85°F | +2 |
+| Temp ≥ 75°F | +1 |
+| Temp ≤ 45°F | -1 |
+| Wind blowing **out** | +1 / +2 (≥10 mph) / +3 (≥15 mph) |
+| Wind blowing **in** | -1 / -2 (≥10 mph) / -3 (≥15 mph) |
+| Crosswind / calm | neutral |
+| Dome / roof closed | **neutral — not included** |
+| Missing weather | **neutral — not included** |
+
+The expanded HR Target row shows the weather score and explicitly says
+whether it was *included* or *neutral*, so a dome game or a
+data-missing game reads honestly as "Weather score: 0.0 (neutral — not
+included)".
+
 ### Future work — batter game logs
 
 The current schema stores only HR *events* (`home_runs`) and pitcher

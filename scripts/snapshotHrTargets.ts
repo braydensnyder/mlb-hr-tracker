@@ -312,7 +312,7 @@ export async function snapshotHrTargets(date: string, opts: SnapshotOptions = {}
     if (name && ELITE_POWER_NAMES.has(name)) elitePowerIds.add(id);
   }
 
-  // 4. Map GameRow → HrTargetGame
+  // 4. Map GameRow → HrTargetGame (including weather context)
   const targetGames: HrTargetGame[] = games.map((g) => ({
     game_pk: g.game_pk,
     game_date: g.game_date,
@@ -325,6 +325,10 @@ export async function snapshotHrTargets(date: string, opts: SnapshotOptions = {}
     away_probable_pitcher_id: g.away_probable_pitcher_id,
     away_probable_pitcher_name: g.away_probable_pitcher_name,
     away_probable_pitcher_hand: g.away_probable_pitcher_hand,
+    weather_condition: g.weather?.condition ?? null,
+    weather_temp_f: g.weather_temp_f ?? null,
+    weather_wind_mph: g.weather_wind_mph ?? null,
+    weather_wind_dir: g.weather_wind_dir ?? null,
   }));
 
   // 5. Run the model

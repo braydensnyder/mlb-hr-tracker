@@ -39,6 +39,7 @@ import { enrichHandedness } from './enrichHandedness.js';
 import { enrichVenues } from './enrichVenues.js';
 import { enrichPitcherStarts } from './enrichPitcherStarts.js';
 import { enrichPlayers } from './enrichPlayers.js';
+import { enrichWeather } from './enrichWeather.js';
 import { rebuildPlayerSummaries } from './rebuildPlayerSummaries.js';
 import { snapshotHrTargets } from './snapshotHrTargets.js';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
@@ -200,6 +201,15 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
   await runStep(
     `enrich:pitcher-starts (${addDays(today, -14)} → ${today})`,
     () => enrichPitcherStarts({ start: addDays(today, -14), end: today }),
+    steps,
+  );
+  // Weather: pull gameData.weather from the MLB feed for the schedule
+  // window. refreshAll so in-progress games get updated conditions; the
+  // feed has no weather for games hours out, so those just skip. Cheap
+  // and isolated — a failure here never blocks the rest of the run.
+  await runStep(
+    `enrich:weather (${yesterday} → ${plus3}, refresh-all)`,
+    () => enrichWeather({ start: yesterday, end: plus3, refreshAll: true }),
     steps,
   );
   // Players: a heavier /v1/people loop. Skip on night runs to keep them fast.

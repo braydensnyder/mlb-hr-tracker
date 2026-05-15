@@ -17,6 +17,7 @@
     "enrich:players": "tsx scripts/runEnrichPlayers.ts",
     "enrich:probable-pitchers": "tsx scripts/runEnrichProbablePitchers.ts",
     "enrich:pitcher-starts": "tsx scripts/runEnrichPitcherStarts.ts",
+    "enrich:weather": "tsx scripts/runEnrichWeather.ts",
     "update:daily": "tsx scripts/runUpdateDaily.ts daily",
     "update:morning": "tsx scripts/runUpdateDaily.ts morning",
     "update:live": "tsx scripts/runUpdateDaily.ts live",

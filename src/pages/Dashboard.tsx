@@ -16,6 +16,7 @@ import {
   applyCanonicalTeams,
   applyFilters,
   backToBackHr,
+  formatWeatherLine,
   hotHittersLastNGames,
   hrsInLastDays,
   leagueHandednessSplit,
@@ -64,6 +65,39 @@ async function fetchSeasonToDate(asOf: string): Promise<HomeRunRow[]> {
   return all;
 }
 
+/**
+ * Fetch the games on `date` (just the weather-relevant columns) so the
+ * Dashboard can label each "HRs today" card with the conditions that
+ * HR was hit in. Soft helper — a failure here just means no weather
+ * tag on the cards.
+ */
+async function fetchGameWeather(
+  date: string,
+): Promise<Map<number, string>> {
+  const { data, error } = await supabase
+    .from('games')
+    .select('game_pk, weather, weather_temp_f, weather_wind_mph, weather_wind_dir')
+    .eq('game_date', date);
+  if (error) throw new Error(error.message);
+  const out = new Map<number, string>();
+  for (const g of (data ?? []) as {
+    game_pk: number;
+    weather: { condition?: string } | null;
+    weather_temp_f: number | null;
+    weather_wind_mph: number | null;
+    weather_wind_dir: string | null;
+  }[]) {
+    const line = formatWeatherLine({
+      condition: g.weather?.condition ?? null,
+      temp_f: g.weather_temp_f,
+      wind_mph: g.weather_wind_mph,
+      wind_dir: g.weather_wind_dir,
+    });
+    if (line) out.set(g.game_pk, line);
+  }
+  return out;
+}
+
 export default function Dashboard() {
   // ---- single source of truth: the as-of date ----
   // Honor ?asOf= from the URL so navigating back from a player page keeps context.
@@ -88,6 +122,8 @@ export default function Dashboard() {
    *  Re-fetched on every refresh tick so the card stays current as the
    *  cron lands new live-game HRs into Supabase. */
   const [todayStatus, setTodayStatus] = useState<TodayStatus | null>(null);
+  /** game_pk → formatted weather line, for labelling the HRs-today cards. */
+  const [weatherByGame, setWeatherByGame] = useState<Map<number, string>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -134,6 +170,11 @@ export default function Dashboard() {
     fetchTodayStatus(asOf)
       .then((s) => { if (!cancelled) setTodayStatus(s); })
       .catch(() => { if (!cancelled) setTodayStatus(null); });
+
+    // Game weather for the as-of date — used to tag the HRs-today cards.
+    fetchGameWeather(asOf)
+      .then((m) => { if (!cancelled) setWeatherByGame(m); })
+      .catch(() => { if (!cancelled) setWeatherByGame(new Map()); });
 
     return () => {
       cancelled = true;
@@ -304,7 +345,12 @@ export default function Dashboard() {
         ) : (
           <div style={{ display: 'grid', gap: 8 }}>
             {hrsToday.map((hr) => (
-              <HomeRunCard key={hr.id} hr={hr} asOf={asOf} />
+              <HomeRunCard
+                key={hr.id}
+                hr={hr}
+                asOf={asOf}
+                weather={weatherByGame.get(hr.game_pk) ?? null}
+              />
             ))}
           </div>
         )}

@@ -55,6 +55,14 @@ export interface GameRow {
   away_probable_pitcher_id: number | null;
   away_probable_pitcher_name: string | null;
   away_probable_pitcher_hand: string | null;
+
+  // Weather (populated by `npm run enrich:weather` from the MLB feed —
+  // null until MLB publishes it, usually a few hours before first pitch).
+  /** Raw gameData.weather object from the feed. */
+  weather: { condition?: string; temp?: string; wind?: string } | null;
+  weather_temp_f: number | null;
+  weather_wind_mph: number | null;
+  weather_wind_dir: string | null;
 }
 
 /** Canonical players catalog. The frontend prefers `current_team_name` from
