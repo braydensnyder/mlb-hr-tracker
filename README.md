@@ -955,64 +955,87 @@ npm run update:morning   # ~8 AM — yesterday's finals
 npm run update:night     # ~10 PM — today's finals
 ```
 
-#### Vercel Cron automation (primary)
+#### Vercel Cron automation — ONE smart hourly cron
 
-The scheduled cron is hosted on **Vercel Cron**, not GitHub Actions —
-GH Actions' cron was firing unreliably for this repo. The configuration
-lives in [`vercel.json`](./vercel.json) and the endpoint is
-[`api/cron/update.ts`](./api/cron/update.ts).
+The scheduled cron is **a single hourly Vercel Cron** (`7 * * * *`) that
+*decides for itself* how much work to do. One cron entry, smart tiering
+inside the endpoint — so the app stays fresh every hour without doing
+expensive rebuilds 24× a day. Config lives in
+[`vercel.json`](./vercel.json), the endpoint is
+[`api/cron/update.ts`](./api/cron/update.ts), and the decision logic is
+[`scripts/lib/cronState.ts`](./scripts/lib/cronState.ts).
 
-| Pacific time | UTC cron (PDT) | Mode | Path | Snapshot behavior |
-| --- | --- | --- | --- | --- |
-|  ~8:07 AM PT | `7 15 * * *` | **morning** | `/api/cron/update?mode=morning` | **FORCE rebuild** today's snapshot (clean pregame baseline) |
-| ~12:07 PM PT | `7 19 * * *` | **live**    | `/api/cron/update?mode=live`    | **NO-OP** — preserves morning baseline |
-|  ~3:07 PM PT | `7 22 * * *` | **live**    | `/api/cron/update?mode=live`    | **NO-OP** — preserves morning baseline |
-| ~10:07 PM PT | `7 5 * * *`  | **night**   | `/api/cron/update?mode=night`   | **FORCE update** today's snapshot (final post-game) |
+```json
+"crons": [ { "path": "/api/cron/update", "schedule": "7 * * * *" } ]
+```
 
-##### Mode lifecycle
+##### Smart tiers — chosen automatically by `decideMode()`
 
-The orchestrator runs the same pipeline across all four crons, but each
-mode tunes which steps fire and how the snapshot is written. The intent
-is that *each day starts with a clean refreshed baseline* and the
-afternoon live runs never silently overwrite that baseline with stale
-mid-day model output.
+Every hour the endpoint reads the `cron_state` row (migration 009) and
+picks one of three tiers from the wall clock + how long it's been since
+the last heavy run:
 
-| Mode    | process(yesterday) | process(today) | snapshot(today)             | snapshot(tomorrow)             |
-| ---     | ---                | ---            | ---                         | ---                            |
-| morning | ✓                  | skip           | **FORCE rebuild**           | skip-if-exists, pre-game-only  |
-| live    | ✓                  | ✓              | NO-OP (preserve baseline)   | NO-OP (preserve baseline)      |
-| night   | ✓                  | ✓              | **FORCE update** (post-game) | skip-if-exists, pre-game-only |
-| daily   | ✓                  | ✓              | skip-if-exists, pre-game-only | skip-if-exists, pre-game-only |
+| Tier | When | What it does |
+| --- | --- | --- |
+| **light** | every hour (default) | Pull today's schedule, ingest live/final HRs, refresh game statuses, cheap weather fill. **No** heavy enrichments, **no** snapshot writes, **no** summary rebuilds. Fast (~15-25s). |
+| **full** | ≥ 6h since last heavy run | Wide schedule pull, all enrichments (probables, handedness, venues, pitcher-starts, players), weather refresh-all, summary rebuilds. The **first full of the UTC day** force-rebuilds today's snapshot (morning baseline). |
+| **night** | once/day, 07:00–13:00 UTC (post-games) | Same as `full` + force-rebuilds the nightly snapshot. Finalizes the day's actual results. |
 
-**Yesterday is processed on every cron mode** so late-finalizing west-coast
-games or games that wrapped between cron ticks always get a second
-chance to ingest. `processDate` is idempotent: once all of yesterday's
-games are marked `processed=true`, the call short-circuits to a single
-schedule-fetch + an empty pending-games query. Effectively free.
+Practical cadence when the cron fires hourly: ~18 light ticks, ~4 full
+runs, 1 night run per day. APIs and Vercel limits stay respected; the
+Dashboard still updates every hour because `light` always ingests HRs.
 
-The JSON response from `/api/cron/update` echoes the active mode plus a
-`logSummary` array containing the operator-friendly phrases:
-`active mode: <mode>`, `created snapshot — ...`,
-`snapshot overwritten — created ...`, `snapshot already exists, skipped`,
-`live mode — preserving morning baseline`, `live preview updated`,
-`results processed`, and `snapshot diagnostics`. Grep on those strings
-to confirm what each cron tick actually did.
+> **Degrades gracefully.** If the cron only fires once per day (some
+> plans throttle cron frequency), `decideMode()` sees a large
+> `hoursSinceHeavy` and picks `full` or `night` every time — so the app
+> still updates, just less granularly. The design doesn't *depend* on
+> hourly firing.
 
-The endpoint:
+##### Safeguards
 
-- Requires `Authorization: Bearer <CRON_SECRET>` — Vercel Cron sends
-  this header automatically when `CRON_SECRET` is set in the project env.
-- Calls the same `updateDaily()` orchestrator as `npm run update:daily`.
-- Returns JSON `{ ok, mode, durationMs, stepCount, failureCount,
-  failures, logSummary }` — the `logSummary` slice contains the exact
-  greppable phrases (`created snapshot`, `snapshot already exists, skipped`,
-  `live preview updated`, `results processed`, `snapshot diagnostics`).
-- Has `maxDuration: 300` so a multi-minute run fits inside one
-  invocation. **Requires Vercel Pro plan** (Hobby caps at 10s and 2 daily
-  cron jobs).
-- Never exposes `SUPABASE_SERVICE_ROLE_KEY` to the frontend bundle — it
-  lives only in Vercel's server-side env and is referenced from inside
-  the serverless function.
+- **Bearer `CRON_SECRET` auth** — Vercel Cron sends the header
+  automatically when `CRON_SECRET` is set in project env.
+- **Overlap lock** — `cron_state.running` is an atomic compare-and-set
+  flag. If a previous run is still in flight, the new tick returns
+  `mode: "skipped-locked"` and exits cleanly. A stale lock (> 15 min,
+  e.g. a crashed run) is auto-stolen.
+- **Heavy-rebuild throttle** — `full`/`night` only fire when ≥ 6h have
+  passed since the last heavy run (tracked in `cron_state.last_heavy_run_at`).
+- **Step isolation** — `updateDaily` wraps every step in `runStep`; a
+  failing weather pull or one bad MLB API call never fails the whole run.
+- **Service-role key** stays server-only — never in the frontend bundle.
+
+##### Manual override + testing
+
+`?mode=light|full|night|daily|morning|live` runs that tier directly
+(still takes the lock). Handy for testing:
+
+```bash
+curl -sS "https://<project>.vercel.app/api/cron/update?mode=full" \
+  -H "Authorization: Bearer $CRON_SECRET" | head -c 3000
+```
+
+##### Response JSON
+
+The endpoint returns a flat, dashboard-friendly metric block:
+
+```json
+{
+  "ok": true, "mode": "light", "decisionReason": "2.1h since last heavy run (< 6h) — light tick",
+  "gamesChecked": 15, "liveGamesProcessed": 6, "finalGamesProcessed": 2,
+  "HRsInserted": 4, "duplicatesSkipped": 11, "weatherUpdated": 3,
+  "summariesRebuilt": 0, "snapshotsCreated": 0, "snapshotsSkipped": 1,
+  "lastUpdatedAt": "2026-05-13T22:14:08Z",
+  "actualResults": { "today": { ... }, "yesterday": { ... } },
+  "logSummary": [ ... ]
+}
+```
+
+The endpoint has `maxDuration: 300`. On the Vercel **Hobby** plan
+function duration is capped lower (and cron frequency may be throttled);
+the smart-tier design is built to tolerate that — `light` ticks finish
+fast, and if cron frequency is throttled the tier logic still produces a
+correct (just less granular) result.
 
 ##### Vercel environment variables — setup
 
@@ -1038,8 +1061,14 @@ curl -X POST 'https://<your-project>.vercel.app/api/cron/update' \
   -H "Authorization: Bearer $CRON_SECRET"
 ```
 
-A successful run returns JSON with `ok: true` and a `logSummary` array
-showing whether snapshots were created or skipped.
+A successful run returns JSON with `ok: true` and the flat metric block
+(`gamesChecked`, `HRsInserted`, `mode`, `decisionReason`, …).
+
+> **One-time setup:** run **migration 009** (`supabase/migrations/009_cron_state.sql`)
+> in the Supabase SQL editor before the smart cron can throttle properly.
+> Without it the endpoint still works — it just can't track "last heavy
+> run", so `decideMode()` treats every tick as a candidate for a `full`
+> run and there's no overlap lock. The migration is idempotent.
 
 #### GitHub Actions — manual backup only
 

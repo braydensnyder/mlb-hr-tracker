@@ -1,26 +1,38 @@
 /**
- * api/cron/update — Vercel Cron entry point for the HR Tracker update
- * pipeline. The smoke test (api/cron/update.js) confirmed routing
- * works; this version layers back on the real logic:
+ * api/cron/update — the SINGLE smart hourly cron endpoint.
  *
- *   1. Bearer-CRON_SECRET auth
- *   2. Required-env check (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
- *   3. updateDaily() call — same pipeline as `npm run update:daily`
- *   4. JSON response with operator-friendly log summary
+ * vercel.json fires this once an hour (`7 * * * *`). The endpoint then
+ * decides — from the wall clock + the `cron_state` row — HOW MUCH work
+ * to do, so one hourly cron stays cheap most of the time and only does
+ * heavy rebuilds a few times a day:
  *
- * GET (Vercel Cron) and POST (manual testing) both supported.
+ *   - light  — hourly tick: ingest live/final HRs, refresh statuses +
+ *              weather. No heavy enrichments / snapshots / summaries.
+ *   - full   — every ~6h: wide schedule pull, all enrichments, summary
+ *              rebuilds. First full of the UTC day = morning baseline
+ *              (force-rebuilds today's snapshot).
+ *   - night  — once/day post-games: finalize results + nightly snapshot.
  *
- * Mode override — supply ?mode=morning or ?mode=night. Default "daily".
+ * Safeguards:
+ *   - Bearer CRON_SECRET auth.
+ *   - Atomic DB lock (cron_state.running) prevents overlapping runs;
+ *     a stale lock (>15 min) is auto-stolen.
+ *   - updateDaily isolates every step — one failing API never fails
+ *     the whole run.
  *
- * Service-role secrets are server-only — never leaked to the frontend
- * bundle. vercel.json pins maxDuration=300 so the multi-minute update
- * fits inside one invocation (requires Vercel Pro).
+ * Manual override: ?mode=light|full|night|daily|morning|live runs that
+ * mode directly (still takes the lock). Handy for testing.
+ *
+ * GET (Vercel Cron) and POST (manual curl) both supported.
  */
 import { updateDaily, type UpdateMode } from '../../scripts/updateDaily.js';
+import {
+  acquireCronLock,
+  releaseCronLock,
+  readCronState,
+  decideMode,
+} from '../../scripts/lib/cronState.js';
 
-// Inline shape that matches Vercel's Node-runtime request/response.
-// Avoids depending on @vercel/node devDep — runtime objects satisfy
-// these shapes naturally.
 interface VercelReqLike {
   method?: string;
   headers: Record<string, string | string[] | undefined>;
@@ -37,28 +49,27 @@ export const config = {
   maxDuration: 300,
 };
 
+const VALID_MODES: UpdateMode[] = ['light', 'full', 'night', 'daily', 'morning', 'live'];
+
 function isAuthorized(req: VercelReqLike): boolean {
   const secret = process.env.CRON_SECRET;
-  if (!secret) return false; // refuse rather than serve unguarded
+  if (!secret) return false;
   const raw = req.headers['authorization'] ?? req.headers['Authorization'];
   const authHeader = Array.isArray(raw) ? raw[0] : raw;
   return authHeader === `Bearer ${secret}`;
 }
 
-function parseMode(req: VercelReqLike): UpdateMode {
+/** Optional manual override — ?mode=... runs that mode directly. */
+function parseModeOverride(req: VercelReqLike): UpdateMode | null {
   const raw = req.query['mode'];
   const v = Array.isArray(raw) ? raw[0] : raw;
-  if (v === 'morning' || v === 'live' || v === 'night' || v === 'daily') return v;
-  return 'daily';
+  return v && (VALID_MODES as string[]).includes(v) ? (v as UpdateMode) : null;
 }
 
 export default async function handler(req: VercelReqLike, res: VercelResLike): Promise<void> {
-  // Force JSON on every code path. Belt-and-suspenders so a thrown
-  // error or CDN edge case can't accidentally serve HTML.
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
 
-  // Vercel Cron uses GET. Manual testing typically uses POST. Both ok.
   if (req.method && req.method !== 'GET' && req.method !== 'POST') {
     res.status(405).json({ ok: false, route: 'cron-update', error: `Method ${req.method} not allowed — use GET or POST` });
     return;
@@ -88,58 +99,74 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
     return;
   }
 
-  const mode = parseMode(req);
+  // ---- SAFEGUARD: prevent overlapping runs ----
+  const gotLock = await acquireCronLock();
+  if (!gotLock) {
+    // Another run is in flight (and its lock is fresh). Skip cleanly —
+    // do NOT release a lock we don't hold.
+    res.status(200).json({
+      ok: true,
+      route: 'cron-update',
+      mode: 'skipped-locked',
+      message: 'Another cron run is in progress — skipped this tick to avoid overlap.',
+    });
+    return;
+  }
 
-  // Capture stdout so the response includes the operator-friendly log
-  // phrases — easier than scrolling Vercel's function logs.
+  // Capture stdout so the response carries the operator-friendly log.
   const capturedLines: string[] = [];
   const originalLog = console.log;
   const originalWarn = console.warn;
   const originalError = console.error;
   const captureLine = (level: 'log' | 'warn' | 'error', args: unknown[]): void => {
-    const text = args
-      .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
-      .join(' ');
+    const text = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
     capturedLines.push(level === 'log' ? text : `[${level}] ${text}`);
   };
   console.log = (...args: unknown[]) => { captureLine('log', args); originalLog(...args); };
   console.warn = (...args: unknown[]) => { captureLine('warn', args); originalWarn(...args); };
   console.error = (...args: unknown[]) => { captureLine('error', args); originalError(...args); };
 
+  // Decide the tier. A ?mode= override wins; otherwise decideMode()
+  // picks light / full / night from the clock + cron_state.
+  const override = parseModeOverride(req);
+  let tier: UpdateMode;
+  let forceSnapshot: boolean;
+  let decisionReason: string;
+  if (override) {
+    tier = override;
+    // Manual full → force the snapshot rebuild (operator intent).
+    forceSnapshot = override === 'full' || override === 'morning' || override === 'night';
+    decisionReason = `manual override ?mode=${override}`;
+  } else {
+    const state = await readCronState();
+    const decision = decideMode(new Date(), state);
+    tier = decision.tier;
+    forceSnapshot = decision.forceSnapshot;
+    decisionReason = decision.reason;
+  }
+
+  const heavyRan = tier === 'full' || tier === 'night' || tier === 'morning' || tier === 'daily';
+  const nightRan = tier === 'night';
+
   try {
-    const result = await updateDaily(mode);
+    console.log(`[cron] decided tier=${tier} (${decisionReason})`);
+    const result = await updateDaily(tier, { forceSnapshot });
 
     const greppable = capturedLines.filter((l) =>
-      /active mode|created snapshot|snapshot overwritten|snapshot already exists, skipped|live mode — preserving|live preview updated|results processed|live games checked|finals newly processed|home runs ingested|latest HR created_at|snapshot diagnostics/i.test(l),
+      /\[cron\]|decided tier|active mode|created snapshot|snapshot overwritten|snapshot already exists, skipped|no snapshot writes|live preview updated|results processed|live games checked|finals newly processed|home runs ingested|duplicates skipped|latest HR created_at|snapshot diagnostics/i.test(l),
     );
 
-    // Pull out a compact, dashboard-friendly view of actual-results
-    // ingest. The Dashboard status card on the frontend reads the same
-    // shape from Supabase directly; we surface it here so curl-testing
-    // can see at a glance what the pipeline accomplished.
-    const summarize = (r: typeof result.actualResults.today) =>
-      r
-        ? {
-            date: r.date,
-            totalGames: r.totalGames,
-            liveGamesChecked: r.liveGamesChecked,
-            finalGamesProcessed: r.finalGamesProcessed,
-            alreadyProcessed: r.alreadyProcessed,
-            pendingPregame: r.pendingPregame,
-            homeRunsInserted: r.homeRunsInserted,
-            pitcherStartsInserted: r.pitcherStartsInserted,
-            latestHrCreatedAt: r.latestHrCreatedAt,
-          }
-        : null;
-
+    const s = result.summary;
     res.status(200).json({
       ok: result.failures.length === 0,
       route: 'cron-update',
-      mode: result.mode,
+      mode: s.mode,
+      decisionReason,
+      forceSnapshot,
       message:
         result.failures.length === 0
-          ? `update:${result.mode} completed cleanly`
-          : `update:${result.mode} completed with ${result.failures.length} failure(s)`,
+          ? `update:${s.mode} completed cleanly`
+          : `update:${s.mode} completed with ${result.failures.length} failure(s)`,
       today: result.today,
       yesterday: result.yesterday,
       scheduleWindow: result.scheduleWindow,
@@ -147,9 +174,20 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
       stepCount: result.steps.length,
       failureCount: result.failures.length,
       failures: result.failures,
+      // The flat, dashboard-friendly metric block.
+      gamesChecked: s.gamesChecked,
+      liveGamesProcessed: s.liveGamesProcessed,
+      finalGamesProcessed: s.finalGamesProcessed,
+      HRsInserted: s.HRsInserted,
+      duplicatesSkipped: s.duplicatesSkipped,
+      weatherUpdated: s.weatherUpdated,
+      summariesRebuilt: s.summariesRebuilt,
+      snapshotsCreated: s.snapshotsCreated,
+      snapshotsSkipped: s.snapshotsSkipped,
+      lastUpdatedAt: s.lastUpdatedAt,
       actualResults: {
-        today: summarize(result.actualResults.today),
-        yesterday: summarize(result.actualResults.yesterday),
+        today: summarizeProcess(result.actualResults.today),
+        yesterday: summarizeProcess(result.actualResults.yesterday),
       },
       logSummary: greppable.slice(-60),
     });
@@ -158,13 +196,42 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
     res.status(500).json({
       ok: false,
       route: 'cron-update',
-      mode,
+      mode: tier,
+      decisionReason,
       error: msg,
       logSummary: capturedLines.slice(-30),
     });
   } finally {
+    // Always release the lock + record what ran, even if updateDaily threw.
+    try {
+      await releaseCronLock({
+        tier: tier === 'morning' || tier === 'daily' ? 'full' : (tier === 'live' ? 'light' : tier as 'light' | 'full' | 'night'),
+        heavyRan,
+        nightRan,
+      });
+    } catch {
+      /* non-fatal */
+    }
     console.log = originalLog;
     console.warn = originalWarn;
     console.error = originalError;
   }
+}
+
+/** Compact processDate roll-up for the response JSON. */
+function summarizeProcess(r: import('../../scripts/processDate.js').ProcessDateResult | null) {
+  return r
+    ? {
+        date: r.date,
+        totalGames: r.totalGames,
+        liveGamesChecked: r.liveGamesChecked,
+        finalGamesProcessed: r.finalGamesProcessed,
+        alreadyProcessed: r.alreadyProcessed,
+        pendingPregame: r.pendingPregame,
+        homeRunsInserted: r.homeRunsInserted,
+        duplicatesSkipped: r.duplicatesSkipped,
+        pitcherStartsInserted: r.pitcherStartsInserted,
+        latestHrCreatedAt: r.latestHrCreatedAt,
+      }
+    : null;
 }

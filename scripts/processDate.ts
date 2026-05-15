@@ -70,6 +70,10 @@ export interface ProcessDateResult {
    *  dedup means this counts the NET new rows (DB returns the inserted
    *  count, not the attempted count). */
   homeRunsInserted: number;
+  /** HR rows that were re-seen and skipped via the event_key unique
+   *  constraint (already in the DB) — i.e. attempted minus net-new.
+   *  Surfaced for the cron-response JSON's `duplicatesSkipped`. */
+  duplicatesSkipped: number;
   /** Pitcher-start rows inserted (final games only). */
   pitcherStartsInserted: number;
   /** Most-recent home_runs.created_at across the rows we just upserted.
@@ -127,6 +131,7 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
   );
 
   let totalHRs = 0;
+  let totalDupes = 0;
   let totalStarts = 0;
   let latestHrCreatedAt: string | null = null;
   const perGame: ProcessDateResult['perGame'] = [];
@@ -138,10 +143,12 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
     classification: 'final' | 'live' | 'already-processed' | 'pregame',
     hrs_inserted: number,
     starts_inserted: number,
+    dupes_skipped: number,
     error?: string,
   ) => {
     perGame.push({ game_pk, status, classification, hrs_inserted, starts_inserted, error });
     totalHRs    += hrs_inserted;
+    totalDupes  += dupes_skipped;
     totalStarts += starts_inserted;
   };
 
@@ -152,16 +159,17 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
       const hrs = extractHomeRuns(feed);
       const inserted = await upsertHomeRuns(hrs);
       latestHrCreatedAt = bumpLatestCreatedAt(latestHrCreatedAt, inserted.maxCreatedAt);
+      const dupes = Math.max(0, hrs.length - inserted.netInserted);
       console.log(
         `  [live game ${game.game_pk}] status="${game.status}" ` +
           `${inserted.netInserted}/${hrs.length} new HR(s) ingested ` +
-          `(processed=false → will re-check next run)`,
+          `(${dupes} dupe(s) skipped, processed=false → will re-check next run)`,
       );
-      record(game.game_pk, game.status, 'live', inserted.netInserted, 0);
+      record(game.game_pk, game.status, 'live', inserted.netInserted, 0, dupes);
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
       console.error(`  [live game ${game.game_pk}] FAILED: ${m}`);
-      record(game.game_pk, game.status, 'live', 0, 0, m);
+      record(game.game_pk, game.status, 'live', 0, 0, 0, m);
     }
   }
 
@@ -174,6 +182,7 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
 
       const hrIns = await upsertHomeRuns(hrs);
       latestHrCreatedAt = bumpLatestCreatedAt(latestHrCreatedAt, hrIns.maxCreatedAt);
+      const hrDupes = Math.max(0, hrs.length - hrIns.netInserted);
 
       let starterCount = 0;
       if (starts.length > 0) {
@@ -201,20 +210,20 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
       if (markErr) throw new Error(`mark processed failed: ${markErr.message}`);
 
       console.log(
-        `  [final game ${game.game_pk}] ${hrIns.netInserted} new HR(s), ` +
-          `${starterCount}/${starts.length} starter(s), processed=true`,
+        `  [final game ${game.game_pk}] ${hrIns.netInserted} new HR(s) ` +
+          `(${hrDupes} dupe(s) skipped), ${starterCount}/${starts.length} starter(s), processed=true`,
       );
-      record(game.game_pk, game.status, 'final', hrIns.netInserted, starterCount);
+      record(game.game_pk, game.status, 'final', hrIns.netInserted, starterCount, hrDupes);
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
       console.error(`  [final game ${game.game_pk}] FAILED: ${m}`);
-      record(game.game_pk, game.status, 'final', 0, 0, m);
+      record(game.game_pk, game.status, 'final', 0, 0, 0, m);
     }
   }
 
   // ---- 3c. record the no-op buckets so the summary is honest ----
-  for (const g of done)    record(g.game_pk, g.status, 'already-processed', 0, 0);
-  for (const g of pregame) record(g.game_pk, g.status, 'pregame', 0, 0);
+  for (const g of done)    record(g.game_pk, g.status, 'already-processed', 0, 0, 0);
+  for (const g of pregame) record(g.game_pk, g.status, 'pregame', 0, 0, 0);
 
   console.log(
     `  results processed — ${finals.length} game(s), ${totalHRs} HR(s), ` +
@@ -224,6 +233,7 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
   console.log(`  live games checked — ${live.length} for ${date}`);
   console.log(`  finals newly processed — ${finals.length} for ${date}`);
   console.log(`  home runs ingested — ${totalHRs} new row(s) for ${date}`);
+  console.log(`  duplicates skipped — ${totalDupes} HR row(s) for ${date}`);
   if (latestHrCreatedAt) {
     console.log(`  latest HR created_at — ${latestHrCreatedAt}`);
   }
@@ -236,6 +246,7 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
     alreadyProcessed: done.length,
     pendingPregame: pregame.length,
     homeRunsInserted: totalHRs,
+    duplicatesSkipped: totalDupes,
     pitcherStartsInserted: totalStarts,
     latestHrCreatedAt,
     perGame,

@@ -1,36 +1,34 @@
 /**
- * updateDaily — single orchestrator that runs all daily-update steps in
- * a safe, idempotent order. Designed to be triggered manually or by cron /
- * GitHub Actions on a cadence like 8am / 12pm / 3pm / 10pm.
+ * updateDaily — the single orchestrator behind the smart hourly cron.
  *
- * Three modes (all safe to re-run):
- *   - daily   — full pass; processes BOTH yesterday and today
- *   - morning — pregame baseline; processes yesterday's finals + FORCE-rebuilds
- *               today's snapshot (clean baseline for the day)
- *   - live    — midday refresh; processes today only; preserves the morning
- *               baseline snapshot (NO snapshot writes)
- *   - night   — postgame finalization; processes today only + FORCE-updates
- *               today's snapshot with final post-game model output
+ * It runs the same five phases every time, but a per-mode `PhaseConfig`
+ * decides HOW MUCH of each phase actually fires. That's what lets one
+ * hourly cron be cheap most of the time and thorough a few times a day.
  *
- * Pipeline (each step is isolated — a failure in one doesn't kill the run):
+ * Modes
+ *   Smart-cron tiers (chosen automatically by decideMode in cronState.ts):
+ *     - light  — hourly tick. Ingest live/final HRs, refresh today's
+ *                game statuses + weather. NO heavy enrichments, NO
+ *                snapshot writes, NO summary rebuilds.
+ *     - full   — heavy refresh (≈ every 6h). Wide schedule pull, all
+ *                enrichments, summary rebuilds. The first `full` of the
+ *                UTC day force-rebuilds today's snapshot (morning baseline).
+ *     - night  — post-game finalization (once/day). Same as `full` plus
+ *                a forced nightly snapshot rebuild.
+ *   Legacy manual modes (kept for `npm run update:*`):
+ *     - daily / morning / live — see phaseConfigFor() below.
  *
- *   1. Schedules — refresh probable pitchers + venue for [yesterday, today+3]
- *       via enrich:schedule. NEVER overwrites existing probables with null
- *       (see upsertGameRows in lib/games.ts).
- *   2. Process completed games — processDate(yesterday) and/or processDate(today).
- *       Only finalized + un-processed games get HR + pitcher-start extraction.
- *   3. Enrich — probable-pitcher live-feed fallback, handedness, venues,
- *       pitcher-starts (last 14 days), players (capped per run so we don't
- *       hammer /v1/people).
- *   4. Rebuild summaries — rebuildPlayerSummaries for yesterday and today so
- *       the player_daily_summary cache stays current for any future consumer.
- *       The frontend itself reads from raw home_runs / pitcher_starts and
- *       picks up changes automatically on next page load.
+ * Pipeline (each step isolated — a failure in one never kills the run):
+ *   1. Schedules   — enrich:schedule (narrow=today / wide=[yesterday,+3])
+ *   2. Process     — processDate(yesterday) + processDate(today): ingest
+ *                    HRs from live + final games (event_key dedup).
+ *   3. Enrich      — probable pitchers, handedness, venues, pitcher-starts,
+ *                    weather, players. Gated by config.heavyEnrichments.
+ *   4. Snapshot    — none / skip-if-exists / force-today, per config.
+ *   5. Summaries   — rebuildPlayerSummaries(yesterday + today), per config.
  *
- * No data is ever deleted. HR rows are deduped by event_key. Game rows
- * are upserted with null-safe semantics. Cache tables can be wiped + rebuilt
- * only via the explicit `rebuild:all` command, which this orchestrator
- * never invokes.
+ * No data is ever deleted. HR rows dedup by event_key, game rows upsert
+ * null-safe. The `summary` block on the result feeds the cron-response JSON.
  */
 import { enrichSchedule } from './enrichSchedule.js';
 import { processDate, type ProcessDateResult } from './processDate.js';
@@ -39,12 +37,102 @@ import { enrichHandedness } from './enrichHandedness.js';
 import { enrichVenues } from './enrichVenues.js';
 import { enrichPitcherStarts } from './enrichPitcherStarts.js';
 import { enrichPlayers } from './enrichPlayers.js';
-import { enrichWeather } from './enrichWeather.js';
+import { enrichWeather, type EnrichWeatherResult } from './enrichWeather.js';
 import { rebuildPlayerSummaries } from './rebuildPlayerSummaries.js';
-import { snapshotHrTargets } from './snapshotHrTargets.js';
+import { snapshotHrTargets, type SnapshotResult } from './snapshotHrTargets.js';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
 
-export type UpdateMode = 'daily' | 'morning' | 'live' | 'night';
+export type UpdateMode = 'daily' | 'morning' | 'live' | 'night' | 'light' | 'full';
+
+/** Drives which slice of each phase runs for a given mode. */
+interface PhaseConfig {
+  /** narrow = today only (cheap status refresh); wide = [yesterday, today+3]. */
+  scheduleWindow: 'narrow' | 'wide';
+  processYesterday: boolean;
+  processToday: boolean;
+  /** probable-pitchers + handedness + venues + pitcher-starts + players. */
+  heavyEnrichments: boolean;
+  /** none = skip; missing-only = cheap fill of today; refresh-all = wide re-pull. */
+  weatherRefresh: 'none' | 'missing-only' | 'refresh-all';
+  /** none = no writes; skip-if-exists = idempotent; force-today = rebuild today. */
+  snapshot: 'none' | 'skip-if-exists' | 'force-today';
+  rebuildSummaries: boolean;
+}
+
+function phaseConfigFor(mode: UpdateMode): PhaseConfig {
+  switch (mode) {
+    case 'light':
+      // Hourly tick — keep the app fresh, do NOTHING heavy.
+      return {
+        scheduleWindow: 'narrow',
+        processYesterday: true,
+        processToday: true,
+        heavyEnrichments: false,
+        weatherRefresh: 'missing-only',
+        snapshot: 'none',
+        rebuildSummaries: false,
+      };
+    case 'full':
+      // Heavy refresh every ~6h. Snapshot behavior (force vs skip) is
+      // decided by the caller via the `forceSnapshot` flag and passed
+      // through opts — see updateDaily().
+      return {
+        scheduleWindow: 'wide',
+        processYesterday: true,
+        processToday: true,
+        heavyEnrichments: true,
+        weatherRefresh: 'refresh-all',
+        snapshot: 'skip-if-exists', // overridden to force-today when forceSnapshot
+        rebuildSummaries: true,
+      };
+    case 'night':
+      // Post-game finalization — process finals, rebuild, lock the
+      // nightly snapshot.
+      return {
+        scheduleWindow: 'wide',
+        processYesterday: true,
+        processToday: true,
+        heavyEnrichments: true,
+        weatherRefresh: 'refresh-all',
+        snapshot: 'force-today',
+        rebuildSummaries: true,
+      };
+    case 'morning':
+      // Legacy manual: pregame baseline, today's games not yet played.
+      return {
+        scheduleWindow: 'wide',
+        processYesterday: true,
+        processToday: false,
+        heavyEnrichments: true,
+        weatherRefresh: 'refresh-all',
+        snapshot: 'force-today',
+        rebuildSummaries: true,
+      };
+    case 'live':
+      // Legacy manual: midday refresh, preserve baseline snapshot.
+      return {
+        scheduleWindow: 'wide',
+        processYesterday: true,
+        processToday: true,
+        heavyEnrichments: true,
+        weatherRefresh: 'refresh-all',
+        snapshot: 'none',
+        rebuildSummaries: true,
+      };
+    case 'daily':
+    default:
+      // Legacy manual full pass.
+      return {
+        scheduleWindow: 'wide',
+        processYesterday: true,
+        processToday: true,
+        heavyEnrichments: true,
+        weatherRefresh: 'refresh-all',
+        snapshot: 'skip-if-exists',
+        rebuildSummaries: true,
+      };
+  }
+}
 
 export interface StepLog {
   step: string;
@@ -57,13 +145,26 @@ export interface StepLog {
 /** Roll-up of the actual-results ingest across yesterday + today, fed
  *  to the cron-response JSON and used by the Dashboard status card. */
 export interface ActualResultsSummary {
-  /** Snapshot of the date this summary represents (today's actuals). */
   date: string;
-  /** Same metrics for yesterday — useful when the user opens the
-   *  Dashboard in the morning. null when yesterday wasn't processed. */
   yesterday: ProcessDateResult | null;
-  /** Today's metrics. null when today wasn't processed (e.g. mode=morning). */
   today: ProcessDateResult | null;
+}
+
+/** Flat, dashboard-friendly metrics — exactly the fields the cron
+ *  response surfaces. */
+export interface RunSummary {
+  mode: UpdateMode;
+  gamesChecked: number;
+  liveGamesProcessed: number;
+  finalGamesProcessed: number;
+  HRsInserted: number;
+  duplicatesSkipped: number;
+  weatherUpdated: number;
+  summariesRebuilt: number;
+  snapshotsCreated: number;
+  snapshotsSkipped: number;
+  /** Freshest home_runs.created_at seen this run (latest actual HR). */
+  lastUpdatedAt: string | null;
 }
 
 export interface UpdateDailyResult {
@@ -75,6 +176,14 @@ export interface UpdateDailyResult {
   steps: StepLog[];
   failures: { step: string; error: string }[];
   actualResults: ActualResultsSummary;
+  summary: RunSummary;
+}
+
+export interface UpdateDailyOptions {
+  /** When true (and the mode's config allows a snapshot), the snapshot
+   *  phase FORCE-rebuilds today's snapshot instead of skip-if-exists.
+   *  decideMode() sets this for the first `full` run of the UTC day. */
+  forceSnapshot?: boolean;
 }
 
 function todayISO() {
@@ -106,15 +215,31 @@ async function runStep<T>(name: string, fn: () => Promise<T>, log: StepLog[]): P
   }
 }
 
-export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDailyResult> {
+export async function updateDaily(
+  mode: UpdateMode = 'daily',
+  opts: UpdateDailyOptions = {},
+): Promise<UpdateDailyResult> {
   const t0 = Date.now();
   const today = todayISO();
   const yesterday = addDays(today, -1);
+  const tomorrow = addDays(today, 1);
   const plus3 = addDays(today, 3);
+
+  const cfg = phaseConfigFor(mode);
+  // `full` mode's snapshot behavior depends on whether this is the
+  // morning baseline run — caller passes forceSnapshot for that.
+  const effectiveSnapshot: PhaseConfig['snapshot'] =
+    mode === 'full' && opts.forceSnapshot ? 'force-today' : cfg.snapshot;
+
+  const schedStart = cfg.scheduleWindow === 'wide' ? yesterday : today;
+  const schedEnd = cfg.scheduleWindow === 'wide' ? plus3 : today;
 
   console.log(`\n████████████████████████████████████████████████████`);
   console.log(`  HR Tracker — update:${mode}`);
-  console.log(`  today=${today}  yesterday=${yesterday}  schedule window=${yesterday} → ${plus3}`);
+  console.log(`  today=${today}  yesterday=${yesterday}`);
+  console.log(`  schedule window=${schedStart} → ${schedEnd} (${cfg.scheduleWindow})`);
+  console.log(`  heavy enrichments=${cfg.heavyEnrichments}  weather=${cfg.weatherRefresh}  ` +
+    `snapshot=${effectiveSnapshot}  summaries=${cfg.rebuildSummaries}`);
   console.log(`████████████████████████████████████████████████████`);
 
   const steps: StepLog[] = [];
@@ -122,48 +247,42 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
   // -------------------------------------------------------------
   // 1. Pull schedules
   // -------------------------------------------------------------
-  console.log(`\n[1/4] Pull schedules (${yesterday} → ${plus3})`);
+  console.log(`\n[1/5] Pull schedules (${schedStart} → ${schedEnd})`);
   await runStep(
-    `enrich:schedule ${yesterday} → ${plus3}`,
-    () => enrichSchedule({ start: yesterday, end: plus3 }),
+    `enrich:schedule ${schedStart} → ${schedEnd}`,
+    () => enrichSchedule({ start: schedStart, end: schedEnd }),
     steps,
   );
 
   // -------------------------------------------------------------
-  // 2. Process games — BOTH live + final.
-  //    processDate is idempotent: completed games marked processed are
-  //    skipped on subsequent runs; live games are re-checked every run
-  //    and event_key dedup prevents duplicate HRs.
+  // 2. Process games — live + final HR ingestion.
   // -------------------------------------------------------------
-  console.log(`\n[2/4] Process games (live + final)`);
+  console.log(`\n[2/5] Process games (live + final)`);
   let yesterdayResult: ProcessDateResult | null = null;
   let todayResult: ProcessDateResult | null = null;
-  // YESTERDAY: processed on EVERY mode. Late-finishing west-coast games or
-  // games that wrapped after the morning cron need a fallback ingest path,
-  // and processDate is idempotent — once all of yesterday's games are
-  // marked processed=true it's a near-no-op (just a schedule fetch + a
-  // SELECT to find pending games, both of which return zero pending).
-  yesterdayResult = await runStep(
-    `processDate(yesterday=${yesterday})`,
-    async () => {
-      const r = await processDate(yesterday);
-      logProcessResult(r);
-      // Surface a clean "yesterday is fully ingested" line when there's
-      // nothing left to do — easier than scanning per-game logs.
-      if (r.liveGamesChecked === 0 && r.finalGamesProcessed === 0 && r.alreadyProcessed === r.totalGames) {
-        console.log(`    yesterday fully ingested — all ${r.totalGames} game(s) processed`);
-      } else if (r.liveGamesChecked + r.pendingPregame > 0) {
-        console.log(
-          `    yesterday still has ${r.liveGamesChecked + r.pendingPregame} game(s) not yet final — will re-check next tick`,
-        );
-      }
-      return r;
-    },
-    steps,
-  );
-  // TODAY: skipped on morning (games not yet played); processed on
-  // live / night / daily. event_key dedup makes re-ingestion safe.
-  if (mode !== 'morning') {
+
+  if (cfg.processYesterday) {
+    yesterdayResult = await runStep(
+      `processDate(yesterday=${yesterday})`,
+      async () => {
+        const r = await processDate(yesterday);
+        logProcessResult(r);
+        if (r.liveGamesChecked === 0 && r.finalGamesProcessed === 0 && r.alreadyProcessed === r.totalGames) {
+          console.log(`    yesterday fully ingested — all ${r.totalGames} game(s) processed`);
+        } else if (r.liveGamesChecked + r.pendingPregame > 0) {
+          console.log(
+            `    yesterday still has ${r.liveGamesChecked + r.pendingPregame} game(s) not yet final — will re-check next tick`,
+          );
+        }
+        return r;
+      },
+      steps,
+    );
+  } else {
+    console.log(`    (yesterday skipped — mode=${mode})`);
+  }
+
+  if (cfg.processToday) {
     todayResult = await runStep(
       `processDate(today=${today})`,
       async () => {
@@ -174,169 +293,175 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
       steps,
     );
   } else {
-    console.log(`    (today skipped — mode=morning, games not yet played)`);
+    console.log(`    (today skipped — mode=${mode}, games not yet played)`);
   }
 
   // -------------------------------------------------------------
-  // 3. Enrich data
-  //    Each step is isolated and idempotent. Limits keep each cron tick
-  //    short and polite to the public MLB API.
+  // 3. Enrich data — gated by config.
+  //    Weather always runs (it's cheap + isolated); the heavy
+  //    /v1/people-style loops only run when heavyEnrichments=true.
   // -------------------------------------------------------------
-  console.log(`\n[3/4] Enrich data`);
-  await runStep(
-    `enrich:probable-pitchers ${yesterday} → ${plus3}`,
-    () => enrichProbablePitchers({ start: yesterday, end: plus3 }),
-    steps,
-  );
-  await runStep(
-    `enrich:handedness (limit 100)`,
-    () => enrichHandedness({ limit: 100 }),
-    steps,
-  );
-  await runStep(
-    `enrich:venues (limit 30)`,
-    () => enrichVenues({ limit: 30 }),
-    steps,
-  );
-  await runStep(
-    `enrich:pitcher-starts (${addDays(today, -14)} → ${today})`,
-    () => enrichPitcherStarts({ start: addDays(today, -14), end: today }),
-    steps,
-  );
-  // Weather: pull gameData.weather from the MLB feed for the schedule
-  // window. refreshAll so in-progress games get updated conditions; the
-  // feed has no weather for games hours out, so those just skip. Cheap
-  // and isolated — a failure here never blocks the rest of the run.
-  await runStep(
-    `enrich:weather (${yesterday} → ${plus3}, refresh-all)`,
-    () => enrichWeather({ start: yesterday, end: plus3, refreshAll: true }),
-    steps,
-  );
-  // Players: a heavier /v1/people loop. Skip on night runs to keep them fast.
-  if (mode !== 'night') {
+  console.log(`\n[3/5] Enrich data (heavy=${cfg.heavyEnrichments})`);
+  let weatherResult: EnrichWeatherResult | null = null;
+
+  if (cfg.heavyEnrichments) {
     await runStep(
-      `enrich:players (limit 100, refresh ≥7d)`,
-      () => enrichPlayers({ limit: 100, refreshDays: 7 }),
+      `enrich:probable-pitchers ${schedStart} → ${schedEnd}`,
+      () => enrichProbablePitchers({ start: schedStart, end: schedEnd }),
+      steps,
+    );
+    await runStep(`enrich:handedness (limit 100)`, () => enrichHandedness({ limit: 100 }), steps);
+    await runStep(`enrich:venues (limit 30)`, () => enrichVenues({ limit: 30 }), steps);
+    await runStep(
+      `enrich:pitcher-starts (${addDays(today, -14)} → ${today})`,
+      () => enrichPitcherStarts({ start: addDays(today, -14), end: today }),
+      steps,
+    );
+    // Players: heaviest loop. Skip on night to keep the finalize run fast.
+    if (mode !== 'night') {
+      await runStep(
+        `enrich:players (limit 100, refresh ≥7d)`,
+        () => enrichPlayers({ limit: 100, refreshDays: 7 }),
+        steps,
+      );
+    } else {
+      console.log(`    (skipping enrich:players on night mode)`);
+    }
+  } else {
+    console.log(`    (heavy enrichments skipped — mode=${mode}, light tick)`);
+  }
+
+  // Weather — light tick does a cheap "missing only / today only" fill;
+  // full/night do a wide refresh-all so live conditions update.
+  if (cfg.weatherRefresh === 'missing-only') {
+    weatherResult = await runStep(
+      `enrich:weather (${today}, missing-only)`,
+      () => enrichWeather({ start: today, end: today, refreshAll: false }),
+      steps,
+    );
+  } else if (cfg.weatherRefresh === 'refresh-all') {
+    weatherResult = await runStep(
+      `enrich:weather (${schedStart} → ${schedEnd}, refresh-all)`,
+      () => enrichWeather({ start: schedStart, end: schedEnd, refreshAll: true }),
       steps,
     );
   } else {
-    console.log(`    (skipping enrich:players on night mode)`);
+    console.log(`    (weather refresh skipped — mode=${mode})`);
   }
 
-  // Marker phrase the operator can grep for. After phase 3 the underlying
-  // tables (games, pitcher_starts, players, venues) that the HR Targets
-  // "Live Preview" view reads from have been freshened. The saved snapshot
-  // — phase 4 below — remains untouched unless --force is supplied.
   console.log(`    live preview updated — underlying data refreshed (saved snapshot untouched)`);
 
   // -------------------------------------------------------------
-  // 4. Snapshot HR Targets — mode-aware lifecycle.
-  //
-  //    morning → FORCE rebuild today's snapshot. Clean pregame baseline.
-  //              Tomorrow: skip-if-exists, pre-game-only (don't overwrite
-  //              a tomorrow-baseline that a prior night/daily run already laid down).
-  //    live    → NO-OP. Preserve the morning baseline so the dashboard's
-  //              Saved-Snapshot view stays stable through the day. Live
-  //              Preview on the UI still updates because the underlying
-  //              data (games, pitcher_starts, players) was just refreshed
-  //              in phase 3.
-  //    night   → FORCE update today's snapshot with the post-game-final
-  //              model output (useful for Backtest accuracy + late-night
-  //              comparison). Tomorrow: skip-if-exists, pre-game-only.
-  //    daily   → legacy generic full-pass. Skip-if-exists, pre-game-only
-  //              for both dates. Used by manual `npm run update:daily`.
-  //
-  //    Non-fatal: failure here doesn't block summary rebuilds.
+  // 4. Snapshot HR Targets — config-driven.
+  //    none           → preserve the baseline (light / legacy live)
+  //    skip-if-exists → idempotent, pre-game-only (legacy daily / full non-morning)
+  //    force-today    → rebuild today's snapshot (morning baseline / night finalize)
   // -------------------------------------------------------------
-  const tomorrow = addDays(today, 1);
-  console.log(`\n[4/5] Snapshot HR Targets — mode=${mode}`);
+  console.log(`\n[4/5] Snapshot HR Targets — ${effectiveSnapshot}`);
+  let snapshotsCreated = 0;
+  let snapshotsSkipped = 0;
 
-  if (mode === 'morning') {
-    console.log(`    morning baseline — FORCE rebuild today, skip-if-exists tomorrow`);
-    await runStep(
-      `snapshot:hr-targets(${today}) [force=true mode=morning]`,
-      () => snapshotHrTargets(today, { force: true, skipIfGamesStarted: false }),
-      steps,
-    );
-    await runStep(
-      `snapshot:hr-targets(${tomorrow})`,
-      () => snapshotHrTargets(tomorrow, { force: false, skipIfGamesStarted: true }),
-      steps,
-    );
-  } else if (mode === 'live') {
-    console.log(
-      `    live mode — preserving morning baseline (no snapshot writes). ` +
-        `Live Preview on /targets still reflects the refreshed underlying data.`,
-    );
+  if (effectiveSnapshot === 'none') {
+    console.log(`    no snapshot writes — preserving baseline (mode=${mode})`);
     steps.push({
-      step: `snapshot:hr-targets — skipped (mode=live, preserving baseline)`,
+      step: `snapshot:hr-targets — skipped (mode=${mode}, preserving baseline)`,
       durationMs: 0,
       ok: true,
-      detail: { skipped: true, reason: 'live mode preserves morning baseline' },
+      detail: { skipped: true, reason: `${mode} mode preserves baseline` },
     });
-  } else if (mode === 'night') {
-    console.log(`    night finalization — FORCE update today, skip-if-exists tomorrow`);
-    await runStep(
-      `snapshot:hr-targets(${today}) [force=true mode=night]`,
-      () => snapshotHrTargets(today, { force: true, skipIfGamesStarted: false }),
-      steps,
-    );
-    await runStep(
-      `snapshot:hr-targets(${tomorrow})`,
-      () => snapshotHrTargets(tomorrow, { force: false, skipIfGamesStarted: true }),
-      steps,
-    );
+    snapshotsSkipped += 1;
   } else {
-    // 'daily' — legacy full-pass behavior. Idempotent, pre-game-only.
-    console.log(`    daily full-pass — skip-if-exists + pre-game-only for both dates`);
-    await runStep(
-      `snapshot:hr-targets(${today})`,
-      () => snapshotHrTargets(today, { force: false, skipIfGamesStarted: true }),
+    const forceToday = effectiveSnapshot === 'force-today';
+    if (forceToday) {
+      console.log(`    force-rebuild today's snapshot, skip-if-exists tomorrow`);
+    } else {
+      console.log(`    skip-if-exists + pre-game-only for today + tomorrow`);
+    }
+    const todaySnap = await runStep(
+      `snapshot:hr-targets(${today})${forceToday ? ' [force=true]' : ''}`,
+      () => snapshotHrTargets(today, { force: forceToday, skipIfGamesStarted: !forceToday }),
       steps,
     );
-    await runStep(
+    const tomorrowSnap = await runStep(
       `snapshot:hr-targets(${tomorrow})`,
       () => snapshotHrTargets(tomorrow, { force: false, skipIfGamesStarted: true }),
       steps,
     );
+    for (const snap of [todaySnap, tomorrowSnap] as (SnapshotResult | null)[]) {
+      if (!snap) continue;
+      if (snap.skipped || snap.inserted === 0) snapshotsSkipped += 1;
+      else snapshotsCreated += 1;
+    }
   }
 
   // -------------------------------------------------------------
-  // 5. Rebuild summaries
-  //    The frontend reads from raw home_runs / pitcher_starts so it always
-  //    sees fresh data. player_daily_summary is a server-side cache for
-  //    future consumers (digests, alerts) — refresh for today + yesterday.
+  // 5. Rebuild summaries — config-driven (skipped on light ticks).
   // -------------------------------------------------------------
-  console.log(`\n[5/5] Rebuild summaries`);
-  await runStep(
-    `rebuildPlayerSummaries(${yesterday})`,
-    () => rebuildPlayerSummaries(yesterday),
-    steps,
-  );
-  await runStep(
-    `rebuildPlayerSummaries(${today})`,
-    () => rebuildPlayerSummaries(today),
-    steps,
-  );
+  console.log(`\n[5/5] Rebuild summaries (${cfg.rebuildSummaries ? 'on' : 'skipped — light tick'})`);
+  let summariesRebuilt = 0;
+  if (cfg.rebuildSummaries) {
+    const ySummary = await runStep(
+      `rebuildPlayerSummaries(${yesterday})`,
+      () => rebuildPlayerSummaries(yesterday),
+      steps,
+    );
+    const tSummary = await runStep(
+      `rebuildPlayerSummaries(${today})`,
+      () => rebuildPlayerSummaries(today),
+      steps,
+    );
+    if (ySummary != null) summariesRebuilt += 1;
+    if (tSummary != null) summariesRebuilt += 1;
+  } else {
+    console.log(`    (summary rebuilds skipped — mode=${mode})`);
+  }
 
   // -------------------------------------------------------------
-  // Diagnostic — read back what actually landed in Supabase so the operator
-  // can confirm whether snapshots were created, skipped, or never written.
+  // Diagnostic — read back what landed in Supabase.
   // -------------------------------------------------------------
   await logSnapshotDiagnostics(today, tomorrow);
 
   // -------------------------------------------------------------
-  // Wrap-up
+  // Wrap-up + summary roll-up
   // -------------------------------------------------------------
   const totalDurationMs = Date.now() - t0;
   const failures = steps
     .filter((s) => !s.ok)
     .map((s) => ({ step: s.step, error: String(s.detail) }));
 
+  const pd = [yesterdayResult, todayResult].filter((r): r is ProcessDateResult => r != null);
+  const sumField = (f: (r: ProcessDateResult) => number) => pd.reduce((acc, r) => acc + f(r), 0);
+  const latestUpdated = pd
+    .map((r) => r.latestHrCreatedAt)
+    .filter((s): s is string => !!s)
+    .sort()
+    .pop() ?? null;
+
+  const summary: RunSummary = {
+    mode,
+    gamesChecked: sumField((r) => r.totalGames),
+    liveGamesProcessed: sumField((r) => r.liveGamesChecked),
+    finalGamesProcessed: sumField((r) => r.finalGamesProcessed),
+    HRsInserted: sumField((r) => r.homeRunsInserted),
+    duplicatesSkipped: sumField((r) => r.duplicatesSkipped),
+    weatherUpdated: weatherResult?.weatherFilled ?? 0,
+    summariesRebuilt,
+    snapshotsCreated,
+    snapshotsSkipped,
+    lastUpdatedAt: latestUpdated,
+  };
+
   console.log(`\n████████████████████████████████████████████████████`);
   console.log(`  active mode: ${mode}`);
   console.log(`  update:${mode} complete in ${(totalDurationMs / 1000).toFixed(1)}s`);
   console.log(`  ${steps.length} step(s) run, ${failures.length} failed`);
+  console.log(
+    `  summary — gamesChecked=${summary.gamesChecked} live=${summary.liveGamesProcessed} ` +
+      `final=${summary.finalGamesProcessed} HRs=${summary.HRsInserted} ` +
+      `dupes=${summary.duplicatesSkipped} weather=${summary.weatherUpdated} ` +
+      `summaries=${summary.summariesRebuilt} snapCreated=${summary.snapshotsCreated} ` +
+      `snapSkipped=${summary.snapshotsSkipped}`,
+  );
   if (failures.length > 0) {
     for (const f of failures) console.log(`    ✗ ${f.step}: ${f.error}`);
   } else {
@@ -348,7 +473,7 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
     mode,
     today,
     yesterday,
-    scheduleWindow: { start: yesterday, end: plus3 },
+    scheduleWindow: { start: schedStart, end: schedEnd },
     totalDurationMs,
     steps,
     failures,
@@ -357,6 +482,7 @@ export async function updateDaily(mode: UpdateMode = 'daily'): Promise<UpdateDai
       yesterday: yesterdayResult,
       today: todayResult,
     },
+    summary,
   };
 }
 
@@ -364,7 +490,7 @@ function logProcessResult(r: ProcessDateResult) {
   console.log(
     `    games: ${r.finalGamesProcessed} final newly processed (${r.alreadyProcessed} already done), ` +
       `${r.liveGamesChecked} live checked, ${r.pendingPregame} pregame · ` +
-      `${r.homeRunsInserted} new HR(s), ${r.pitcherStartsInserted} starter row(s)`,
+      `${r.homeRunsInserted} new HR(s), ${r.duplicatesSkipped} dupe(s), ${r.pitcherStartsInserted} starter row(s)`,
   );
   if (r.latestHrCreatedAt) {
     console.log(`    latest HR created_at — ${r.latestHrCreatedAt}`);
@@ -373,10 +499,7 @@ function logProcessResult(r: ProcessDateResult) {
 
 /**
  * End-of-run sanity dump: query hr_target_snapshots for today and tomorrow
- * and print exactly what landed in Supabase. Gives the operator proof-
- * positive that an update:daily run either created a snapshot or
- * deliberately skipped one — instead of having to guess from earlier logs.
- * Also reads the freshest home_runs.created_at as "Data last updated."
+ * and print exactly what landed in Supabase.
  */
 async function logSnapshotDiagnostics(today: string, tomorrow: string): Promise<void> {
   console.log(`\n--- snapshot diagnostics (read-back from Supabase)`);

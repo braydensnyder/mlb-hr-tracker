@@ -21,6 +21,8 @@
     "update:daily": "tsx scripts/runUpdateDaily.ts daily",
     "update:morning": "tsx scripts/runUpdateDaily.ts morning",
     "update:live": "tsx scripts/runUpdateDaily.ts live",
+    "update:light": "tsx scripts/runUpdateDaily.ts light",
+    "update:full": "tsx scripts/runUpdateDaily.ts full",
     "update:night": "tsx scripts/runUpdateDaily.ts night",
     "snapshot:targets": "tsx scripts/runSnapshotHrTargets.ts",
     "snapshot:today": "tsx scripts/runSnapshotHrTargets.ts today",
