@@ -405,6 +405,67 @@ export interface VenueSummaryRow {
   updated_at: string;
 }
 
+/**
+ * One row in `odds_snapshots` — captures a single (book, player, game,
+ * snapshot_type) HR-prop line at a moment in time. Drives the Odds tab.
+ *
+ * Phase 1: model_prob is derived from the Heat Score at snapshot time
+ * via the sigmoid curve in src/lib/oddsMath.ts. `edge = model_prob -
+ * implied_prob` is signed; positive means the model thinks the player
+ * is more likely to homer than the book's price implies.
+ */
+export interface OddsSnapshotRow {
+  id: number;
+  target_date: string;          // YYYY-MM-DD
+  snapshot_type: 'morning' | 'midday' | 'pregame' | 'manual';
+  snapshot_time: string;        // ISO timestamp
+  game_pk: number;
+  player_id: number | null;
+  player_name: string;
+  team: string | null;
+  opponent: string | null;
+  book: string;
+  market_key: string;
+  american_odds: number;
+  decimal_odds: number;
+  implied_prob: number;
+  heat_score: number | null;
+  confidence: 'high' | 'medium' | 'low' | null;
+  model_prob: number | null;
+  edge: number | null;
+  weather_temp_f: number | null;
+  weather_wind_mph: number | null;
+  weather_wind_dir: string | null;
+  created_at: string;
+}
+
+/** Fetch all odds_snapshots rows for a target_date, across every
+ *  snapshot_type and book. The Odds page aggregates them in memory. */
+export async function fetchOddsSnapshots(targetDate: string): Promise<OddsSnapshotRow[]> {
+  const PAGE = 1000;
+  const all: OddsSnapshotRow[] = [];
+  for (let page = 0; ; page++) {
+    const { data, error } = await supabase
+      .from('odds_snapshots')
+      .select('*')
+      .eq('target_date', targetDate)
+      .order('snapshot_time', { ascending: true })
+      .range(page * PAGE, page * PAGE + PAGE - 1);
+    if (error) {
+      // Table missing → empty result (Phase 1 graceful degradation when
+      // migration 011 hasn't been applied yet).
+      if (/odds_snapshots/i.test(error.message) && /does not exist|schema cache/i.test(error.message)) {
+        return [];
+      }
+      throw new Error(error.message);
+    }
+    const rows = (data ?? []) as OddsSnapshotRow[];
+    all.push(...rows);
+    if (rows.length < PAGE) break;
+  }
+  return all;
+}
+
 /** Singleton row from cron_state — backs the "Last cron run" tile on
  *  the Dashboard's status card. */
 export interface CronStateRow {

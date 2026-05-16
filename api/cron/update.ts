@@ -33,6 +33,8 @@ import {
   decideMode,
 } from '../../scripts/lib/cronState.js';
 import { mlbDateContext, formatMlbDateContext } from '../../scripts/lib/mlbDate.js';
+import { decideOddsSnapshot } from '../../scripts/lib/oddsCron.js';
+import { snapshotOdds, type OddsSnapshotType } from '../../scripts/snapshotOdds.js';
 
 interface VercelReqLike {
   method?: string;
@@ -160,9 +162,44 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
   const heavyRan = tier === 'full' || tier === 'night' || tier === 'morning' || tier === 'daily';
   const nightRan = tier === 'night';
 
+  // Result tracking for the odds-snapshot decision (Phase 1 Odds tab).
+  // We attempt one odds bucket per cron tick when its PT window is open
+  // AND it hasn't already been taken today. Isolated try/catch so a
+  // missing ODDS_API_KEY or quota error never fails the whole cron.
+  let oddsAttempt: {
+    decision: { type: OddsSnapshotType | null; reason: string };
+    result?: Awaited<ReturnType<typeof snapshotOdds>>;
+    error?: string;
+  } = { decision: { type: null, reason: 'not evaluated yet' } };
+
   try {
     console.log(`[cron] decided tier=${tier} (${decisionReason})`);
     const result = await updateDaily(tier, { forceSnapshot });
+
+    // ---- Phase 1 Odds snapshot decision ----
+    try {
+      const decision = await decideOddsSnapshot(cronStartDate, dateContext.mlbTargetDate);
+      oddsAttempt.decision = decision;
+      if (decision.type) {
+        console.log(`[cron] odds snapshot due: type=${decision.type} (${decision.reason})`);
+        if (!process.env.ODDS_API_KEY) {
+          console.warn('[cron] ODDS_API_KEY not set in env — skipping odds snapshot.');
+          oddsAttempt.error = 'ODDS_API_KEY missing';
+        } else {
+          oddsAttempt.result = await snapshotOdds({
+            date: dateContext.mlbTargetDate,
+            snapshotType: decision.type,
+          });
+          console.log(`[cron] odds snapshot ${decision.type} upserted ${oddsAttempt.result.rows_upserted} rows`);
+        }
+      } else {
+        console.log(`[cron] no odds snapshot due (${decision.reason})`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : JSON.stringify(err);
+      oddsAttempt.error = msg;
+      console.warn(`[cron] odds snapshot FAILED (non-fatal): ${msg}`);
+    }
 
     const greppable = capturedLines.filter((l) =>
       /\[cron\]|decided tier|active mode|created snapshot|snapshot overwritten|snapshot already exists, skipped|no snapshot writes|live preview updated|results processed|live games checked|finals newly processed|home runs ingested|duplicates skipped|latest HR created_at|snapshot diagnostics/i.test(l),
@@ -224,6 +261,14 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
       // ---- freshness ------------------------------------------------
       lastUpdatedAt: s.lastUpdatedAt,
       latestHomeRunAt,
+      odds: {
+        decision: oddsAttempt.decision,
+        rowsUpserted: oddsAttempt.result?.rows_upserted ?? 0,
+        eventsFetched: oddsAttempt.result?.events_fetched ?? 0,
+        eventsFailed: oddsAttempt.result?.events_failed ?? 0,
+        unmatchedPlayers: oddsAttempt.result?.unmatched_players ?? 0,
+        error: oddsAttempt.error ?? null,
+      },
       actualResults: {
         today: summarizeProcess(result.actualResults.today),
         yesterday: summarizeProcess(result.actualResults.yesterday),

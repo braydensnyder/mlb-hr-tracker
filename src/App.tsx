@@ -4,6 +4,7 @@ import PlayerDetail from './pages/PlayerDetail';
 import Matchups from './pages/Matchups';
 import HrTargets from './pages/HrTargets';
 import Backtest from './pages/Backtest';
+import Odds from './pages/Odds';
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
           <NavLink to="/" end>Dashboard</NavLink>
           <NavLink to="/matchups">Matchups</NavLink>
           <NavLink to="/targets">HR Targets</NavLink>
+          <NavLink to="/odds">Odds</NavLink>
           <NavLink to="/backtest">Backtest</NavLink>
         </nav>
       </header>
@@ -24,6 +26,7 @@ export default function App() {
         <Route path="/" element={<Dashboard />} />
         <Route path="/matchups" element={<Matchups />} />
         <Route path="/targets" element={<HrTargets />} />
+        <Route path="/odds" element={<Odds />} />
         <Route path="/backtest" element={<Backtest />} />
         <Route path="/player/:playerId" element={<PlayerDetail />} />
         <Route
