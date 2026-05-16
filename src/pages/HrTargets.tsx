@@ -65,13 +65,22 @@ async function fetchSeasonHrs(asOf: string): Promise<HomeRunRow[]> {
 }
 
 async function fetchGamesOn(date: string): Promise<GameRow[]> {
+  // select('*') pulls every column including weather_*. Visible log so
+  // you can confirm in dev tools how many games came back with weather.
   const { data, error } = await supabase
     .from('games')
     .select('*')
     .eq('game_date', date)
     .order('game_pk', { ascending: true });
   if (error) throw new Error(error.message);
-  return (data ?? []) as GameRow[];
+  const rows = (data ?? []) as GameRow[];
+  const withTemp = rows.filter((g) => g.weather_temp_f != null).length;
+  const withUpdatedAt = rows.filter((g) => g.weather_updated_at != null).length;
+  console.log(
+    `[weather] HrTargets fetchGamesOn(${date}) → ${rows.length} games, ` +
+      `${withTemp} with temp, ${withUpdatedAt} with weather_updated_at`,
+  );
+  return rows;
 }
 
 /** Persisted Top-N for the date, if a snapshot exists. Drives the

@@ -127,10 +127,16 @@ export default function WeatherLine(props: WeatherLineProps) {
             marginTop: 2,
             color: 'var(--muted, #777)',
             fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            lineHeight: 1.4,
           }}
           title="Temporary debug — remove once weather pipeline is verified."
         >
-          weather_updated_at: {props.weather_updated_at ?? 'null'}
+          <div>kind: {cls.kind}</div>
+          <div>weather_temp_f: {props.temp_f ?? 'null'}</div>
+          <div>weather_wind_mph: {props.wind_mph ?? 'null'}</div>
+          <div>weather_wind_dir: {props.wind_dir ?? 'null'}</div>
+          <div>weather_condition: {props.condition ?? 'null'}</div>
+          <div>weather_updated_at: {props.weather_updated_at ?? 'null'}</div>
         </div>
       )}
     </div>

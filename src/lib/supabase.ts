@@ -442,12 +442,37 @@ export interface WeatherCoverage {
 }
 
 export async function fetchWeatherCoverage(date: string): Promise<WeatherCoverage> {
+  type Wide = { game_pk: number; weather_temp_f: number | null; weather_updated_at: string | null };
+  type Narrow = Omit<Wide, 'weather_updated_at'>;
+
+  let rows: Wide[] = [];
+  // Tier 1 — full select with weather_updated_at.
   const { data, error } = await supabase
     .from('games')
     .select('game_pk, weather_temp_f, weather_updated_at')
     .eq('game_date', date);
-  if (error) throw new Error(error.message);
-  const rows = (data ?? []) as { game_pk: number; weather_temp_f: number | null; weather_updated_at: string | null }[];
+
+  if (error) {
+    const msg = error.message ?? '';
+    const isMissingColumn =
+      /weather_updated_at/i.test(msg) && /(does not exist|schema cache|column)/i.test(msg);
+    if (!isMissingColumn) throw new Error(msg);
+    // Tier 2 — without the new column.
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[weather] fetchWeatherCoverage: weather_updated_at column not found. ' +
+        'Run supabase/migrations/010_weather_updated_at.sql. Coverage tile will still work; freshness will read null.',
+    );
+    const { data: data2, error: error2 } = await supabase
+      .from('games')
+      .select('game_pk, weather_temp_f')
+      .eq('game_date', date);
+    if (error2) throw new Error(error2.message);
+    rows = ((data2 ?? []) as Narrow[]).map((g) => ({ ...g, weather_updated_at: null }));
+  } else {
+    rows = (data ?? []) as Wide[];
+  }
+
   let withWeather = 0;
   let latest: string | null = null;
   for (const r of rows) {

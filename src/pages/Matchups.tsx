@@ -59,13 +59,23 @@ async function fetchSeasonHrs(asOf: string): Promise<HomeRunRow[]> {
 }
 
 async function fetchGamesOn(date: string): Promise<GameRow[]> {
+  // select('*') pulls every column including weather_*. If migration 010
+  // hasn't run yet, weather_updated_at simply doesn't exist on returned
+  // rows (typed as null) — the WeatherLine still renders temp/wind.
   const { data, error } = await supabase
     .from('games')
     .select('*')
     .eq('game_date', date)
     .order('game_pk', { ascending: true });
   if (error) throw new Error(error.message);
-  return (data ?? []) as GameRow[];
+  const rows = (data ?? []) as GameRow[];
+  const withTemp = rows.filter((g) => g.weather_temp_f != null).length;
+  const withUpdatedAt = rows.filter((g) => g.weather_updated_at != null).length;
+  console.log(
+    `[weather] Matchups fetchGamesOn(${date}) → ${rows.length} games, ` +
+      `${withTemp} with temp, ${withUpdatedAt} with weather_updated_at`,
+  );
+  return rows;
 }
 
 interface MatchupNote {

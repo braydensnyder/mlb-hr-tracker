@@ -95,26 +95,67 @@ export interface GameWeather {
 
 /**
  * Fetch the games on `date` and return the weather payload per game_pk.
- * Soft helper — a failure here returns an empty map; the WeatherLine
- * component still renders "Weather pending" for every card.
+ *
+ * Two-tier select so the UI keeps working when migration 010 hasn't been
+ * applied yet:
+ *   1. Try the full select including `weather_updated_at`.
+ *   2. If Postgres rejects the column (PGRST204 / "column does not exist"),
+ *      retry with the original four columns and treat updated_at as null.
+ *
+ * Logs to the browser console either way so you can confirm in dev tools
+ * exactly what came back from Supabase.
  */
 async function fetchGameWeather(date: string): Promise<Map<number, GameWeather>> {
-  const { data, error } = await supabase
-    .from('games')
-    .select(
-      'game_pk, weather, weather_temp_f, weather_wind_mph, weather_wind_dir, weather_updated_at',
-    )
-    .eq('game_date', date);
-  if (error) throw new Error(error.message);
-  const out = new Map<number, GameWeather>();
-  for (const g of (data ?? []) as {
+  type Wide = {
     game_pk: number;
     weather: { condition?: string } | null;
     weather_temp_f: number | null;
     weather_wind_mph: number | null;
     weather_wind_dir: string | null;
     weather_updated_at: string | null;
-  }[]) {
+  };
+  type Narrow = Omit<Wide, 'weather_updated_at'>;
+
+  let rows: Wide[] = [];
+  let migrationApplied = true;
+
+  // Tier 1 — preferred path, includes weather_updated_at.
+  {
+    const { data, error } = await supabase
+      .from('games')
+      .select(
+        'game_pk, weather, weather_temp_f, weather_wind_mph, weather_wind_dir, weather_updated_at',
+      )
+      .eq('game_date', date);
+
+    if (error) {
+      // "column ... does not exist" / "could not find ... in the schema cache"
+      const msg = error.message ?? '';
+      const isMissingColumn =
+        /weather_updated_at/i.test(msg) &&
+        /(does not exist|schema cache|column)/i.test(msg);
+      if (!isMissingColumn) throw new Error(msg);
+      migrationApplied = false;
+      console.warn(
+        '[weather] Dashboard fetchGameWeather: weather_updated_at column not found in games. ' +
+          'Run supabase/migrations/010_weather_updated_at.sql. Falling back to select without it.',
+      );
+      // Tier 2 — without the new column.
+      const { data: data2, error: error2 } = await supabase
+        .from('games')
+        .select('game_pk, weather, weather_temp_f, weather_wind_mph, weather_wind_dir')
+        .eq('game_date', date);
+      if (error2) throw new Error(error2.message);
+      rows = ((data2 ?? []) as Narrow[]).map((g) => ({ ...g, weather_updated_at: null }));
+    } else {
+      rows = (data ?? []) as Wide[];
+    }
+  }
+
+  const out = new Map<number, GameWeather>();
+  let withTemp = 0;
+  let withUpdatedAt = 0;
+  for (const g of rows) {
     out.set(g.game_pk, {
       condition: g.weather?.condition ?? null,
       temp_f: g.weather_temp_f,
@@ -122,7 +163,18 @@ async function fetchGameWeather(date: string): Promise<Map<number, GameWeather>>
       wind_dir: g.weather_wind_dir,
       weather_updated_at: g.weather_updated_at,
     });
+    if (g.weather_temp_f != null) withTemp++;
+    if (g.weather_updated_at) withUpdatedAt++;
   }
+
+  // Visible breadcrumb in dev tools so you can see whether Supabase is
+  // returning weather data at all.
+  console.log(
+    `[weather] Dashboard fetchGameWeather(${date}) → ${rows.length} games, ` +
+      `${withTemp} with temp, ${withUpdatedAt} with weather_updated_at` +
+      (migrationApplied ? '' : ' (migration 010 not applied — updated_at always null)'),
+  );
+
   return out;
 }
 

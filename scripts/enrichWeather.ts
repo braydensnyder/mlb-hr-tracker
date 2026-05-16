@@ -160,16 +160,37 @@ export async function enrichWeather(opts: EnrichWeatherOptions = {}): Promise<En
           );
         }
       } else {
-        const { error: uErr } = await supabaseAdmin
+        // Two-tier UPDATE so the cron survives Supabase deployments where
+        // migration 010 hasn't been applied yet. First attempt includes
+        // weather_updated_at; on a "column not found" error we retry with
+        // the original four columns so the rest of the weather data still
+        // lands. Anything else is a real failure.
+        const fullPatch = {
+          weather: weather.raw,
+          weather_temp_f: weather.temp_f,
+          weather_wind_mph: weather.wind_mph,
+          weather_wind_dir: weather.wind_dir,
+          weather_updated_at: new Date().toISOString(),
+        };
+        let { error: uErr } = await supabaseAdmin
           .from('games')
-          .update({
-            weather: weather.raw,
-            weather_temp_f: weather.temp_f,
-            weather_wind_mph: weather.wind_mph,
-            weather_wind_dir: weather.wind_dir,
-            weather_updated_at: new Date().toISOString(),
-          })
+          .update(fullPatch)
           .eq('game_pk', g.game_pk);
+        if (uErr && /weather_updated_at/i.test(uErr.message ?? '')) {
+          console.warn(
+            `  ${g.game_pk} update rejected weather_updated_at — retrying without (apply migration 010 to silence this)`,
+          );
+          const { error: uErr2 } = await supabaseAdmin
+            .from('games')
+            .update({
+              weather: weather.raw,
+              weather_temp_f: weather.temp_f,
+              weather_wind_mph: weather.wind_mph,
+              weather_wind_dir: weather.wind_dir,
+            })
+            .eq('game_pk', g.game_pk);
+          uErr = uErr2;
+        }
         if (uErr) throw new Error(`update games failed: ${uErr.message}`);
         result.weatherFilled++;
         if (isDomeCondition(weather.condition)) result.domeOrRoofGames++;
