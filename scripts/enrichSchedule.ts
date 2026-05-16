@@ -29,6 +29,7 @@ import { fetchSchedule } from './fetchSchedule.js';
 import { upsertVenues } from './lib/venues.js';
 import { upsertGameRows } from './lib/games.js';
 import { withRetry } from './lib/retry.js';
+import { mlbToday, addDays as mlbAddDays } from './lib/mlbDate.js';
 
 export interface EnrichScheduleOptions {
   start?: string; // YYYY-MM-DD
@@ -48,16 +49,9 @@ export interface EnrichScheduleResult {
   failures: { date: string; error: string }[];
 }
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function addDays(yyyyMmDd: string, delta: number): string {
-  const [y, m, d] = yyyyMmDd.split('-').map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + delta);
-  return dt.toISOString().slice(0, 10);
-}
+// Pacific calendar date — see scripts/lib/mlbDate.ts.
+const todayISO = mlbToday;
+const addDays = mlbAddDays;
 
 function enumerateDates(start: string, end: string): string[] {
   if (start > end) throw new Error(`start (${start}) is after end (${end})`);

@@ -921,6 +921,9 @@ export interface HrTargetGame {
   weather_temp_f?: number | null;
   weather_wind_mph?: number | null;
   weather_wind_dir?: string | null;
+  /** ISO timestamp of the most recent successful enrichWeather write.
+   *  Surfaced in the UI as "Updated 6:14 PM" + the temporary debug line. */
+  weather_updated_at?: string | null;
 }
 
 /**
@@ -1167,6 +1170,9 @@ export interface HrTarget {
   weather_temp_f: number | null;
   weather_wind_mph: number | null;
   weather_wind_dir: string | null;
+  /** Freshness timestamp from games.weather_updated_at — drives the
+   *  "Updated 6:14 PM" suffix on the WeatherLine. Null = never enriched. */
+  weather_updated_at: string | null;
   /** True when weather actually moved the heat score (false = dome /
    *  missing data / net-zero swing). */
   weather_included: boolean;
@@ -1189,6 +1195,8 @@ export interface HrTargetsBoard {
   weather_temp_f: number | null;
   weather_wind_mph: number | null;
   weather_wind_dir: string | null;
+  /** Freshness timestamp from games.weather_updated_at. */
+  weather_updated_at: string | null;
 }
 
 interface InternalAgg {
@@ -1516,6 +1524,7 @@ export function computeHrTargets(
       temp_f: number | null;
       wind_mph: number | null;
       wind_dir: string | null;
+      updated_at: string | null;
     },
   ): HrTarget[] {
     const pool = candidatesByTeam.get(team) ?? [];
@@ -1890,6 +1899,7 @@ export function computeHrTargets(
         weather_temp_f: weather.temp_f,
         weather_wind_mph: weather.wind_mph,
         weather_wind_dir: weather.wind_dir,
+        weather_updated_at: weather.updated_at,
         weather_included: weather.adjustment.included,
       };
       target.reasons = pickReasons(target);
@@ -1931,6 +1941,7 @@ export function computeHrTargets(
       temp_f: g.weather_temp_f ?? null,
       wind_mph: g.weather_wind_mph ?? null,
       wind_dir: g.weather_wind_dir ?? null,
+      updated_at: g.weather_updated_at ?? null,
     };
 
     return {
@@ -1947,6 +1958,7 @@ export function computeHrTargets(
       weather_temp_f: weatherCtx.temp_f,
       weather_wind_mph: weatherCtx.wind_mph,
       weather_wind_dir: weatherCtx.wind_dir,
+      weather_updated_at: weatherCtx.updated_at,
     };
   });
 }

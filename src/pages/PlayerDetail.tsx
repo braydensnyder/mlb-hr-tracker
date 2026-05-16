@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { supabase, type HomeRunRow, type PlayerRow } from '../lib/supabase';
+import { mlbToday } from '../lib/mlbDate';
 import { applyCanonicalTeams, computePlayerView, singlePlayerHandedness } from '../lib/stats';
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
+// Pacific calendar date — see src/lib/mlbDate.ts.
+const todayISO = mlbToday;
 
 const PAGE_SIZE = 1000;
 

@@ -27,6 +27,7 @@ import { supabaseAdmin } from './lib/supabaseAdmin.js';
 import { fetchGameFeed } from './fetchGameFeed.js';
 import { upsertVenues } from './lib/venues.js';
 import { withRetry } from './lib/retry.js';
+import { mlbToday, addDays as mlbAddDays } from './lib/mlbDate.js';
 
 export interface EnrichVenuesOptions {
   delayMs?: number;
@@ -83,16 +84,9 @@ function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function addDays(yyyyMmDd: string, delta: number): string {
-  const [y, m, d] = yyyyMmDd.split('-').map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + delta);
-  return dt.toISOString().slice(0, 10);
-}
+// Pacific calendar date — see scripts/lib/mlbDate.ts.
+const todayISO = mlbToday;
+const addDays = mlbAddDays;
 
 interface VenueAgg {
   venue_id: number;

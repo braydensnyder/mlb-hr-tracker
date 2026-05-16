@@ -21,6 +21,7 @@
  */
 import 'dotenv/config';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
+import { mlbToday, addDays as mlbAddDays } from './lib/mlbDate.js';
 import {
   applyCanonicalTeams,
   computeHrTargets,
@@ -63,7 +64,8 @@ export interface SnapshotOptions {
 /** Statuses that indicate a game has progressed past pre-game state. */
 const STARTED_STATUSES = new Set(['In Progress', 'Final', 'Game Over', 'Completed Early', 'Suspended']);
 
-function todayISO_local(): string { return new Date().toISOString().slice(0, 10); }
+// "today" anchored on Pacific calendar — see scripts/lib/mlbDate.ts.
+const todayISO_local = mlbToday;
 
 /**
  * Decide whether a snapshot for `targetDate` should be tagged 'live' or
@@ -78,12 +80,7 @@ export function deriveSnapshotType(targetDate: string, games: { status: string }
 
 const PAGE = 1000;
 
-function addDays(yyyyMmDd: string, delta: number): string {
-  const [y, m, d] = yyyyMmDd.split('-').map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + delta);
-  return dt.toISOString().slice(0, 10);
-}
+const addDays = mlbAddDays;
 
 async function countExistingSnapshot(targetDate: string): Promise<number> {
   const { count, error } = await supabaseAdmin

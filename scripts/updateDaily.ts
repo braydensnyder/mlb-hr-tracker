@@ -41,6 +41,13 @@ import { enrichWeather, type EnrichWeatherResult } from './enrichWeather.js';
 import { rebuildPlayerSummaries } from './rebuildPlayerSummaries.js';
 import { snapshotHrTargets, type SnapshotResult } from './snapshotHrTargets.js';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
+import {
+  mlbToday,
+  mlbDateContext,
+  formatMlbDateContext,
+  addDays as mlbAddDays,
+  type MlbDateContext,
+} from './lib/mlbDate.js';
 
 export type UpdateMode = 'daily' | 'morning' | 'live' | 'night' | 'light' | 'full';
 
@@ -159,7 +166,17 @@ export interface RunSummary {
   finalGamesProcessed: number;
   HRsInserted: number;
   duplicatesSkipped: number;
+  /** Games whose weather columns we attempted to refresh this run. */
+  weatherChecked: number;
+  /** Games whose weather columns we successfully wrote this run. */
   weatherUpdated: number;
+  /** Games in the window that have non-null weather AFTER this run
+   *  (i.e. how many games the dashboard can show weather for). */
+  gamesWithWeather: number;
+  /** Subset of gamesWithWeather flagged as dome / closed-roof. */
+  domeOrRoofGames: number;
+  /** Per-game weather fetch failures (non-fatal). */
+  weatherErrors: number;
   summariesRebuilt: number;
   snapshotsCreated: number;
   snapshotsSkipped: number;
@@ -177,6 +194,9 @@ export interface UpdateDailyResult {
   failures: { step: string; error: string }[];
   actualResults: ActualResultsSummary;
   summary: RunSummary;
+  /** UTC vs Pacific date snapshot captured at run start. Surfaced in the
+   *  cron response so we can spot timezone drift in production logs. */
+  dateContext: MlbDateContext;
 }
 
 export interface UpdateDailyOptions {
@@ -186,16 +206,10 @@ export interface UpdateDailyOptions {
   forceSnapshot?: boolean;
 }
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function addDays(yyyyMmDd: string, delta: number): string {
-  const [y, m, d] = yyyyMmDd.split('-').map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + delta);
-  return dt.toISOString().slice(0, 10);
-}
+// Date math is delegated to scripts/lib/mlbDate so every script keys off
+// the SAME notion of "today" — the America/Los_Angeles calendar date,
+// not the server's UTC clock.
+const addDays = mlbAddDays;
 
 async function runStep<T>(name: string, fn: () => Promise<T>, log: StepLog[]): Promise<T | null> {
   const t0 = Date.now();
@@ -220,8 +234,12 @@ export async function updateDaily(
   opts: UpdateDailyOptions = {},
 ): Promise<UpdateDailyResult> {
   const t0 = Date.now();
-  const today = todayISO();
-  const yesterday = addDays(today, -1);
+  const startDate = new Date(t0);
+  // Anchor the run on the Pacific calendar date — see scripts/lib/mlbDate.ts
+  // for why we don't trust new Date().toISOString() here.
+  const dateContext = mlbDateContext(startDate);
+  const today = dateContext.mlbTargetDate;
+  const yesterday = dateContext.mlbYesterdayDate;
   const tomorrow = addDays(today, 1);
   const plus3 = addDays(today, 3);
 
@@ -236,7 +254,14 @@ export async function updateDaily(
 
   console.log(`\n████████████████████████████████████████████████████`);
   console.log(`  HR Tracker — update:${mode}`);
+  console.log(`  ${formatMlbDateContext(dateContext)}`);
   console.log(`  today=${today}  yesterday=${yesterday}`);
+  if (dateContext.utcPtMismatch) {
+    console.log(
+      `  ⚠ UTC date (${dateContext.utcDate}) differs from Pacific date (${dateContext.ptDate}). ` +
+        `Targeting MLB date = ${today} (Pacific).`,
+    );
+  }
   console.log(`  schedule window=${schedStart} → ${schedEnd} (${cfg.scheduleWindow})`);
   console.log(`  heavy enrichments=${cfg.heavyEnrichments}  weather=${cfg.weatherRefresh}  ` +
     `snapshot=${effectiveSnapshot}  summaries=${cfg.rebuildSummaries}`);
@@ -444,7 +469,11 @@ export async function updateDaily(
     finalGamesProcessed: sumField((r) => r.finalGamesProcessed),
     HRsInserted: sumField((r) => r.homeRunsInserted),
     duplicatesSkipped: sumField((r) => r.duplicatesSkipped),
+    weatherChecked: weatherResult?.weatherChecked ?? 0,
     weatherUpdated: weatherResult?.weatherFilled ?? 0,
+    gamesWithWeather: weatherResult?.gamesWithWeather ?? 0,
+    domeOrRoofGames: weatherResult?.domeOrRoofGames ?? 0,
+    weatherErrors: weatherResult?.failures.length ?? 0,
     summariesRebuilt,
     snapshotsCreated,
     snapshotsSkipped,
@@ -458,7 +487,10 @@ export async function updateDaily(
   console.log(
     `  summary — gamesChecked=${summary.gamesChecked} live=${summary.liveGamesProcessed} ` +
       `final=${summary.finalGamesProcessed} HRs=${summary.HRsInserted} ` +
-      `dupes=${summary.duplicatesSkipped} weather=${summary.weatherUpdated} ` +
+      `dupes=${summary.duplicatesSkipped} ` +
+      `weatherChecked=${summary.weatherChecked} weatherUpdated=${summary.weatherUpdated} ` +
+      `gamesWithWeather=${summary.gamesWithWeather} dome=${summary.domeOrRoofGames} ` +
+      `weatherErrors=${summary.weatherErrors} ` +
       `summaries=${summary.summariesRebuilt} snapCreated=${summary.snapshotsCreated} ` +
       `snapSkipped=${summary.snapshotsSkipped}`,
   );
@@ -483,6 +515,7 @@ export async function updateDaily(
       today: todayResult,
     },
     summary,
+    dateContext,
   };
 }
 

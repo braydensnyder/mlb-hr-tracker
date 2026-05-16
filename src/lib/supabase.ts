@@ -63,6 +63,9 @@ export interface GameRow {
   weather_temp_f: number | null;
   weather_wind_mph: number | null;
   weather_wind_dir: string | null;
+  /** When enrichWeather last successfully wrote weather columns. NULL ↔
+   *  weather still pending (game too far out, MLB hasn't published yet). */
+  weather_updated_at: string | null;
 }
 
 /** Canonical players catalog. The frontend prefers `current_team_name` from
@@ -400,4 +403,63 @@ export interface VenueSummaryRow {
   unique_hitters: number;
   teams_seen: string[];
   updated_at: string;
+}
+
+/** Singleton row from cron_state — backs the "Last cron run" tile on
+ *  the Dashboard's status card. */
+export interface CronStateRow {
+  id: number;
+  last_run_at: string | null;
+  last_run_mode: string | null;
+  last_heavy_run_at: string | null;
+  last_night_run_at: string | null;
+  running: boolean;
+  lock_acquired_at: string | null;
+  run_count: number;
+}
+
+/** Read the cron_state singleton. Returns null on error / when the row
+ *  hasn't been seeded — the Dashboard will just hide the tile in that case. */
+export async function fetchCronState(): Promise<CronStateRow | null> {
+  const { data, error } = await supabase
+    .from('cron_state')
+    .select('*')
+    .eq('id', 1)
+    .maybeSingle();
+  if (error || !data) return null;
+  return data as CronStateRow;
+}
+
+/** Quick weather-coverage probe for a date — drives the
+ *  "Weather: 12/15 games" / "Weather pending" Dashboard tile. */
+export interface WeatherCoverage {
+  date: string;
+  totalGames: number;
+  withWeather: number;
+  /** Freshest games.weather_updated_at across the date — newest moment
+   *  any game's weather was written. Null when nothing has weather yet. */
+  lastWeatherUpdatedAt: string | null;
+}
+
+export async function fetchWeatherCoverage(date: string): Promise<WeatherCoverage> {
+  const { data, error } = await supabase
+    .from('games')
+    .select('game_pk, weather_temp_f, weather_updated_at')
+    .eq('game_date', date);
+  if (error) throw new Error(error.message);
+  const rows = (data ?? []) as { game_pk: number; weather_temp_f: number | null; weather_updated_at: string | null }[];
+  let withWeather = 0;
+  let latest: string | null = null;
+  for (const r of rows) {
+    if (r.weather_temp_f != null) withWeather++;
+    if (r.weather_updated_at && (!latest || r.weather_updated_at > latest)) {
+      latest = r.weather_updated_at;
+    }
+  }
+  return {
+    date,
+    totalGames: rows.length,
+    withWeather,
+    lastWeatherUpdatedAt: latest,
+  };
 }

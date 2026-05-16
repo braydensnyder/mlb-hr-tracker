@@ -15,15 +15,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { supabase, fetchDataLastUpdated, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
+import { mlbToday, addDays } from '../lib/mlbDate';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
 
-function todayISO() { return new Date().toISOString().slice(0, 10); }
-function addDays(s: string, d: number): string {
-  const [y, m, dd] = s.split('-').map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, dd));
-  dt.setUTCDate(dt.getUTCDate() + d);
-  return dt.toISOString().slice(0, 10);
-}
+// Pacific calendar date — see src/lib/mlbDate.ts.
+const todayISO = mlbToday;
 
 async function fetchSnapshot(targetDate: string): Promise<HrTargetSnapshotRow[]> {
   const { data, error } = await supabase

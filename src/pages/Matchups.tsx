@@ -13,12 +13,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { supabase, fetchPlayerIndex, type GameRow, type HomeRunRow } from '../lib/supabase';
+import { mlbToday } from '../lib/mlbDate';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
+import WeatherLine from '../components/WeatherLine';
 import {
   addDays,
   aggregateByPlayer,
   applyCanonicalTeams,
-  formatWeatherLine,
   pitcherHrLeaderboard,
   hotHittersLastNGames,
   venueLeaderboard,
@@ -28,9 +29,11 @@ import {
   type VenueStats,
 } from '../lib/stats';
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
+/** Temporary debug toggle — see Dashboard for explanation. */
+const WEATHER_DEBUG = true;
+
+// Pacific calendar date — see src/lib/mlbDate.ts.
+const todayISO = mlbToday;
 
 const PAGE_SIZE = 1000;
 
@@ -253,13 +256,6 @@ export default function Matchups() {
             }
           }
 
-          const weatherLine = formatWeatherLine({
-            condition: g.weather?.condition ?? null,
-            temp_f: g.weather_temp_f,
-            wind_mph: g.weather_wind_mph,
-            wind_dir: g.weather_wind_dir,
-          });
-
           return (
             <div key={g.game_pk} className="panel">
               <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
@@ -270,11 +266,15 @@ export default function Matchups() {
                   {g.venue_name ? `${g.venue_name} · ` : ''}{g.status}
                 </div>
               </div>
-              {weatherLine && (
-                <div className="subtle" style={{ fontSize: 12, marginTop: 4 }}>
-                  🌤 {weatherLine}
-                </div>
-              )}
+              {/* Always render — pending / dome / live all show. */}
+              <WeatherLine
+                condition={g.weather?.condition ?? null}
+                temp_f={g.weather_temp_f}
+                wind_mph={g.weather_wind_mph}
+                wind_dir={g.weather_wind_dir}
+                weather_updated_at={g.weather_updated_at}
+                showDebug={WEATHER_DEBUG}
+              />
 
               <div className="grid" style={{ marginTop: 12, gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))' }}>
                 <SidePanel side={home} venueRow={venueRow} asOf={asOf} sideLabel="Home" />

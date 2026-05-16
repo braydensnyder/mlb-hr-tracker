@@ -32,6 +32,7 @@ import {
   readCronState,
   decideMode,
 } from '../../scripts/lib/cronState.js';
+import { mlbDateContext, formatMlbDateContext } from '../../scripts/lib/mlbDate.js';
 
 interface VercelReqLike {
   method?: string;
@@ -69,6 +70,12 @@ function parseModeOverride(req: VercelReqLike): UpdateMode | null {
 export default async function handler(req: VercelReqLike, res: VercelResLike): Promise<void> {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
+
+  // Capture date context FIRST so even early-exit responses (auth fail,
+  // env missing, lock held) carry the same UTC vs Pacific debug data.
+  const cronStartDate = new Date();
+  const dateContext = mlbDateContext(cronStartDate);
+  console.log(`[cron] start ${formatMlbDateContext(dateContext)}`);
 
   if (req.method && req.method !== 'GET' && req.method !== 'POST') {
     res.status(405).json({ ok: false, route: 'cron-update', error: `Method ${req.method} not allowed — use GET or POST` });
@@ -108,6 +115,11 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
       ok: true,
       route: 'cron-update',
       mode: 'skipped-locked',
+      cronStartedAt: dateContext.cronStartedAt,
+      utcDate: dateContext.utcDate,
+      ptDate: dateContext.ptDate,
+      targetDate: dateContext.mlbTargetDate,
+      utcPtMismatch: dateContext.utcPtMismatch,
       message: 'Another cron run is in progress — skipped this tick to avoid overlap.',
     });
     return;
@@ -157,6 +169,17 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
     );
 
     const s = result.summary;
+    const ctx = result.dateContext;
+    // Derive a single "homeRunsFound" number from the per-date roll-ups
+    // for operator-friendliness (HRsInserted is what landed in DB; "found"
+    // is the same — we always upsert by event_key, not skip).
+    const homeRunsFound = s.HRsInserted + s.duplicatesSkipped;
+    const latestHomeRunAt =
+      s.lastUpdatedAt
+      ?? result.actualResults.today?.latestHrCreatedAt
+      ?? result.actualResults.yesterday?.latestHrCreatedAt
+      ?? null;
+
     res.status(200).json({
       ok: result.failures.length === 0,
       route: 'cron-update',
@@ -167,6 +190,12 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
         result.failures.length === 0
           ? `update:${s.mode} completed cleanly`
           : `update:${s.mode} completed with ${result.failures.length} failure(s)`,
+      // ---- date context (the timezone-bug fix) -----------------------
+      cronStartedAt: ctx.cronStartedAt,
+      utcDate: ctx.utcDate,
+      ptDate: ctx.ptDate,
+      targetDate: ctx.mlbTargetDate,
+      utcPtMismatch: ctx.utcPtMismatch,
       today: result.today,
       yesterday: result.yesterday,
       scheduleWindow: result.scheduleWindow,
@@ -174,21 +203,36 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
       stepCount: result.steps.length,
       failureCount: result.failures.length,
       failures: result.failures,
-      // The flat, dashboard-friendly metric block.
+      // ---- flat metric block, in the order the user spec'd ----------
       gamesChecked: s.gamesChecked,
       liveGamesProcessed: s.liveGamesProcessed,
       finalGamesProcessed: s.finalGamesProcessed,
-      HRsInserted: s.HRsInserted,
+      homeRunsFound,
+      homeRunsInserted: s.HRsInserted,
+      HRsInserted: s.HRsInserted, // back-compat alias
       duplicatesSkipped: s.duplicatesSkipped,
+      // ---- weather block --------------------------------------------
+      weatherChecked: s.weatherChecked,
       weatherUpdated: s.weatherUpdated,
+      gamesWithWeather: s.gamesWithWeather,
+      domeOrRoofGames: s.domeOrRoofGames,
+      weatherErrors: s.weatherErrors,
+      // ---- snapshots / summaries ------------------------------------
       summariesRebuilt: s.summariesRebuilt,
       snapshotsCreated: s.snapshotsCreated,
       snapshotsSkipped: s.snapshotsSkipped,
+      // ---- freshness ------------------------------------------------
       lastUpdatedAt: s.lastUpdatedAt,
+      latestHomeRunAt,
       actualResults: {
         today: summarizeProcess(result.actualResults.today),
         yesterday: summarizeProcess(result.actualResults.yesterday),
       },
+      // ---- aggregate error roll-up (for the manual verification route) -
+      errors: [
+        ...result.failures.map((f) => `${f.step}: ${f.error}`),
+        ...(s.weatherErrors > 0 ? [`enrich:weather had ${s.weatherErrors} per-game failure(s)`] : []),
+      ],
       logSummary: greppable.slice(-60),
     });
   } catch (err) {
@@ -198,7 +242,13 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
       route: 'cron-update',
       mode: tier,
       decisionReason,
+      cronStartedAt: dateContext.cronStartedAt,
+      utcDate: dateContext.utcDate,
+      ptDate: dateContext.ptDate,
+      targetDate: dateContext.mlbTargetDate,
+      utcPtMismatch: dateContext.utcPtMismatch,
       error: msg,
+      errors: [msg],
       logSummary: capturedLines.slice(-30),
     });
   } finally {

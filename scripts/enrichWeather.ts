@@ -33,8 +33,9 @@
  */
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
 import { fetchGameFeed } from './fetchGameFeed.js';
-import { extractWeather } from './extractWeather.js';
+import { extractWeather, isDomeCondition } from './extractWeather.js';
 import { withRetry } from './lib/retry.js';
+import { mlbToday, addDays as mlbAddDays } from './lib/mlbDate.js';
 
 export interface EnrichWeatherOptions {
   start?: string;
@@ -50,23 +51,25 @@ export interface EnrichWeatherOptions {
 export interface EnrichWeatherResult {
   start: string;
   end: string;
+  /** Total games we considered fetching this run. */
   gamesScanned: number;
+  /** Subset we actually called the live feed for. */
+  weatherChecked: number;
+  /** Games we successfully updated weather columns on. */
   weatherFilled: number;
+  /** Total games in the window with non-null weather AFTER this run
+   *  (i.e. how many games the dashboard can display weather for). */
+  gamesWithWeather: number;
   /** Games whose feed had no weather block yet (future games — skipped). */
   noWeatherYet: number;
+  /** Games inside a closed-roof / dome — weather is implicitly neutral. */
+  domeOrRoofGames: number;
   failures: { game_pk: number; error: string }[];
 }
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function addDays(yyyyMmDd: string, delta: number): string {
-  const [y, m, d] = yyyyMmDd.split('-').map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + delta);
-  return dt.toISOString().slice(0, 10);
-}
+// "today" = America/Los_Angeles calendar date, not server UTC.
+const todayISO = mlbToday;
+const addDays = mlbAddDays;
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -126,13 +129,17 @@ export async function enrichWeather(opts: EnrichWeatherOptions = {}): Promise<En
     start,
     end,
     gamesScanned: candidates.length,
+    weatherChecked: 0,
     weatherFilled: 0,
+    gamesWithWeather: 0,
     noWeatherYet: 0,
+    domeOrRoofGames: 0,
     failures: [],
   };
 
   for (let i = 0; i < candidates.length; i++) {
     const g = candidates[i];
+    result.weatherChecked++;
     try {
       const feed = await withRetry(() => fetchGameFeed(g.game_pk));
       const weather = extractWeather(feed);
@@ -145,10 +152,11 @@ export async function enrichWeather(opts: EnrichWeatherOptions = {}): Promise<En
         }
       } else if (dryRun) {
         result.weatherFilled++;
+        if (isDomeCondition(weather.condition)) result.domeOrRoofGames++;
         if (i % 25 === 0) {
           console.log(
             `  [dry-run] ${g.game_pk} (${g.game_date}) → ${weather.temp_f ?? '?'}°F, ` +
-              `wind ${weather.wind_mph ?? '?'} ${weather.wind_dir ?? ''}`,
+              `wind ${weather.wind_mph ?? '?'} ${weather.wind_dir ?? ''} (${weather.condition ?? 'no condition'})`,
           );
         }
       } else {
@@ -159,14 +167,17 @@ export async function enrichWeather(opts: EnrichWeatherOptions = {}): Promise<En
             weather_temp_f: weather.temp_f,
             weather_wind_mph: weather.wind_mph,
             weather_wind_dir: weather.wind_dir,
+            weather_updated_at: new Date().toISOString(),
           })
           .eq('game_pk', g.game_pk);
         if (uErr) throw new Error(`update games failed: ${uErr.message}`);
         result.weatherFilled++;
+        if (isDomeCondition(weather.condition)) result.domeOrRoofGames++;
         if (i % 25 === 0) {
           console.log(
             `  ${g.game_pk} (${g.game_date}) → ${weather.temp_f ?? '?'}°F, ` +
-              `wind ${weather.wind_mph ?? '?'} mph ${weather.wind_dir ?? ''}`.trim(),
+              `wind ${weather.wind_mph ?? '?'} mph ${weather.wind_dir ?? ''} ` +
+              `(${weather.condition ?? 'no condition'})`.trim(),
           );
         }
       }
@@ -178,10 +189,27 @@ export async function enrichWeather(opts: EnrichWeatherOptions = {}): Promise<En
     if (i < candidates.length - 1 && delayMs > 0) await sleep(delayMs);
   }
 
+  // Final read-back: how many games in the window now have weather columns
+  // populated. This is what the dashboard will actually be able to render.
+  try {
+    const { count, error: cErr } = await supabaseAdmin
+      .from('games')
+      .select('game_pk', { count: 'exact', head: true })
+      .gte('game_date', start)
+      .lte('game_date', end)
+      .not('weather_temp_f', 'is', null);
+    if (!cErr && typeof count === 'number') result.gamesWithWeather = count;
+  } catch {
+    /* non-fatal: gamesWithWeather just stays 0 */
+  }
+
   console.log('[enrichWeather] DONE', {
     gamesScanned: result.gamesScanned,
+    weatherChecked: result.weatherChecked,
     weatherFilled: result.weatherFilled,
+    gamesWithWeather: result.gamesWithWeather,
     noWeatherYet: result.noWeatherYet,
+    domeOrRoofGames: result.domeOrRoofGames,
     failures: result.failures.length,
   });
   return result;

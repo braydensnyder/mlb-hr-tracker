@@ -1,8 +1,20 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { supabase, fetchPlayerIndex, fetchTodayStatus, type HomeRunRow, type TodayStatus } from '../lib/supabase';
+import {
+  supabase,
+  fetchPlayerIndex,
+  fetchTodayStatus,
+  fetchCronState,
+  fetchWeatherCoverage,
+  type HomeRunRow,
+  type TodayStatus,
+  type CronStateRow,
+  type WeatherCoverage,
+} from '../lib/supabase';
+import { mlbToday } from '../lib/mlbDate';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
 import HomeRunCard from '../components/HomeRunCard';
+import WeatherLine from '../components/WeatherLine';
 import Leaderboard, { type LeaderRow } from '../components/Leaderboard';
 import TeamLeaderboard from '../components/TeamLeaderboard';
 import { BackToBackPanel, MultiHrPanel } from '../components/PlayerStreaks';
@@ -16,7 +28,6 @@ import {
   applyCanonicalTeams,
   applyFilters,
   backToBackHr,
-  formatWeatherLine,
   hotHittersLastNGames,
   hrsInLastDays,
   leagueHandednessSplit,
@@ -29,9 +40,15 @@ import {
   type PlayerTeamIndex,
 } from '../lib/stats';
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
+// "today" = MLB / Pacific calendar date. See src/lib/mlbDate.ts for why
+// `new Date().toISOString().slice(0, 10)` is the wrong call here.
+const todayISO = mlbToday;
+
+/** Temporary debug toggle — when true, every WeatherLine on the page also
+ *  prints the literal `weather_updated_at: <iso | null>` so we can spot
+ *  "missing in DB" vs "missing in UI" by eye. Flip to false when the
+ *  weather pipeline is verified end-to-end. */
+const WEATHER_DEBUG = true;
 
 const PAGE_SIZE = 1000;
 
@@ -65,35 +82,46 @@ async function fetchSeasonToDate(asOf: string): Promise<HomeRunRow[]> {
   return all;
 }
 
+/** Per-game weather payload — everything the WeatherLine component needs.
+ *  Pulled with `weather_updated_at` so the UI can show "Updated 6:14 PM"
+ *  AND the temporary debug text the user requested. */
+export interface GameWeather {
+  condition: string | null;
+  temp_f: number | null;
+  wind_mph: number | null;
+  wind_dir: string | null;
+  weather_updated_at: string | null;
+}
+
 /**
- * Fetch the games on `date` (just the weather-relevant columns) so the
- * Dashboard can label each "HRs today" card with the conditions that
- * HR was hit in. Soft helper — a failure here just means no weather
- * tag on the cards.
+ * Fetch the games on `date` and return the weather payload per game_pk.
+ * Soft helper — a failure here returns an empty map; the WeatherLine
+ * component still renders "Weather pending" for every card.
  */
-async function fetchGameWeather(
-  date: string,
-): Promise<Map<number, string>> {
+async function fetchGameWeather(date: string): Promise<Map<number, GameWeather>> {
   const { data, error } = await supabase
     .from('games')
-    .select('game_pk, weather, weather_temp_f, weather_wind_mph, weather_wind_dir')
+    .select(
+      'game_pk, weather, weather_temp_f, weather_wind_mph, weather_wind_dir, weather_updated_at',
+    )
     .eq('game_date', date);
   if (error) throw new Error(error.message);
-  const out = new Map<number, string>();
+  const out = new Map<number, GameWeather>();
   for (const g of (data ?? []) as {
     game_pk: number;
     weather: { condition?: string } | null;
     weather_temp_f: number | null;
     weather_wind_mph: number | null;
     weather_wind_dir: string | null;
+    weather_updated_at: string | null;
   }[]) {
-    const line = formatWeatherLine({
+    out.set(g.game_pk, {
       condition: g.weather?.condition ?? null,
       temp_f: g.weather_temp_f,
       wind_mph: g.weather_wind_mph,
       wind_dir: g.weather_wind_dir,
+      weather_updated_at: g.weather_updated_at,
     });
-    if (line) out.set(g.game_pk, line);
   }
   return out;
 }
@@ -122,8 +150,14 @@ export default function Dashboard() {
    *  Re-fetched on every refresh tick so the card stays current as the
    *  cron lands new live-game HRs into Supabase. */
   const [todayStatus, setTodayStatus] = useState<TodayStatus | null>(null);
-  /** game_pk → formatted weather line, for labelling the HRs-today cards. */
-  const [weatherByGame, setWeatherByGame] = useState<Map<number, string>>(new Map());
+  /** Cron singleton — "Last cron run" / "Last cron mode" tiles. */
+  const [cronState, setCronState] = useState<CronStateRow | null>(null);
+  /** Weather coverage on `asOf` — drives "Weather: 12/15 games" tile. */
+  const [weatherCoverage, setWeatherCoverage] = useState<WeatherCoverage | null>(null);
+  /** game_pk → weather payload, for labelling the HRs-today cards. The
+   *  WeatherLine component renders "Weather pending" when a game has no
+   *  entry, so cards never go un-labelled. */
+  const [weatherByGame, setWeatherByGame] = useState<Map<number, GameWeather>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -170,6 +204,16 @@ export default function Dashboard() {
     fetchTodayStatus(asOf)
       .then((s) => { if (!cancelled) setTodayStatus(s); })
       .catch(() => { if (!cancelled) setTodayStatus(null); });
+
+    // Cron singleton — "Last cron run" + "Last cron mode" tiles.
+    fetchCronState()
+      .then((c) => { if (!cancelled) setCronState(c); })
+      .catch(() => { if (!cancelled) setCronState(null); });
+
+    // Weather coverage on the as-of date.
+    fetchWeatherCoverage(asOf)
+      .then((w) => { if (!cancelled) setWeatherCoverage(w); })
+      .catch(() => { if (!cancelled) setWeatherCoverage(null); });
 
     // Game weather for the as-of date — used to tag the HRs-today cards.
     fetchGameWeather(asOf)
@@ -332,7 +376,12 @@ export default function Dashboard() {
           Reads from the `games` table (status counts) + home_runs
           (HR count + freshest created_at on game_date == asOf). The
           card answers "is the cron actually pulling today's games?". */}
-      <TodayStatusCard status={todayStatus} asOf={asOf} />
+      <TodayStatusCard
+        status={todayStatus}
+        asOf={asOf}
+        cronState={cronState}
+        weather={weatherCoverage}
+      />
 
       {/* ---- HRs today ---- */}
       <h3 className="section">HRs on {asOf}</h3>
@@ -350,6 +399,7 @@ export default function Dashboard() {
                 hr={hr}
                 asOf={asOf}
                 weather={weatherByGame.get(hr.game_pk) ?? null}
+                showWeatherDebug={WEATHER_DEBUG}
               />
             ))}
           </div>
@@ -458,7 +508,17 @@ function Kpi({ label, value }: { label: string; value: string | number }) {
  *   - Pregame: games not yet started
  *   - Last actual results update: MAX(home_runs.created_at) where game_date = asOf
  */
-function TodayStatusCard({ status, asOf }: { status: TodayStatus | null; asOf: string }) {
+function TodayStatusCard({
+  status,
+  asOf,
+  cronState,
+  weather,
+}: {
+  status: TodayStatus | null;
+  asOf: string;
+  cronState: CronStateRow | null;
+  weather: WeatherCoverage | null;
+}) {
   if (!status) {
     return (
       <div className="panel" style={{ marginBottom: 12, padding: 10 }}>
@@ -477,6 +537,18 @@ function TodayStatusCard({ status, asOf }: { status: TodayStatus | null; asOf: s
   const liveStyle = status.liveGames > 0
     ? { color: 'var(--good)', fontWeight: 700 as const }
     : undefined;
+
+  // Weather coverage tile — null while loading, "Pending" when no game has
+  // weather yet (MLB hasn't published), "12/15 games" otherwise.
+  const weatherTile = (() => {
+    if (!weather) return { value: '—', accent: false };
+    if (weather.totalGames === 0) return { value: 'No games', accent: false };
+    if (weather.withWeather === 0) return { value: 'Pending', accent: false };
+    return {
+      value: `${weather.withWeather}/${weather.totalGames}`,
+      accent: weather.withWeather === weather.totalGames,
+    };
+  })();
 
   return (
     <div
@@ -511,6 +583,15 @@ function TodayStatusCard({ status, asOf }: { status: TodayStatus | null; asOf: s
         <StatusTile label="Live in progress"  value={status.liveGames} valueStyle={liveStyle} />
         <StatusTile label="Finals awaiting"   value={status.finalsAwaitingIngest} />
         <StatusTile label="Pregame"           value={status.pregameGames} />
+        <StringTile label="Weather coverage"  value={weatherTile.value} accent={weatherTile.accent} />
+        <StringTile
+          label="Last cron run"
+          value={cronState?.last_run_at ? new Date(cronState.last_run_at).toLocaleTimeString() : '—'}
+        />
+        <StringTile
+          label="Last cron mode"
+          value={cronState?.last_run_mode ?? '—'}
+        />
       </div>
       <div
         style={{
@@ -518,17 +599,82 @@ function TodayStatusCard({ status, asOf }: { status: TodayStatus | null; asOf: s
           paddingTop: 8,
           borderTop: '1px solid var(--border)',
           fontSize: 11,
+          display: 'grid',
+          gap: 4,
         }}
       >
-        <span className="subtle" style={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>
-          Last actual results update
-        </span>
-        <span style={{ marginLeft: 8 }}>{fmt(status.lastActualHrCreatedAt)}</span>
-        {status.liveGames > 0 && (
-          <span className="subtle" style={{ marginLeft: 12 }}>
-            (next cron tick will re-check the {status.liveGames} live game{status.liveGames === 1 ? '' : 's'})
+        <div>
+          <span className="subtle" style={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>
+            Last actual results update
           </span>
-        )}
+          <span style={{ marginLeft: 8 }}>{fmt(status.lastActualHrCreatedAt)}</span>
+          {status.liveGames > 0 && (
+            <span className="subtle" style={{ marginLeft: 12 }}>
+              (next cron tick will re-check the {status.liveGames} live game{status.liveGames === 1 ? '' : 's'})
+            </span>
+          )}
+        </div>
+        <div>
+          <span className="subtle" style={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>
+            Last cron run
+          </span>
+          <span style={{ marginLeft: 8 }}>{fmt(cronState?.last_run_at ?? null)}</span>
+          {cronState?.last_run_mode && (
+            <span className="subtle" style={{ marginLeft: 8 }}>
+              ({cronState.last_run_mode}{cronState.run_count ? ` · run #${cronState.run_count}` : ''})
+            </span>
+          )}
+          {cronState?.running && (
+            <span style={{ marginLeft: 8, color: 'var(--good)', fontWeight: 600 }}>
+              · running now
+            </span>
+          )}
+        </div>
+        <div>
+          <span className="subtle" style={{ textTransform: 'uppercase', letterSpacing: 0.6 }}>
+            Last weather update
+          </span>
+          <span style={{ marginLeft: 8 }}>{fmt(weather?.lastWeatherUpdatedAt ?? null)}</span>
+          {weather && weather.totalGames > 0 && weather.withWeather === 0 && (
+            <span className="subtle" style={{ marginLeft: 8 }}>
+              (MLB hasn't published weather yet — usually a few hours before first pitch)
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StringTile({
+  label,
+  value,
+  accent,
+}: {
+  label: string;
+  value: string;
+  accent?: boolean;
+}) {
+  return (
+    <div
+      style={{
+        padding: '6px 8px',
+        borderRadius: 6,
+        background: 'var(--panel-2)',
+        border: '1px solid var(--border)',
+      }}
+    >
+      <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+        {label}
+      </div>
+      <div
+        style={{
+          fontSize: 13,
+          fontWeight: 600,
+          color: accent ? 'var(--accent)' : undefined,
+        }}
+      >
+        {value}
       </div>
     </div>
   );

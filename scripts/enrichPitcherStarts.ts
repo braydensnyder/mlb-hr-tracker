@@ -21,6 +21,7 @@ import { supabaseAdmin } from './lib/supabaseAdmin.js';
 import { fetchGameFeed } from './fetchGameFeed.js';
 import { extractPitcherStarts } from './extractPitcherStarts.js';
 import { withRetry } from './lib/retry.js';
+import { mlbToday, addDays as mlbAddDays } from './lib/mlbDate.js';
 
 export interface EnrichPitcherStartsOptions {
   start?: string;
@@ -41,13 +42,9 @@ export interface EnrichPitcherStartsResult {
 
 const PAGE = 1000;
 
-function todayISO() { return new Date().toISOString().slice(0, 10); }
-function addDays(s: string, d: number): string {
-  const [y, m, dd] = s.split('-').map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, dd));
-  dt.setUTCDate(dt.getUTCDate() + d);
-  return dt.toISOString().slice(0, 10);
-}
+// Pacific calendar date — see scripts/lib/mlbDate.ts.
+const todayISO = mlbToday;
+const addDays = mlbAddDays;
 function sleep(ms: number) { return new Promise<void>((r) => setTimeout(r, ms)); }
 
 async function listAllGamePksInRange(start: string, end: string): Promise<number[]> {

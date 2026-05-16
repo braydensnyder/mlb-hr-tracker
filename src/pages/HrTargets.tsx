@@ -18,12 +18,13 @@
 import React, { Fragment, useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { supabase, fetchPlayerIndex, fetchPitcherFormIndex, fetchDataLastUpdated, type GameRow, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
+import { mlbToday } from '../lib/mlbDate';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
+import WeatherLine from '../components/WeatherLine';
 import {
   addDays,
   applyCanonicalTeams,
   computeHrTargets,
-  formatWeatherLine,
   pitcherHrLeaderboard,
   venueLeaderboard,
   ELITE_POWER_NAMES,
@@ -34,9 +35,11 @@ import {
   type PlayerTeamIndex,
 } from '../lib/stats';
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
+/** Temporary debug toggle — see Dashboard for explanation. */
+const WEATHER_DEBUG = true;
+
+// Pacific calendar date — see src/lib/mlbDate.ts.
+const todayISO = mlbToday;
 
 const PAGE = 1000;
 
@@ -288,6 +291,7 @@ export default function HrTargets() {
       weather_temp_f: g.weather_temp_f,
       weather_wind_mph: g.weather_wind_mph,
       weather_wind_dir: g.weather_wind_dir,
+      weather_updated_at: g.weather_updated_at,
     })),
     [games],
   );
@@ -762,41 +766,30 @@ function MatchupDetail({ t }: { t: HrTarget }) {
         </div>
       </div>
 
-      {/* Weather transparency — temp, wind, and whether it moved the score */}
+      {/* Weather transparency — always rendered (live / dome / pending). */}
       <div>
         <div className="subtle" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 4 }}>Weather</div>
-        {(() => {
-          const line = formatWeatherLine({
-            condition: t.weather_condition,
-            temp_f: t.weather_temp_f,
-            wind_mph: t.weather_wind_mph,
-            wind_dir: t.weather_wind_dir,
-          });
-          if (!line) {
-            return <div className="subtle" style={{ fontSize: 13 }}>No weather data yet</div>;
-          }
-          return (
+        <WeatherLine
+          condition={t.weather_condition}
+          temp_f={t.weather_temp_f}
+          wind_mph={t.weather_wind_mph}
+          wind_dir={t.weather_wind_dir}
+          weather_updated_at={t.weather_updated_at}
+          showDebug={WEATHER_DEBUG}
+        />
+        <div className="subtle" style={{ fontSize: 12, marginTop: 4 }}>
+          {t.weather_included ? (
             <>
-              <div style={{ fontSize: 13 }}><strong>{line}</strong></div>
-              <div
-                className="subtle"
-                style={{ fontSize: 12, marginTop: 4 }}
-              >
-                {t.weather_included ? (
-                  <>
-                    Weather score:{' '}
-                    <span style={{ color: b.weather_adjustment >= 0 ? 'var(--good)' : '#ff8d8d' }}>
-                      {b.weather_adjustment >= 0 ? '+' : ''}{b.weather_adjustment.toFixed(1)}
-                    </span>{' '}
-                    (included in heat)
-                  </>
-                ) : (
-                  <>Weather score: 0.0 (neutral — not included)</>
-                )}
-              </div>
+              Weather score:{' '}
+              <span style={{ color: b.weather_adjustment >= 0 ? 'var(--good)' : '#ff8d8d' }}>
+                {b.weather_adjustment >= 0 ? '+' : ''}{b.weather_adjustment.toFixed(1)}
+              </span>{' '}
+              (included in heat)
             </>
-          );
-        })()}
+          ) : (
+            <>Weather score: 0.0 (neutral — not included)</>
+          )}
+        </div>
       </div>
 
       <div>
@@ -1299,12 +1292,6 @@ function CompareTable({
 }
 
 function GameTargetsCard({ board, asOf }: { board: HrTargetsBoard; asOf: string }) {
-  const weatherLine = formatWeatherLine({
-    condition: board.weather_condition,
-    temp_f: board.weather_temp_f,
-    wind_mph: board.weather_wind_mph,
-    wind_dir: board.weather_wind_dir,
-  });
   return (
     <div className="panel">
       <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
@@ -1315,11 +1302,15 @@ function GameTargetsCard({ board, asOf }: { board: HrTargetsBoard; asOf: string 
           {board.venue_name ?? 'Venue TBD'} · {board.game_date}
         </div>
       </div>
-      {weatherLine && (
-        <div className="subtle" style={{ fontSize: 12, marginTop: 4 }}>
-          🌤 {weatherLine}
-        </div>
-      )}
+      {/* Always render — pending / dome / live all show. */}
+      <WeatherLine
+        condition={board.weather_condition}
+        temp_f={board.weather_temp_f}
+        wind_mph={board.weather_wind_mph}
+        wind_dir={board.weather_wind_dir}
+        weather_updated_at={board.weather_updated_at}
+        showDebug={WEATHER_DEBUG}
+      />
 
       <div className="grid" style={{ marginTop: 12, gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))' }}>
         <SidePanel label={`${board.away_team} batters`} facing={board.away_facing} targets={board.away_targets} asOf={asOf} />

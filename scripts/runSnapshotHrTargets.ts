@@ -9,14 +9,11 @@
  *   npm run snapshot:targets -- 2026-05-10 --limit 25
  */
 import { snapshotHrTargets } from './snapshotHrTargets.js';
+import { mlbToday, addDays as mlbAddDays } from './lib/mlbDate.js';
 
-function todayISO() { return new Date().toISOString().slice(0, 10); }
-function addDays(s: string, d: number) {
-  const [y, m, dd] = s.split('-').map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, dd));
-  dt.setUTCDate(dt.getUTCDate() + d);
-  return dt.toISOString().slice(0, 10);
-}
+// Pacific calendar date — see scripts/lib/mlbDate.ts.
+const todayISO = mlbToday;
+const addDays = mlbAddDays;
 
 interface Parsed { date: string; force: boolean; limit?: number; }
 
