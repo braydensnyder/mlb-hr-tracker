@@ -9,6 +9,6 @@
     { "source": "/(.*)", "destination": "/" }
   ],
   "crons": [
-    { "path": "/api/cron/update", "schedule": "7 * * * *" }
+    { "path": "/api/cron/update", "schedule": "7 16 * * *" }
   ]
 }

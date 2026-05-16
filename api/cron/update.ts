@@ -1,17 +1,33 @@
 /**
- * api/cron/update — the SINGLE smart hourly cron endpoint.
+ * api/cron/update — the SINGLE smart cron endpoint.
  *
- * vercel.json fires this once an hour (`7 * * * *`). The endpoint then
- * decides — from the wall clock + the `cron_state` row — HOW MUCH work
- * to do, so one hourly cron stays cheap most of the time and only does
- * heavy rebuilds a few times a day:
+ * vercel.json fires this ONCE A DAY at `7 16 * * *` (16:07 UTC ≈ 9 AM PT).
+ * That's the most Vercel's Hobby plan allows — they capped Hobby crons at
+ * once-per-day in May 2026 and refuse to deploy if the schedule fires
+ * more often.
  *
- *   - light  — hourly tick: ingest live/final HRs, refresh statuses +
- *              weather. No heavy enrichments / snapshots / summaries.
- *   - full   — every ~6h: wide schedule pull, all enrichments, summary
- *              rebuilds. First full of the UTC day = morning baseline
- *              (force-rebuilds today's snapshot).
- *   - night  — once/day post-games: finalize results + nightly snapshot.
+ * Why 9 AM PT for the single fire:
+ *   - Falls inside the odds-snapshot morning window (PT 7–11) so
+ *     decideOddsSnapshot can take the morning bucket cleanly.
+ *   - West-coast games from "yesterday" have long since finalized, so the
+ *     yesterday-ingest pass catches everything.
+ *   - Today's HrTargets snapshot lands BEFORE first pitch (East Coast
+ *     games start ~10 AM PT at the earliest).
+ *   - Enough cushion before games start that probable-pitcher data is
+ *     usually announced.
+ *
+ * Decision still happens at runtime — the endpoint reads cron_state +
+ * the clock and picks light / full / night automatically:
+ *
+ *   - light  — cheap tick: ingest live/final HRs, refresh statuses + weather.
+ *   - full   — heavy refresh ≥6h since the last heavy run.
+ *   - night  — post-game finalize once per UTC day in 7–13 UTC.
+ *
+ * In-game HR ingest is now MANUAL or external on Hobby. Trigger it with:
+ *   curl -H "Authorization: Bearer $CRON_SECRET" \
+ *        "https://<your-domain>/api/cron/update?mode=light"
+ * To automate hourly, point cron-job.org / GitHub Actions / your phone
+ * shortcut at the same URL.
  *
  * Safeguards:
  *   - Bearer CRON_SECRET auth.
