@@ -1113,6 +1113,25 @@ export interface HrTargetSubscores {
   };
 }
 
+/**
+ * A compact, verified reason chip. Three tones:
+ *   - 'good'    — positive signal (Hot last 7d, Park boost, Wind boost…)
+ *   - 'bad'     — negative signal (Cold L5+L7d, Dominant pitcher, Wind in…)
+ *   - 'neutral' — informational caveat (Data limited, Low confidence…)
+ *
+ * `label` is what the chip shows. `detail` is the longer numeric backup
+ * that the expanded row reveals — it always cites the source value, so
+ * the chip itself can stay short without losing accountability.
+ */
+export interface ReasonChip {
+  label: string;
+  tone: 'good' | 'bad' | 'neutral';
+  /** Optional longer text — shown in the expanded detail tooltip / row. */
+  detail?: string;
+  /** Stable id so React keys are stable and CSS can target a kind if needed. */
+  kind: string;
+}
+
 export interface HrTarget {
   player_id: number;
   player_name: string;
@@ -1138,8 +1157,15 @@ export interface HrTarget {
   subscores: HrTargetSubscores;
   /** Grouped score breakdown (post-stability) for the expandable detail. */
   breakdown: HrTargetBreakdown;
-  /** 1–3 specific, numeric reason strings (e.g. "5 HR last 5 games"). */
+  /** Legacy: short sentences kept ONLY for snapshot back-compat (the
+   *  Backtest page joins this string array). The HR Targets UI now reads
+   *  `reason_chips` instead — see ReasonChip below. */
   reasons: string[];
+  /** Verified, compact reason chips. Each chip is derived from a real
+   *  measured fact (calendar-window HRs, pitcher-starts data, etc.) —
+   *  never from "last N HR-games" sleight-of-hand which conflated
+   *  "games played" with "games where this hitter homered". */
+  reason_chips: ReasonChip[];
 
   // Pitcher / venue context, denormalized for display + reason text:
   pitcher_l14d_allowed: number;
@@ -1279,169 +1305,208 @@ function round2(n: number) { return Math.round(n * 100) / 100; }
  *   - Park rank (top 5) or absolute L14d
  *   - Meta tag: "Hot streak + favorable matchup" when 2+ heavy signals stack
  */
-function pickReasons(t: HrTarget): string[] {
-  const candidates: { weight: number; text: string }[] = [];
+/**
+ * pickReasonChips — emits compact, *verified* chips for the UI.
+ *
+ * Strict rules (per user audit, task #161):
+ *   - Recent-form chips ONLY fire from calendar-window measurements
+ *     (hrs_l7d, hr_streak) — NEVER from "last N HR-games", which
+ *     reported misleading text like "2 HR over last 2 HR games" for
+ *     hitters whose most-recent HRs were a month apart.
+ *   - Pitcher-weakness "L3/L5 starts" chips require real pitcher_starts
+ *     data (starts_known ≥ 3). Without it, only the calendar-window
+ *     L14d claim is allowed, and only if it's non-trivial.
+ *   - If no chip would fire, we emit a single neutral "Data limited" chip
+ *     rather than inventing prose.
+ *
+ * `pickReasons` is kept as a back-compat wrapper that joins chip labels
+ * into the legacy string[] for snapshots and the Backtest page.
+ */
+function pickReasonChips(t: HrTarget): ReasonChip[] {
+  const candidates: { weight: number; chip: ReasonChip }[] = [];
   const c = t.subscores.contributions;
+  const havePitcherStarts = t.pitcher_starts_known >= 3;
 
-  // ----- recent form: pick the SHARPEST window that is non-trivial -----
-  // Phrasing note: "last N HR games" is honest — these counts are computed
-  // across the player's N most recent distinct HR-DATES, NOT the literal last
-  // N MLB games played (we have HR-event data only, not at-bat data).
-  //
-  // Narrative-prefix format (task #155) — "Recent HR form: ..." so the
-  // reason lists scan more like a scout's notes than a stat-line dump.
-  if (t.hrs_l2 >= 2) {
-    candidates.push({ weight: 30 + 5 * t.hrs_l2, text: `Recent HR form — ${t.hrs_l2} HR over last 2 HR games` });
-  } else if (t.hrs_l3 >= 2) {
-    candidates.push({ weight: 25 + 3 * t.hrs_l3, text: `Recent HR form — ${t.hrs_l3} HR over last 3 HR games` });
-  } else if (t.hrs_l5 >= 3) {
-    candidates.push({ weight: 18 + 2 * t.hrs_l5, text: `Recent HR form — ${t.hrs_l5} HR over last 5 HR games` });
-  } else if (t.hrs_l7d >= 3) {
-    candidates.push({ weight: 15 + t.hrs_l7d, text: `Recent HR form — ${t.hrs_l7d} HR in last 7 calendar days` });
-  } else if (t.hrs_l5 >= 2) {
-    candidates.push({ weight: 10 + t.hrs_l5, text: `Recent HR form — ${t.hrs_l5} HR over last 5 HR games` });
+  // ----- recent form: ONLY calendar-window facts -----
+  // hrs_l7d is "HRs in the last 7 calendar days ≤ asOf" — game-log truth.
+  if (t.hrs_l7d >= 3) {
+    candidates.push({
+      weight: 32,
+      chip: { kind: 'hot7', label: 'Hot last 7d', tone: 'good', detail: `${t.hrs_l7d} HR in last 7 days` },
+    });
+  } else if (t.hrs_l7d === 2) {
+    candidates.push({
+      weight: 22,
+      chip: { kind: 'hot7', label: 'Hot last 7d', tone: 'good', detail: `2 HR in last 7 days` },
+    });
   }
 
-  // Consecutive HR-DAY streak — distinct signal from L3 HR count.
+  // Consecutive-calendar-day HR streak — a clean, easy-to-verify signal.
   if (t.hr_streak >= 3) {
-    candidates.push({ weight: 18 + t.hr_streak, text: `HR on ${t.hr_streak} consecutive calendar days` });
+    candidates.push({
+      weight: 26,
+      chip: { kind: 'streak', label: `${t.hr_streak}d HR streak`, tone: 'good', detail: `HR on ${t.hr_streak} consecutive calendar days` },
+    });
+  } else if (t.hr_streak === 2) {
+    candidates.push({
+      weight: 14,
+      chip: { kind: 'streak', label: 'Back-to-back days', tone: 'good', detail: 'HR on 2 consecutive calendar days' },
+    });
   }
 
-  // ----- season power — narrative categories -----
+  // ----- season power: short labels, value in detail -----
   if (t.season_hr >= 25) {
-    candidates.push({ weight: c.season + 4, text: `Elite season power (${t.season_hr} HR)` });
+    candidates.push({ weight: c.season + 6, chip: { kind: 'power', label: 'Elite power', tone: 'good', detail: `${t.season_hr} season HR` } });
   } else if (t.season_hr >= 15) {
-    candidates.push({ weight: c.season + t.season_hr / 8, text: `Strong season power (${t.season_hr} HR)` });
+    candidates.push({ weight: c.season + 2, chip: { kind: 'power', label: 'Strong power', tone: 'good', detail: `${t.season_hr} season HR` } });
   } else if (t.season_hr >= 8 && c.season >= 1) {
-    candidates.push({ weight: c.season, text: `Mid-tier season power (${t.season_hr} HR)` });
+    candidates.push({ weight: c.season, chip: { kind: 'power', label: 'Mid-tier power', tone: 'good', detail: `${t.season_hr} season HR` } });
   }
 
-  // ----- handedness edge — narrative + count -----
+  // ----- handedness edge -----
   if (t.pitcher_hand === 'L' || t.pitcher_hand === 'R') {
     const vsCount = t.pitcher_hand === 'L' ? t.vs_lhp_season : t.vs_rhp_season;
     if (vsCount >= 3 && c.hand >= 1.5) {
       candidates.push({
         weight: c.hand + 1.5,
-        text: `Good matchup vs ${t.pitcher_hand}HP (${vsCount} HR vs ${t.pitcher_hand}HP this season)`,
+        chip: { kind: 'hand', label: `Good vs ${t.pitcher_hand}HP`, tone: 'good', detail: `${vsCount} HR vs ${t.pitcher_hand}HP this season` },
       });
     }
   }
 
-  // ----- pitcher weakness, with concrete count -----
-  // STRICT change: "Pitcher allowed N HR in last 3/5 starts" now requires
-  // real pitcher_starts data (starts_known ≥ 3). Without it, the L3/L5
-  // counts come from the home_runs-only approximation, which counts
-  // "distinct HR-allowed dates" not "actual last 5 starts" — that was
-  // the source of misleading recent-form text for pitchers.
-  const havePitcherStarts = t.pitcher_starts_known >= 3;
+  // ----- pitcher weakness — strict source rules -----
   if (havePitcherStarts && t.pitcher_l5_starts_allowed >= 4) {
     candidates.push({
       weight: c.pitcher + t.pitcher_l5_starts_allowed,
-      text: `Pitcher HR weakness — allowed ${t.pitcher_l5_starts_allowed} HR in last 5 starts`,
+      chip: { kind: 'pitcher_weak', label: 'Weak HR pitcher', tone: 'good', detail: `Allowed ${t.pitcher_l5_starts_allowed} HR in last 5 starts` },
     });
   } else if (havePitcherStarts && t.pitcher_l3_starts_allowed >= 3) {
     candidates.push({
       weight: c.pitcher + t.pitcher_l3_starts_allowed,
-      text: `Pitcher HR weakness — allowed ${t.pitcher_l3_starts_allowed} HR in last 3 starts`,
+      chip: { kind: 'pitcher_weak', label: 'Weak HR pitcher', tone: 'good', detail: `Allowed ${t.pitcher_l3_starts_allowed} HR in last 3 starts` },
     });
   } else if (t.pitcher_l14d_allowed >= 3) {
     candidates.push({
       weight: c.pitcher,
-      text: `Pitcher HR weakness — allowed ${t.pitcher_l14d_allowed} HR in last 14 days`,
+      chip: { kind: 'pitcher_weak', label: 'Weak HR pitcher', tone: 'good', detail: `Allowed ${t.pitcher_l14d_allowed} HR in last 14 days` },
     });
   }
 
-  // Pitcher quality — NEGATIVE side. When facing a dominant arm we
-  // surface that so the user understands why the model penalized the row.
+  // Pitcher quality — NEGATIVE chips.
   if (t.pitcher_k_per_9 != null && havePitcherStarts) {
     if (t.pitcher_k_per_9 >= 11 && t.pitcher_l5_starts_allowed <= 1) {
       candidates.push({
-        weight: 20,
-        text: `Facing dominant pitcher (K/9 ${t.pitcher_k_per_9.toFixed(1)}, ${t.pitcher_l5_starts_allowed} HR L5 starts)`,
+        weight: 22,
+        chip: { kind: 'pitcher_dominant', label: 'Dominant pitcher', tone: 'bad', detail: `K/9 ${t.pitcher_k_per_9.toFixed(1)}, ${t.pitcher_l5_starts_allowed} HR L5 starts` },
       });
     } else if (t.pitcher_k_per_9 >= 11) {
       candidates.push({
-        weight: 12,
-        text: `Facing high-K pitcher (K/9 ${t.pitcher_k_per_9.toFixed(1)})`,
+        weight: 14,
+        chip: { kind: 'pitcher_highK', label: 'High-K pitcher', tone: 'bad', detail: `K/9 ${t.pitcher_k_per_9.toFixed(1)}` },
       });
     }
   }
   if (t.pitcher_bb_per_9 != null && havePitcherStarts && t.pitcher_bb_per_9 >= 4.5) {
     candidates.push({
-      weight: 10,
-      text: `Wild pitcher (BB/9 ${t.pitcher_bb_per_9.toFixed(1)})`,
+      weight: 12,
+      chip: { kind: 'pitcher_wild', label: 'Wild pitcher', tone: 'good', detail: `BB/9 ${t.pitcher_bb_per_9.toFixed(1)}` },
     });
   }
 
-  // ----- park boost: rank-based when in top 5 -----
+  // ----- park boost -----
   if (t.venue_l14d_rank != null && t.venue_l14d_rank <= 5 && t.venue_l14d_hrs >= 2) {
     candidates.push({
       weight: c.park + (6 - t.venue_l14d_rank),
-      text: `Power-friendly park (top ${t.venue_l14d_rank} in L14d HRs)`,
+      chip: { kind: 'park', label: 'Park boost', tone: 'good', detail: `Top ${t.venue_l14d_rank} in L14d HRs (${t.venue_l14d_hrs} HR L14d)` },
     });
   } else if (t.venue_l14d_hrs >= 4) {
     candidates.push({
       weight: c.park,
-      text: `Power-friendly park (${t.venue_l14d_hrs} HR L14d)`,
+      chip: { kind: 'park', label: 'Park boost', tone: 'good', detail: `${t.venue_l14d_hrs} HR L14d at venue` },
     });
   }
 
-  // ----- cold-streak surface — NEGATIVE -----
-  // Mirror the scoring penalty so the user sees WHY a power hitter is
-  // ranked lower than usual. Same threshold as the scoring rule.
-  const isQuiet = t.hrs_l5 === 0 && t.hrs_l7d === 0;
-  if (isQuiet && t.season_hr >= HEAT_SCORE_STABILITY.auto_elite_hr) {
-    candidates.push({
-      weight: 16,
-      text: `Cold — 0 HR L5 games + 0 HR L7 days (${t.season_hr} season HR)`,
-    });
-  } else if (isQuiet && t.season_hr >= 8) {
-    candidates.push({
-      weight: 8,
-      text: `Cold — 0 HR L5 games + 0 HR L7 days`,
-    });
+  // ----- weather chips — only when actually included in heat score -----
+  if (t.weather_included) {
+    // Re-derive a short label from temp/wind for chip display. The
+    // numeric adjustment is in the expanded breakdown row.
+    const w = t.weather_wind_mph ?? 0;
+    const dir = (t.weather_wind_dir ?? '').toLowerCase();
+    const tempBoost = (t.weather_temp_f ?? 0) >= 85;
+    const isOut = /out to/.test(dir);
+    const isIn = /in from/.test(dir);
+    if (isOut && w >= 10) {
+      candidates.push({ weight: 10, chip: { kind: 'wind_out', label: 'Wind boost', tone: 'good', detail: `${w} mph ${dir}` } });
+    } else if (isIn && w >= 10) {
+      candidates.push({ weight: 10, chip: { kind: 'wind_in', label: 'Wind in', tone: 'bad', detail: `${w} mph ${dir}` } });
+    }
+    if (tempBoost) {
+      candidates.push({ weight: 6, chip: { kind: 'warm', label: 'Warm', tone: 'good', detail: `${t.weather_temp_f}°F` } });
+    }
   }
 
-  // ----- META: two strong signals stacked -----
-  const W = HEAT_SCORE_WEIGHTS;
-  const recentSignal  = (t.subscores.l3 + t.subscores.l5) >= 1.4; // ≥70% of 2.0 max
-  const pitcherSignal = c.pitcher >= 0.6 * W.pitcher;
-  const parkSignal    = c.park    >= 0.6 * W.park;
-  const handSignal    = c.hand    >= 0.6 * W.hand;
-  const heavyMatchup  = pitcherSignal || parkSignal || handSignal;
-  if (recentSignal && heavyMatchup) {
-    candidates.push({ weight: 28, text: 'Hot streak + favorable matchup' });
+  // ----- cold-streak surface (NEGATIVE) -----
+  // Calendar-window ONLY. We deliberately do NOT mix in hrs_l5 here, even
+  // though the scoring penalty still does — hrs_l5 counts the player's
+  // last 5 *HR-dates* (could be months old), so a hitter like Elly De La
+  // Cruz with HRs in April had hrs_l5=2 and was incorrectly classified
+  // as "not cold" despite a real 0-HR-in-7-days drought. The chip stays
+  // honest by reading the calendar-window value only.
+  if (t.hrs_l7d === 0 && t.season_hr >= HEAT_SCORE_STABILITY.auto_elite_hr) {
+    candidates.push({
+      weight: 18,
+      chip: { kind: 'cold', label: 'Cold last 7d', tone: 'bad', detail: `0 HR last 7 days (${t.season_hr} season HR baseline)` },
+    });
+  } else if (t.hrs_l7d === 0 && t.season_hr >= 8) {
+    candidates.push({
+      weight: 10,
+      chip: { kind: 'cold', label: 'Cold last 7d', tone: 'bad', detail: '0 HR in the last 7 calendar days' },
+    });
   }
 
   // ----- LOW-CONFIDENCE NOTE -----
-  // Surface the confidence label as a reason so the user sees WHY the
-  // model is being cautious. Only fires on 'low' so we don't clutter
-  // high/medium rows. Weight 4 puts it near the end of the list.
   if (t.confidence === 'low') {
     candidates.push({
-      weight: 4,
-      text: 'Lower confidence — limited sample / few factors agreeing',
+      weight: 5,
+      chip: { kind: 'low_conf', label: 'Low confidence', tone: 'neutral', detail: 'Limited sample or few factors agreeing' },
+    });
+  }
+
+  // ----- DATA-LIMITED NOTE -----
+  // Fires when we couldn't load pitcher-starts data for the probable.
+  // The chip warns the user that pitcher-weakness chips are absent because
+  // of missing inputs, not because the pitcher looks safe.
+  if (!havePitcherStarts && t.pitcher_id != null && t.pitcher_name !== 'TBD') {
+    candidates.push({
+      weight: 3,
+      chip: { kind: 'data_limited', label: 'Data limited', tone: 'neutral', detail: 'Pitcher start data unavailable — pitcher chips suppressed' },
     });
   }
 
   candidates.sort((a, b) => b.weight - a.weight);
+
   if (candidates.length === 0) {
-    // STRICT honesty rule: do NOT invent a season-HR fallback. If we
-    // genuinely have nothing specific to say, say so. The expanded row
-    // still shows the subscore numbers, so the user can verify directly.
-    return t.season_hr === 0 ? ['recent form unavailable'] : [];
+    // STRICT honesty rule: when nothing verifiable applies, say so plainly.
+    return [
+      { kind: 'data_limited', label: 'Data limited', tone: 'neutral', detail: 'No verified signals for this matchup yet' },
+    ];
   }
 
-  // De-dup by text (meta tag can echo a recent-form theme; pick highest weight version)
   const seen = new Set<string>();
-  const out: string[] = [];
+  const out: ReasonChip[] = [];
   for (const c2 of candidates) {
-    if (seen.has(c2.text)) continue;
-    seen.add(c2.text);
-    out.push(c2.text);
-    if (out.length === 4) break;
+    if (seen.has(c2.chip.kind)) continue;
+    seen.add(c2.chip.kind);
+    out.push(c2.chip);
+    if (out.length === 5) break; // small cap so the chip row stays scannable on mobile
   }
   return out;
+}
+
+/** Back-compat — flatten chips into the legacy string[] format consumed
+ *  by snapshot rows and the Backtest table. */
+function pickReasons(t: HrTarget): string[] {
+  return t.reason_chips.map((c) => (c.detail ? `${c.label} — ${c.detail}` : c.label));
 }
 
 /** Public so HrTargets.tsx can build the index and pass it in. */
@@ -1882,7 +1947,10 @@ export function computeHrTargets(
         heat_score: round1(heat),
         subscores,
         breakdown,
+        // Filled below from pickReasonChips() / pickReasons() so the
+        // chip pass sees all the other fields already populated.
         reasons: [],
+        reason_chips: [],
         pitcher_l14d_allowed: pitcher_l14d,
         pitcher_l3_starts_allowed: pitcher_l3_starts,
         pitcher_l5_starts_allowed: pitcher_l5_starts,
@@ -1902,6 +1970,7 @@ export function computeHrTargets(
         weather_updated_at: weather.updated_at,
         weather_included: weather.adjustment.included,
       };
+      target.reason_chips = pickReasonChips(target);
       target.reasons = pickReasons(target);
       return target;
     });

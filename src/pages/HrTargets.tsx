@@ -21,6 +21,7 @@ import { supabase, fetchPlayerIndex, fetchPitcherFormIndex, fetchDataLastUpdated
 import { mlbToday } from '../lib/mlbDate';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
 import WeatherLine from '../components/WeatherLine';
+import ReasonChips, { ReasonChipDetails } from '../components/ReasonChips';
 import {
   addDays,
   applyCanonicalTeams,
@@ -445,8 +446,8 @@ export default function HrTargets() {
                     <td className="subtle" style={{ fontSize: 12 }}>vs {t.opponent}</td>
                     <td className="num">{t.season_hr}</td>
                     <td className="num">{t.heat_score.toFixed(1)}</td>
-                    <td className="subtle" style={{ fontSize: 12 }}>
-                      {t.reasons.length > 0 ? t.reasons.join(' · ') : '—'}
+                    <td>
+                      <ReasonChips chips={t.reason_chips} />
                     </td>
                   </tr>
                 ))}
@@ -597,8 +598,8 @@ function Top10Table({ targets, asOf }: { targets: HrTarget[]; asOf: string }) {
                     <strong>{t.heat_score.toFixed(1)}</strong>
                     <ConfidenceBadge confidence={t.confidence} compact />
                   </td>
-                  <td className="subtle" style={{ fontSize: 12 }}>
-                    {t.reasons.length > 0 ? t.reasons.join(' · ') : '—'}
+                  <td>
+                    <ReasonChips chips={t.reason_chips} />
                   </td>
                 </tr>
                 {isOpen && (
@@ -634,6 +635,27 @@ function MatchupDetail({ t }: { t: HrTarget }) {
 
   return (
     <>
+      {/* Verified reason chips with source values — the audit answer to
+          "where does each chip come from?". Lives at the top of the
+          expanded detail so it's the first thing visible. */}
+      <div
+        style={{
+          marginBottom: 10,
+          padding: 10,
+          background: 'var(--panel)',
+          border: '1px solid var(--border)',
+          borderRadius: 8,
+        }}
+      >
+        <div
+          className="subtle"
+          style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8 }}
+        >
+          Reasons (verified source values)
+        </div>
+        <ReasonChipDetails chips={t.reason_chips} />
+      </div>
+
       {/* Grouped breakdown — power / form / pitcher / hand / venue / final */}
       <div
         style={{
@@ -1379,8 +1401,8 @@ function SidePanel({
                   <td className="num">{t.hrs_l7d}</td>
                   <td className="num">{t.season_hr}</td>
                   <td className="num"><strong>{t.heat_score.toFixed(1)}</strong></td>
-                  <td className="subtle" style={{ fontSize: 12 }}>
-                    {t.reasons.length > 0 ? t.reasons.join(' · ') : '—'}
+                  <td>
+                    <ReasonChips chips={t.reason_chips} />
                   </td>
                 </tr>
               ))}
