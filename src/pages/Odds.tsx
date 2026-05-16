@@ -27,7 +27,7 @@
  * full column set is reachable. The summary "Model vs Market" cards
  * stack vertically.
  */
-import { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { fetchOddsSnapshots, type OddsSnapshotRow } from '../lib/supabase';
 import { mlbToday, addDays } from '../lib/mlbDate';
