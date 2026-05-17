@@ -1,0 +1,113 @@
+name: HR Tracker — hourly cron pinger
+
+# Why this exists:
+#   Vercel Hobby caps internal crons at once per day. To get hourly
+#   in-game HR ingest + weather refreshes back, we use GitHub Actions
+#   as a free heartbeat that just hits the Vercel cron endpoint. The
+#   actual data work runs on Vercel — this workflow is pure ping.
+#
+# What it does:
+#   Every hour at :07 (UTC), curl /api/cron/update with the
+#   Authorization: Bearer ${{ secrets.CRON_SECRET }} header. The endpoint's
+#   decideMode() brain picks light/full/night based on the clock + the
+#   cron_state row in Supabase, so we don't have to pass a mode here.
+#
+# Heads up:
+#   - GH Actions scheduled triggers can be delayed up to ~15 min during
+#     peak hours. For an HR tracker that's fine.
+#   - Requires GitHub Secret CRON_SECRET (same value as Vercel env).
+#   - Requires GitHub Secret VERCEL_URL — the full URL to your deployed
+#     site, e.g. "https://mlb-hr-tracker.vercel.app". Set it as a Secret
+#     not a Variable so it stays out of public logs.
+#   - workflow_dispatch lets you fire the ping by hand from the Actions
+#     tab when you want to refresh immediately.
+
+on:
+  schedule:
+    # Every hour at :07. The 7-minute offset avoids the top-of-hour
+    # stampede that hits GitHub Actions schedulers.
+    - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Optional ?mode= override (light | full | night | morning | live | daily). Leave blank to let the endpoint decide.'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  # Don't run multiple pings in parallel — Vercel already has its own lock
+  # but this is cheap insurance.
+  group: hr-tracker-cron-ping
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    name: Ping Vercel cron
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Sanity check secrets
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          VERCEL_URL: ${{ secrets.VERCEL_URL }}
+        run: |
+          if [ -z "${CRON_SECRET:-}" ]; then
+            echo "::error::Missing GitHub Secret CRON_SECRET."
+            echo "  Add it in: GitHub → repo → Settings → Secrets and variables → Actions → New repository secret."
+            echo "  Value must match the CRON_SECRET you set in the Vercel project env."
+            exit 1
+          fi
+          if [ -z "${VERCEL_URL:-}" ]; then
+            echo "::error::Missing GitHub Secret VERCEL_URL."
+            echo "  Add it in the same place. Format: https://mlb-hr-tracker.vercel.app (no trailing slash)."
+            exit 1
+          fi
+          echo "✓ Secrets present (values masked)"
+
+      - name: Hit /api/cron/update
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          VERCEL_URL: ${{ secrets.VERCEL_URL }}
+          MODE_OVERRIDE: ${{ github.event.inputs.mode }}
+        run: |
+          # Build the URL — append ?mode= only when the manual dispatch
+          # passes one. Scheduled runs always go without it.
+          URL="${VERCEL_URL%/}/api/cron/update"
+          if [ -n "${MODE_OVERRIDE}" ]; then
+            URL="${URL}?mode=${MODE_OVERRIDE}"
+          fi
+          echo "Hitting: $URL"
+          echo "UTC now: $(date -u +'%Y-%m-%d %H:%M:%S')"
+
+          # --fail-with-body: exit non-zero on HTTP 4xx/5xx but still print
+          # the body so we can see Vercel's error JSON. -sS hides the
+          # progress bar but keeps errors. -o response.json saves the body.
+          # -w writes the final HTTP status code on its own line.
+          HTTP_CODE=$(curl -sS \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            -H "Accept: application/json" \
+            -o response.json \
+            -w "%{http_code}" \
+            --max-time 300 \
+            "$URL" || echo "curl-failed")
+
+          echo "HTTP status: $HTTP_CODE"
+          echo "---- response body ----"
+          # Truncate to keep workflow logs scannable — full response is
+          # rarely needed for a heartbeat. Use jq if available, else cat.
+          if command -v jq >/dev/null 2>&1; then
+            jq -C '.' response.json 2>/dev/null | head -80 || cat response.json
+          else
+            head -120 response.json
+          fi
+          echo "----"
+
+          # Treat 2xx as success, surface everything else.
+          case "$HTTP_CODE" in
+            2*) echo "✓ Cron run completed cleanly." ;;
+            *)  echo "::error::Cron ping returned HTTP $HTTP_CODE — see body above."; exit 1 ;;
+          esac
