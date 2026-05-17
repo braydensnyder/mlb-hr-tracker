@@ -822,6 +822,50 @@ function MatchupDetail({ t }: { t: HrTarget }) {
             <>Weather score: 0.0 (neutral — not included)</>
           )}
         </div>
+        {/* Per-component breakdown — temp boost vs wind boost vs park.
+            Lets the user see WHY weather moved (or didn't move) the score. */}
+        <div
+          style={{
+            marginTop: 6,
+            padding: '6px 8px',
+            background: 'var(--panel)',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+            display: 'grid',
+            gap: 3,
+            fontSize: 12,
+          }}
+        >
+          <WeatherComponentRow
+            label="Temp boost"
+            value={b.weather_temp_boost}
+            note={b.weather_temp_label}
+          />
+          <WeatherComponentRow
+            label="Wind boost"
+            value={b.weather_wind_boost}
+            note={b.weather_wind_label}
+          />
+          <WeatherComponentRow
+            label="Park boost"
+            value={b.venue_score}
+            note={
+              t.venue_l14d_rank != null
+                ? `Top ${t.venue_l14d_rank}/${t.venue_total} venue, ${t.venue_l14d_hrs} HR L14d`
+                : `${t.venue_l14d_hrs} HR L14d at venue`
+            }
+            max={10}
+          />
+          <div className="subtle" style={{ fontSize: 11, marginTop: 2 }}>
+            {b.weather_is_dome
+              ? 'Dome / roof closed → weather neutral'
+              : !t.weather_included && b.weather_temp_boost === 0 && b.weather_wind_boost === 0
+              ? 'Weather neutral — included=false, not adjusting heat'
+              : t.weather_included
+              ? 'Weather included in heat (combined boost ≠ 0)'
+              : 'Weather present but combined boost = 0 — not adjusting heat'}
+          </div>
+        </div>
       </div>
 
       <div>
@@ -867,6 +911,31 @@ function MatchupDetail({ t }: { t: HrTarget }) {
       </div>
     </div>
     </>
+  );
+}
+
+/** Tight grid row for the per-component weather breakdown. */
+function WeatherComponentRow({
+  label,
+  value,
+  note,
+  max,
+}: {
+  label: string;
+  value: number;
+  note?: string;
+  max?: number;
+}) {
+  const color =
+    value > 0 ? 'var(--good, #4cd97a)' : value < 0 ? '#ff8d8d' : 'var(--muted, #aaa)';
+  const sign = value > 0 ? '+' : '';
+  const valueText = max != null ? `${sign}${value.toFixed(1)}/${max}` : `${sign}${value.toFixed(1)}`;
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '90px 64px 1fr', gap: 6, alignItems: 'baseline' }}>
+      <span className="subtle" style={{ fontSize: 11 }}>{label}</span>
+      <span style={{ color, fontWeight: 600, textAlign: 'right' }}>{valueText}</span>
+      <span className="subtle" style={{ fontSize: 11 }}>{note ?? ''}</span>
+    </div>
   );
 }
 

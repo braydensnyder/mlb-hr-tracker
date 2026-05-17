@@ -17,6 +17,12 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { supabase, fetchDataLastUpdated, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
 import { mlbToday, addDays } from '../lib/mlbDate';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
+import {
+  computeBacktestPerformance,
+  computeMissAnalysis,
+  type BacktestPerformance,
+  type MissRow,
+} from '../lib/stats';
 
 // Pacific calendar date — see src/lib/mlbDate.ts.
 const todayISO = mlbToday;
@@ -107,6 +113,33 @@ export default function Backtest() {
   const rate5 = hitRate(resolved, 5);
   const rate10 = hitRate(resolved, 10);
 
+  // ---- Task #166: hit-rate buckets w/ random baseline + lift ----
+  // We compute the buckets here rather than memoizing because both
+  // inputs (snapshot, hrs) already trigger a re-render when they change.
+  const performance: BacktestPerformance | null = useMemo(() => {
+    if (snapshot.length === 0) return null;
+    return computeBacktestPerformance(
+      date,
+      snapshot.map((s) => ({ rank: s.rank, player_id: s.player_id, player_name: s.player_name })),
+      hrs.map((h) => ({ player_id: h.player_id, player_name: h.player_name })),
+      [10, 25, 50],
+    );
+  }, [snapshot, hrs, date]);
+
+  // ---- Task #166: miss analysis — homered, ranked > 50 (or unranked) ----
+  // Phase 1 passes an empty liveTargets array — the miss row carries the
+  // snapshot rank + player name only. Phase 2 will recompute live HrTargets
+  // for the date to fill in weather / pitcher / park signals per miss.
+  const misses: MissRow[] = useMemo(() => {
+    if (snapshot.length === 0 || hrs.length === 0) return [];
+    return computeMissAnalysis(
+      hrs.map((h) => ({ player_id: h.player_id, player_name: h.player_name })),
+      snapshot.map((s) => ({ rank: s.rank, player_id: s.player_id, player_name: s.player_name })),
+      [],
+      { cutoff: 50 },
+    );
+  }, [snapshot, hrs]);
+
   const today = todayISO();
   const yesterday = addDays(today, -1);
 
@@ -179,6 +212,16 @@ export default function Backtest() {
         <HitRateCell label="Top 10" hits={rate10.hits} total={rate10.total} />
         <HitRateCell label="All" hits={resolved.filter((r) => r.hit).length} total={resolved.length} />
       </div>
+
+      {/* ---- Task #166: Daily performance — lift vs random ---- */}
+      {performance && (
+        <PerformancePanel perf={performance} />
+      )}
+
+      {/* ---- Task #166: Miss analysis — players who homered outside Top 50 ---- */}
+      {misses.length > 0 && (
+        <MissPanel misses={misses} cutoff={50} />
+      )}
 
       {!loading && snapshot.length === 0 && !error && (
         <div className="panel">
@@ -405,6 +448,190 @@ function HitRateCell({ label, hits, total }: { label: string; hits: number; tota
           </span>
         )}
       </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Task #166: Daily performance — Top N hit-rate + random lift
+// ============================================================
+function PerformancePanel({ perf }: { perf: BacktestPerformance }) {
+  return (
+    <div className="panel" style={{ marginBottom: 16 }}>
+      <h2 style={{ marginTop: 0, fontSize: 16 }}>
+        Model performance — Top 10 / 25 / 50 vs random baseline
+      </h2>
+      <div className="subtle" style={{ fontSize: 12, marginBottom: 12 }}>
+        Base rate: <strong>{perf.hr_hitters_total}</strong> distinct HR-hitters
+        out of <strong>{perf.random_denominator}</strong> ranked players today
+        ={' '}
+        <strong>{(perf.random_base_rate * 100).toFixed(1)}%</strong>. Total HRs:{' '}
+        <strong>{perf.total_hrs}</strong>. Random baseline = the chance that a
+        randomly picked player from the model's ranked pool would have homered.
+      </div>
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Cutoff</th>
+              <th className="num">Hits</th>
+              <th className="num">Hit rate</th>
+              <th className="num">Expected (random)</th>
+              <th className="num">Lift vs random</th>
+            </tr>
+          </thead>
+          <tbody>
+            {perf.buckets.map((b) => {
+              const liftPct = b.lift_vs_random != null ? b.lift_vs_random * 100 : null;
+              const liftColor =
+                liftPct == null
+                  ? 'var(--muted)'
+                  : liftPct > 0
+                  ? 'var(--good, #4cd97a)'
+                  : liftPct < 0
+                  ? '#ff8d8d'
+                  : 'var(--muted)';
+              return (
+                <tr key={b.topN}>
+                  <td><strong>Top {b.topN}</strong></td>
+                  <td className="num">{b.hits} / {b.ranked}</td>
+                  <td className="num">{(b.hit_rate * 100).toFixed(1)}%</td>
+                  <td className="num subtle">{b.expected_random_hits.toFixed(1)}</td>
+                  <td className="num" style={{ color: liftColor, fontWeight: 600 }}>
+                    {liftPct == null
+                      ? '—'
+                      : `${liftPct > 0 ? '+' : ''}${liftPct.toFixed(0)}%`}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="subtle" style={{ marginTop: 8, fontSize: 11, lineHeight: 1.5 }}>
+        Read: lift +80% means the model's Top-N had 80% more HR-hitters than a
+        random pick from the same pool would have produced. Negative lift = the
+        model is worse than random for that cutoff on this date. One day is noise
+        — look at the trend across many days before drawing conclusions.
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Task #166: Miss analysis — homered but ranked > 50
+// ============================================================
+function MissPanel({ misses, cutoff }: { misses: MissRow[]; cutoff: number }) {
+  return (
+    <div className="panel" style={{ marginBottom: 16 }}>
+      <h2 style={{ marginTop: 0, fontSize: 16 }}>
+        Miss analysis — homered but ranked outside Top {cutoff}
+      </h2>
+      <div className="subtle" style={{ fontSize: 12, marginBottom: 8 }}>
+        Players the model passed on who hit HRs today. <strong>{misses.length}</strong>{' '}
+        miss{misses.length === 1 ? '' : 'es'}. Sort: most-snubbed first (highest
+        snapshot rank, or "unranked"). Look for patterns — if many misses had
+        high season HR + cold L7d, the cold penalty might be too aggressive.
+      </div>
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Player</th>
+              <th>Team</th>
+              <th>Snapshot rank</th>
+              <th className="num">Heat</th>
+              <th className="num">Season HR</th>
+              <th className="num">L7d</th>
+              <th className="num">Streak</th>
+              <th>Signals on file</th>
+            </tr>
+          </thead>
+          <tbody>
+            {misses.map((m) => (
+              <tr key={m.player_id}>
+                <td>
+                  <Link className="player-link" to={`/player/${m.player_id}`}>
+                    {m.player_name}
+                  </Link>
+                </td>
+                <td>{m.team ? <span className="pill">{m.team}</span> : '—'}</td>
+                <td className="subtle" style={{ fontSize: 12 }}>
+                  {m.snapshot_rank != null ? `#${m.snapshot_rank}` : 'unranked'}
+                </td>
+                <td className="num">
+                  {m.signals.heat_score != null ? m.signals.heat_score.toFixed(1) : '—'}
+                </td>
+                <td className="num">{m.signals.season_hr}</td>
+                <td className="num">{m.signals.hrs_l7d}</td>
+                <td className="num">{m.signals.hr_streak}</td>
+                <td className="subtle" style={{ fontSize: 11, lineHeight: 1.4 }}>
+                  <SignalTags m={m} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="subtle" style={{ marginTop: 8, fontSize: 11, lineHeight: 1.5 }}>
+        Signals shown are from the LIVE HrTarget computation if available.
+        Empty signals mean the player wasn't in today's matchup pool (e.g. spot
+        starter, traded, no probable pitcher resolved). Use this view to feed
+        scoring changes — frequent miss patterns are the strongest tuning signal.
+      </div>
+    </div>
+  );
+}
+
+/** Pulls a short list of badge-like signal tags off a miss row. */
+function SignalTags({ m }: { m: MissRow }) {
+  const tags: { label: string; tone: 'good' | 'bad' | 'neutral' }[] = [];
+  if (m.signals.is_elite_power) tags.push({ label: 'Elite power', tone: 'good' });
+  if ((m.signals.season_hr ?? 0) >= 15) tags.push({ label: `${m.signals.season_hr} HR`, tone: 'good' });
+  if ((m.signals.hrs_l7d ?? 0) >= 2) tags.push({ label: `Hot L7d (${m.signals.hrs_l7d})`, tone: 'good' });
+  if ((m.signals.hr_streak ?? 0) >= 2) tags.push({ label: `${m.signals.hr_streak}d streak`, tone: 'good' });
+  if (m.signals.weather_included) {
+    const t = m.signals.weather_temp_boost ?? 0;
+    const w = m.signals.weather_wind_boost ?? 0;
+    if (t + w > 0) tags.push({ label: `Weather +${t + w}`, tone: 'good' });
+    if (t + w < 0) tags.push({ label: `Weather ${t + w}`, tone: 'bad' });
+  }
+  if ((m.signals.pitcher_l14d_allowed ?? 0) >= 3) tags.push({ label: `Pitcher ${m.signals.pitcher_l14d_allowed} HR L14d`, tone: 'good' });
+  if (m.signals.venue_l14d_rank != null && m.signals.venue_l14d_rank <= 5) tags.push({ label: `Top-${m.signals.venue_l14d_rank} park`, tone: 'good' });
+  if (m.live_target == null) tags.push({ label: 'Not in today\'s pool', tone: 'neutral' });
+  if (tags.length === 0) tags.push({ label: 'No live signals', tone: 'neutral' });
+
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+      {tags.map((t) => (
+        <span
+          key={t.label}
+          style={{
+            display: 'inline-block',
+            padding: '1px 6px',
+            borderRadius: 999,
+            fontSize: 10,
+            background:
+              t.tone === 'good' ? 'rgba(64,200,120,0.14)' :
+              t.tone === 'bad'  ? 'rgba(255,110,110,0.14)' :
+                                  'rgba(160,160,160,0.14)',
+            border:
+              t.tone === 'good' ? '1px solid rgba(64,200,120,0.45)' :
+              t.tone === 'bad'  ? '1px solid rgba(255,110,110,0.45)' :
+                                  '1px solid rgba(160,160,160,0.45)',
+            color:
+              t.tone === 'good' ? 'var(--good, #4cd97a)' :
+              t.tone === 'bad'  ? '#ff8d8d' :
+                                  'var(--muted)',
+          }}
+        >
+          {t.label}
+        </span>
+      ))}
     </div>
   );
 }

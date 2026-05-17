@@ -942,9 +942,22 @@ export interface HrTargetGame {
  * the expanded row can say "weather: neutral / not included" honestly.
  */
 export interface WeatherAdjustment {
-  delta: number;        // points added to heat (can be negative)
+  delta: number;        // points added to heat (can be negative). Sum of temp_boost + wind_boost, clamped.
   included: boolean;    // false when dome / missing → score untouched
   label: string;        // human-readable summary for the adjustments list
+
+  // ---- BROKEN-OUT COMPONENTS (UI transparency, audit task #166) ----
+  /** Points contributed by the temperature reading alone (signed). */
+  temp_boost: number;
+  /** Points contributed by the wind reading alone (signed). 0 for crosswind. */
+  wind_boost: number;
+  /** True when the game is in a dome / closed roof. Distinct from
+   *  "no data" so the UI can label it neutral instead of pending. */
+  is_dome: boolean;
+  /** Short human-readable temp note ("85°F warm", "Cold (45°F)", "—"). */
+  temp_label: string;
+  /** Short human-readable wind note ("Wind 12mph out", "Calm", "Crosswind"). */
+  wind_label: string;
 }
 
 /**
@@ -1004,37 +1017,68 @@ export function computeWeatherAdjustment(opts: {
   // Dome / roof closed → weather is not a factor. Neutral, not included.
   const isDome = condition != null && /roof closed|dome|indoor/i.test(condition);
   if (isDome) {
-    return { delta: 0, included: false, label: 'Weather neutral — dome / roof closed' };
+    return {
+      delta: 0,
+      included: false,
+      label: 'Weather neutral — dome / roof closed',
+      temp_boost: 0,
+      wind_boost: 0,
+      is_dome: true,
+      temp_label: temp != null ? `${temp}°F (dome, neutral)` : 'Dome — neutral',
+      wind_label: 'Dome — neutral',
+    };
   }
 
   // No usable data at all → neutral, not included.
   if (temp == null && windMph == null) {
-    return { delta: 0, included: false, label: 'Weather neutral — no data' };
+    return {
+      delta: 0,
+      included: false,
+      label: 'Weather neutral — no data',
+      temp_boost: 0,
+      wind_boost: 0,
+      is_dome: false,
+      temp_label: 'No data',
+      wind_label: 'No data',
+    };
   }
 
-  let delta = 0;
-  const parts: string[] = [];
-
-  // Temperature contribution.
+  // ---- TEMPERATURE component ----
+  let tempBoost = 0;
+  let tempLabel = '—';
   if (temp != null) {
-    if (temp >= 85) { delta += 2; parts.push(`${temp}°F warm (+2)`); }
-    else if (temp >= 75) { delta += 1; parts.push(`${temp}°F mild (+1)`); }
-    else if (temp <= 45) { delta -= 1; parts.push(`${temp}°F cold (-1)`); }
-    else parts.push(`${temp}°F neutral`);
+    if (temp >= 85) { tempBoost = 2; tempLabel = `${temp}°F warm`; }
+    else if (temp >= 75) { tempBoost = 1; tempLabel = `${temp}°F mild`; }
+    else if (temp <= 45) { tempBoost = -1; tempLabel = `${temp}°F cold`; }
+    else { tempBoost = 0; tempLabel = `${temp}°F neutral`; }
   }
 
-  // Wind contribution — only "out" / "in" matter; crosswind is neutral.
+  // ---- WIND component (only OUT / IN matter; crosswind is neutral) ----
+  let windBoost = 0;
+  let windLabel = '—';
   if (windMph != null && windMph > 0 && windDir) {
     const windOut = windDir.includes('out');
     const windIn = windDir.includes('in from') || /\bin\b/.test(windDir);
     const mag = windMph >= 15 ? 3 : windMph >= 10 ? 2 : 1;
-    if (windOut) { delta += mag; parts.push(`wind ${windMph}mph out (+${mag})`); }
-    else if (windIn) { delta -= mag; parts.push(`wind ${windMph}mph in (-${mag})`); }
-    else parts.push(`wind ${windMph}mph crosswind`);
+    if (windOut) { windBoost = mag; windLabel = `Wind ${windMph}mph out`; }
+    else if (windIn) { windBoost = -mag; windLabel = `Wind ${windMph}mph in`; }
+    else { windBoost = 0; windLabel = `Wind ${windMph}mph crosswind`; }
+  } else if (windMph === 0 || /^calm/.test(windDir)) {
+    windLabel = 'Calm';
+  } else if (windMph != null) {
+    windLabel = `Wind ${windMph}mph`;
   }
 
-  // Clamp so weather can never swing a ranking on its own.
-  delta = clamp(delta, -3, 5);
+  // Clamp the combined delta so weather can never swing a ranking on its own.
+  const rawDelta = tempBoost + windBoost;
+  const delta = clamp(rawDelta, -3, 5);
+
+  // Compose human-readable summary.
+  const parts: string[] = [];
+  if (temp != null && tempBoost !== 0) parts.push(`${tempLabel} (${tempBoost > 0 ? '+' : ''}${tempBoost})`);
+  else if (temp != null) parts.push(tempLabel);
+  if (windBoost !== 0) parts.push(`${windLabel} (${windBoost > 0 ? '+' : ''}${windBoost})`);
+  else if (windLabel !== '—' && windLabel !== 'No data') parts.push(windLabel);
 
   return {
     delta,
@@ -1042,6 +1086,11 @@ export function computeWeatherAdjustment(opts: {
     label: delta === 0
       ? `Weather neutral — ${parts.join(', ') || 'no swing'}`
       : `Weather ${delta > 0 ? '+' : ''}${delta} — ${parts.join(', ')}`,
+    temp_boost: tempBoost,
+    wind_boost: windBoost,
+    is_dome: false,
+    temp_label: tempLabel,
+    wind_label: windLabel,
   };
 }
 
@@ -1062,6 +1111,20 @@ export interface HrTargetBreakdown {
    *  computeWeatherAdjustment(). The `weather_included` flag on HrTarget
    *  says whether this actually moved the score. */
   weather_adjustment: number;
+  /** Temperature component of weather_adjustment (signed). +2 for ≥85°F,
+   *  +1 for ≥75°F, -1 for ≤45°F, 0 otherwise. Surfaced separately so the
+   *  expanded row can show why the boost landed. */
+  weather_temp_boost: number;
+  /** Wind component of weather_adjustment (signed). +1/+2/+3 for "out" at
+   *  <10/10-14/≥15 mph; mirror for "in". 0 for crosswind / calm / dome. */
+  weather_wind_boost: number;
+  /** Short human-readable temp note for the expanded UI ("85°F warm"). */
+  weather_temp_label: string;
+  /** Short human-readable wind note for the expanded UI ("Wind 12mph out"). */
+  weather_wind_label: string;
+  /** True when condition matches dome / roof closed / indoor. Distinct
+   *  from "no data" so the UI labels neutral correctly. */
+  weather_is_dome: boolean;
   /** Combined negative-weighting adjustment applied to this target.
    *  Sum of all penalties (≤ 0). Examples:
    *    - Cold-streak (elite slugger gone quiet for L5+L7d) → -10
@@ -1916,6 +1979,11 @@ export function computeHrTargets(
         venue_score: round1(c_park),
         weather_score: round1(c_weather),
         weather_adjustment: round1(weather.adjustment.delta),
+        weather_temp_boost: weather.adjustment.temp_boost,
+        weather_wind_boost: weather.adjustment.wind_boost,
+        weather_temp_label: weather.adjustment.temp_label,
+        weather_wind_label: weather.adjustment.wind_label,
+        weather_is_dome: weather.adjustment.is_dome,
         cold_penalty: round1(cold_penalty),
         stability_factor: round2(stab),
         factors_firing: factorsForMultiplier,
@@ -2046,4 +2114,203 @@ export function applyFilters(
     if (search && !r.player_name.toLowerCase().includes(search)) return false;
     return true;
   });
+}
+
+// =====================================================================
+// Backtest performance + miss analysis (task #166)
+// =====================================================================
+
+/** A single (rank_cutoff → hits / expected / lift) row. */
+export interface HitRateBucket {
+  /** Cutoff size (10, 25, 50, etc). */
+  topN: number;
+  /** Snapshot players in the top-N. May be < topN on days with few games. */
+  ranked: number;
+  /** Of those, how many had ≥1 HR on the date. */
+  hits: number;
+  /** hits / ranked. 0 when ranked = 0. */
+  hit_rate: number;
+  /** Random-chance expected hits in top-N given the day's base rate.
+   *  = topN × (total HR-hitters / total hitters who played). */
+  expected_random_hits: number;
+  /** (hits / expected_random_hits) - 1. Positive = model beat random.
+   *  null when expected is 0 (no HRs hit at all, division by zero). */
+  lift_vs_random: number | null;
+}
+
+export interface BacktestPerformance {
+  date: string;
+  /** Total distinct hitters who appeared in the snapshot ranking. */
+  ranked_players: number;
+  /** Total distinct HR-hitters on the date (from home_runs). */
+  hr_hitters_total: number;
+  /** Total HRs on the date (one player can hit multiple). */
+  total_hrs: number;
+  /** Estimated denominator for the "random baseline" — the universe of
+   *  hitters who could plausibly have homered. We use `ranked_players`
+   *  here because that's the model's choice-set; using "all MLB hitters"
+   *  would understate the random baseline and overstate the model's
+   *  apparent lift. */
+  random_denominator: number;
+  /** Base hit-rate used for expected_random_hits — hr_hitters_total / denominator. */
+  random_base_rate: number;
+  /** One row per cutoff (10/25/50 by default). */
+  buckets: HitRateBucket[];
+}
+
+/** A snapshot-shaped row (subset of HrTargetSnapshotRow that we need). */
+export interface SnapshotPick {
+  rank: number;
+  player_id: number;
+  player_name: string;
+}
+
+/** A HR row (subset). */
+export interface ActualHrPick {
+  player_id: number;
+  player_name: string;
+}
+
+/**
+ * Compute hit-rate buckets and random-baseline lift for a date.
+ *
+ * Why we compute the random denominator from the snapshot instead of
+ * "all MLB hitters who played that day": the snapshot IS the model's
+ * universe of choice. Comparing the model to "random pick from its own
+ * pool" is the fair baseline. Comparing to "random pick from all 250
+ * MLB players who batted" would make the model look artificially better
+ * because it's already filtered to power hitters.
+ */
+export function computeBacktestPerformance(
+  date: string,
+  snapshot: SnapshotPick[],
+  actualHrs: ActualHrPick[],
+  cutoffs: number[] = [10, 25, 50],
+): BacktestPerformance {
+  // Set of player_ids who hit ≥1 HR on the date.
+  const hrPlayerIds = new Set<number>();
+  for (const h of actualHrs) hrPlayerIds.add(h.player_id);
+
+  // Snapshot sorted by rank ascending (defensive — caller usually does this).
+  const ranked = snapshot.slice().sort((a, b) => a.rank - b.rank);
+  const ranked_players = ranked.length;
+  const hr_hitters_total = hrPlayerIds.size;
+
+  // Random denominator: the model's choice-set size, floored to 1 to avoid div-by-zero.
+  const random_denominator = Math.max(ranked_players, 1);
+  const random_base_rate = hr_hitters_total / random_denominator;
+
+  const buckets: HitRateBucket[] = cutoffs.map((topN) => {
+    const slice = ranked.slice(0, topN);
+    const sliceSize = slice.length;
+    let hits = 0;
+    for (const p of slice) if (hrPlayerIds.has(p.player_id)) hits++;
+    const expected = topN * random_base_rate;
+    const lift = expected > 0 ? hits / expected - 1 : null;
+    return {
+      topN,
+      ranked: sliceSize,
+      hits,
+      hit_rate: sliceSize > 0 ? hits / sliceSize : 0,
+      expected_random_hits: expected,
+      lift_vs_random: lift,
+    };
+  });
+
+  return {
+    date,
+    ranked_players,
+    hr_hitters_total,
+    total_hrs: actualHrs.length,
+    random_denominator,
+    random_base_rate,
+    buckets,
+  };
+}
+
+/**
+ * Miss analysis — players who homered on the date but ranked OUTSIDE
+ * the given cutoff (default 50). For each, surface every signal we had
+ * on file so the user can see what the model "passed on".
+ *
+ * Caller provides the live HrTarget computation for the same date so we
+ * can read the rich signal block (weather/pitcher/park/recent form/etc.)
+ * not just the snapshot rank.
+ */
+export interface MissRow {
+  player_id: number;
+  player_name: string;
+  team: string | null;
+  opponent: string | null;
+  /** Rank in the snapshot. null = wasn't even in the snapshot. */
+  snapshot_rank: number | null;
+  /** Live HrTarget if we have one for this player today. null = no matchup found. */
+  live_target: HrTarget | null;
+  /** Convenience flags pulled off live_target for quick scanning. */
+  signals: {
+    season_hr: number;
+    hrs_l7d: number;
+    hr_streak: number;
+    heat_score: number | null;
+    is_elite_power: boolean | null;
+    pitcher_l14d_allowed: number | null;
+    venue_l14d_rank: number | null;
+    weather_included: boolean | null;
+    weather_temp_boost: number | null;
+    weather_wind_boost: number | null;
+  };
+}
+
+export function computeMissAnalysis(
+  actualHrs: ActualHrPick[],
+  snapshot: SnapshotPick[],
+  liveTargets: HrTarget[],
+  opts: { cutoff?: number } = {},
+): MissRow[] {
+  const cutoff = opts.cutoff ?? 50;
+  const rankByPlayer = new Map<number, number>();
+  for (const s of snapshot) rankByPlayer.set(s.player_id, s.rank);
+  const liveByPlayer = new Map<number, HrTarget>();
+  for (const t of liveTargets) liveByPlayer.set(t.player_id, t);
+
+  // De-dup actual HRs by player_id (one row per player even if multi-HR game).
+  const seen = new Set<number>();
+  const out: MissRow[] = [];
+  for (const h of actualHrs) {
+    if (seen.has(h.player_id)) continue;
+    seen.add(h.player_id);
+
+    const snap = rankByPlayer.get(h.player_id) ?? null;
+    if (snap != null && snap <= cutoff) continue; // not a miss — we ranked them
+
+    const live = liveByPlayer.get(h.player_id) ?? null;
+    out.push({
+      player_id: h.player_id,
+      player_name: h.player_name,
+      team: live?.team ?? null,
+      opponent: live?.opponent ?? null,
+      snapshot_rank: snap,
+      live_target: live,
+      signals: {
+        season_hr: live?.season_hr ?? 0,
+        hrs_l7d: live?.hrs_l7d ?? 0,
+        hr_streak: live?.hr_streak ?? 0,
+        heat_score: live?.heat_score ?? null,
+        is_elite_power: live?.is_elite_power ?? null,
+        pitcher_l14d_allowed: live?.pitcher_l14d_allowed ?? null,
+        venue_l14d_rank: live?.venue_l14d_rank ?? null,
+        weather_included: live?.weather_included ?? null,
+        weather_temp_boost: live?.breakdown.weather_temp_boost ?? null,
+        weather_wind_boost: live?.breakdown.weather_wind_boost ?? null,
+      },
+    });
+  }
+
+  // Sort: players who got the FURTHEST snubbed first (high rank or null first).
+  out.sort((a, b) => {
+    const ra = a.snapshot_rank ?? 9999;
+    const rb = b.snapshot_rank ?? 9999;
+    return rb - ra;
+  });
+  return out;
 }
