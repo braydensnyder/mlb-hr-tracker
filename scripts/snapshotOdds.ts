@@ -454,14 +454,35 @@ export async function snapshotOdds(opts: SnapshotOddsOptions = {}): Promise<Snap
   // OR group them under the player_name (we still want to see them on
   // the page, but the dedup composite key needs all components). For
   // Phase 1, drop unmatched rows from the upsert and surface the count.
-  const upsertable = rows.filter((r) => r.player_id != null);
-  const skippedForNullId = rows.length - upsertable.length;
+  const matched = rows.filter((r) => r.player_id != null);
+  const skippedForNullId = rows.length - matched.length;
   if (skippedForNullId > 0) {
     console.warn(
       `[snapshotOdds] skipping ${skippedForNullId} rows with unmatched player_id ` +
         '(run enrich:players to add missing players, then re-run).',
     );
   }
+
+  // FINAL dedup guard against the exact composite unique-index key:
+  //   (target_date, snapshot_type, game_pk, player_id, book)
+  // Postgres rejects the whole batch with "ON CONFLICT DO UPDATE cannot
+  // affect row a second time" if the same key appears twice in one
+  // upsert. flattenEventOdds already dedups per-event, but a player who
+  // somehow gets emitted by two events (doubleheader edge case) would
+  // still slip through. Last-write-wins inside this map.
+  const dedupMap = new Map<string, typeof matched[number]>();
+  for (const r of matched) {
+    const k = `${r.target_date}|${r.snapshot_type}|${r.game_pk}|${r.player_id}|${r.book}`;
+    dedupMap.set(k, r);
+  }
+  const upsertable = Array.from(dedupMap.values());
+  const dedupDropped = matched.length - upsertable.length;
+  if (dedupDropped > 0) {
+    console.warn(
+      `[snapshotOdds] de-duped ${dedupDropped} duplicate rows by composite key (alt lines / doubleheader echoes).`,
+    );
+  }
+  console.log(`[snapshotOdds] upsert payload size: ${upsertable.length}`);
 
   // Chunked upsert — Supabase REST will handle a few thousand rows fine,
   // but slice to be safe.

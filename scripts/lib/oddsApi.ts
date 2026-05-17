@@ -158,16 +158,31 @@ export interface FlatOddsRow {
 }
 
 export function flattenEventOdds(evt: OddsApiEventOdds): FlatOddsRow[] {
+  // De-dup by (book, player) within an event. Some books return alt HR lines
+  // (point = 0.5 / 1.5 / 2.5) for the same player; we want only the standard
+  // "≥1 HR" line (point = 0.5, the canonical Yes/Over leg). When `point` is
+  // missing entirely (some books omit it for the binary market), keep the
+  // first occurrence and drop the rest — this matches the unique-index
+  // shape in odds_snapshots: (target_date, snapshot_type, game_pk, player_id, book).
   const out: FlatOddsRow[] = [];
+  const seen = new Set<string>();
   for (const bm of evt.bookmakers ?? []) {
     for (const m of bm.markets ?? []) {
       if (m.key !== HR_MARKET) continue;
       for (const o of m.outcomes ?? []) {
         const isYesLeg = /^(yes|over)$/i.test(o.name ?? '');
         if (!isYesLeg) continue;
+        // Filter out alt lines — we only track the standard 0.5 line.
+        // `point == null` is treated as "the binary market with no point",
+        // also acceptable. Any explicit non-0.5 value is an alt line.
+        if (o.point != null && o.point !== 0.5) continue;
         const playerName = (o.description ?? '').trim();
         if (!playerName) continue;
         if (!Number.isFinite(o.price)) continue;
+        // Final dedup guard — case-folded player + book.
+        const key = `${bm.key}::${playerName.toLowerCase()}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
         out.push({
           event_id: evt.id,
           commence_time: evt.commence_time,
