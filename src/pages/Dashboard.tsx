@@ -46,9 +46,10 @@ const todayISO = mlbToday;
 
 /** Temporary debug toggle — when true, every WeatherLine on the page also
  *  prints the literal `weather_updated_at: <iso | null>` so we can spot
- *  "missing in DB" vs "missing in UI" by eye. Flip to false when the
- *  weather pipeline is verified end-to-end. */
-const WEATHER_DEBUG = true;
+ *  "missing in DB" vs "missing in UI" by eye. Flipped off 2026-05-16
+ *  after end-to-end verification (weather coverage 15/15, updated_at
+ *  visible in DB and UI). Flip back to true if anything looks off again. */
+const WEATHER_DEBUG = false;
 
 const PAGE_SIZE = 1000;
 

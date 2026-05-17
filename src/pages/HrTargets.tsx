@@ -36,8 +36,9 @@ import {
   type PlayerTeamIndex,
 } from '../lib/stats';
 
-/** Temporary debug toggle — see Dashboard for explanation. */
-const WEATHER_DEBUG = true;
+/** Temporary debug toggle — see Dashboard for explanation. Off after
+ *  weather pipeline verification 2026-05-16. */
+const WEATHER_DEBUG = false;
 
 // Pacific calendar date — see src/lib/mlbDate.ts.
 const todayISO = mlbToday;
