@@ -2130,12 +2130,19 @@ export interface HitRateBucket {
   hits: number;
   /** hits / ranked. 0 when ranked = 0. */
   hit_rate: number;
-  /** Random-chance expected hits in top-N given the day's base rate.
-   *  = topN × (total HR-hitters / total hitters who played). */
-  expected_random_hits: number;
-  /** (hits / expected_random_hits) - 1. Positive = model beat random.
-   *  null when expected is 0 (no HRs hit at all, division by zero). */
-  lift_vs_random: number | null;
+  /** Expected hits in top-N if we picked players at random from the MLB-wide
+   *  hitter pool (lineups across all games). This is the TRUE random baseline.
+   *  = topN × (hr_hitters_total / league_hitters_estimated). */
+  expected_random_hits_league: number;
+  /** (hits / expected_random_hits_league) - 1. Positive = model beat random.
+   *  null when expected is 0 (no HRs hit / no games). */
+  lift_vs_league: number | null;
+  /** Diagnostic-only: expected if we picked at random WITHIN the model's
+   *  pre-filtered pool. Naturally lower lift because the pool's HR rate
+   *  is already elevated. Kept for transparency, NOT the headline number. */
+  expected_random_hits_pool: number;
+  /** (hits / expected_random_hits_pool) - 1. Same caveats as above. */
+  lift_vs_pool: number | null;
 }
 
 export interface BacktestPerformance {
@@ -2146,14 +2153,21 @@ export interface BacktestPerformance {
   hr_hitters_total: number;
   /** Total HRs on the date (one player can hit multiple). */
   total_hrs: number;
-  /** Estimated denominator for the "random baseline" — the universe of
-   *  hitters who could plausibly have homered. We use `ranked_players`
-   *  here because that's the model's choice-set; using "all MLB hitters"
-   *  would understate the random baseline and overstate the model's
-   *  apparent lift. */
-  random_denominator: number;
-  /** Base hit-rate used for expected_random_hits — hr_hitters_total / denominator. */
-  random_base_rate: number;
+  /** Estimated total MLB hitters who appeared in any game on the date
+   *  (= games_today × 18 starting-lineup slots). Conservative — doesn't
+   *  count pinch hitters. The TRUE-random baseline divides by this. */
+  league_hitters_estimated: number;
+  /** Number of games used in the league estimate. */
+  games_today: number;
+  /** MLB-wide HR rate: hr_hitters_total / league_hitters_estimated.
+   *  This is the headline "random baseline" — what a coin flip across
+   *  all MLB hitters today would produce. */
+  league_base_rate: number;
+  /** Model-pool HR rate: hr_hitters_total / ranked_players. Naturally
+   *  HIGHER than league_base_rate because the model already curated the
+   *  pool down to power hitters. Shown for transparency, NOT as the
+   *  baseline for lift. */
+  pool_base_rate: number;
   /** One row per cutoff (10/25/50 by default). */
   buckets: HitRateBucket[];
 }
@@ -2171,49 +2185,72 @@ export interface ActualHrPick {
   player_name: string;
 }
 
+/** Starting-lineup slots per MLB game (9 batters × 2 teams, DH universal
+ *  in 2026). Excludes pinch hitters / defensive replacements — a small
+ *  underestimate that the user can override via `hittersPerGame`. */
+export const DEFAULT_HITTERS_PER_GAME = 18;
+
 /**
- * Compute hit-rate buckets and random-baseline lift for a date.
+ * Compute hit-rate buckets with TWO baselines:
  *
- * Why we compute the random denominator from the snapshot instead of
- * "all MLB hitters who played that day": the snapshot IS the model's
- * universe of choice. Comparing the model to "random pick from its own
- * pool" is the fair baseline. Comparing to "random pick from all 250
- * MLB players who batted" would make the model look artificially better
- * because it's already filtered to power hitters.
+ *   1. LEAGUE-WIDE (headline) — what a random pick from all MLB hitters
+ *      today would produce. Denominator = games_today × 18.
+ *   2. MODEL-POOL (diagnostic) — what a random pick from the model's
+ *      curated pool would produce. Denominator = ranked_players. This
+ *      always understates the model's edge because the pool already
+ *      filters to power hitters.
+ *
+ * The user explicitly asked for the league-wide baseline as the "lift vs
+ * random" headline. Both are surfaced so the UI can show both rates and
+ * the note about why the pool rate is naturally higher.
  */
 export function computeBacktestPerformance(
   date: string,
   snapshot: SnapshotPick[],
   actualHrs: ActualHrPick[],
   cutoffs: number[] = [10, 25, 50],
+  opts: { gamesToday?: number; hittersPerGame?: number } = {},
 ): BacktestPerformance {
+  const hittersPerGame = opts.hittersPerGame ?? DEFAULT_HITTERS_PER_GAME;
+  const gamesToday = opts.gamesToday ?? 0;
+
   // Set of player_ids who hit ≥1 HR on the date.
   const hrPlayerIds = new Set<number>();
   for (const h of actualHrs) hrPlayerIds.add(h.player_id);
 
-  // Snapshot sorted by rank ascending (defensive — caller usually does this).
+  // Snapshot sorted by rank ascending (defensive).
   const ranked = snapshot.slice().sort((a, b) => a.rank - b.rank);
   const ranked_players = ranked.length;
   const hr_hitters_total = hrPlayerIds.size;
 
-  // Random denominator: the model's choice-set size, floored to 1 to avoid div-by-zero.
-  const random_denominator = Math.max(ranked_players, 1);
-  const random_base_rate = hr_hitters_total / random_denominator;
+  // ---- BASELINES ----
+  const league_hitters_estimated = Math.max(gamesToday * hittersPerGame, 1);
+  const league_base_rate = hr_hitters_total / league_hitters_estimated;
+
+  const pool_denominator = Math.max(ranked_players, 1);
+  const pool_base_rate = hr_hitters_total / pool_denominator;
 
   const buckets: HitRateBucket[] = cutoffs.map((topN) => {
     const slice = ranked.slice(0, topN);
     const sliceSize = slice.length;
     let hits = 0;
     for (const p of slice) if (hrPlayerIds.has(p.player_id)) hits++;
-    const expected = topN * random_base_rate;
-    const lift = expected > 0 ? hits / expected - 1 : null;
+
+    const expectedLeague = topN * league_base_rate;
+    const liftLeague = expectedLeague > 0 ? hits / expectedLeague - 1 : null;
+
+    const expectedPool = topN * pool_base_rate;
+    const liftPool = expectedPool > 0 ? hits / expectedPool - 1 : null;
+
     return {
       topN,
       ranked: sliceSize,
       hits,
       hit_rate: sliceSize > 0 ? hits / sliceSize : 0,
-      expected_random_hits: expected,
-      lift_vs_random: lift,
+      expected_random_hits_league: expectedLeague,
+      lift_vs_league: liftLeague,
+      expected_random_hits_pool: expectedPool,
+      lift_vs_pool: liftPool,
     };
   });
 
@@ -2222,8 +2259,10 @@ export function computeBacktestPerformance(
     ranked_players,
     hr_hitters_total,
     total_hrs: actualHrs.length,
-    random_denominator,
-    random_base_rate,
+    league_hitters_estimated,
+    games_today: gamesToday,
+    league_base_rate,
+    pool_base_rate,
     buckets,
   };
 }

@@ -46,6 +46,22 @@ async function fetchHrsOn(date: string): Promise<HomeRunRow[]> {
   return (data ?? []) as HomeRunRow[];
 }
 
+/**
+ * Count games on the date — used to estimate the league-wide hitter pool
+ * for the TRUE random baseline (games × 18 starting-lineup slots).
+ * Counts ALL games on the date including in-progress / final / postponed
+ * because pinned MLB lineups exist as soon as a game is scheduled.
+ * Returns 0 on error so the baseline degrades to "—" instead of throwing.
+ */
+async function fetchGamesCountOn(date: string): Promise<number> {
+  const { count, error } = await supabase
+    .from('games')
+    .select('game_pk', { count: 'exact', head: true })
+    .eq('game_date', date);
+  if (error) return 0;
+  return count ?? 0;
+}
+
 interface ResolvedRow extends HrTargetSnapshotRow {
   hit: boolean;
   hrs_today: number;
@@ -64,6 +80,7 @@ export default function Backtest() {
 
   const [snapshot, setSnapshot] = useState<HrTargetSnapshotRow[]>([]);
   const [hrs, setHrs] = useState<HomeRunRow[]>([]);
+  const [gamesCount, setGamesCount] = useState<number>(0);
   const [dataLastUpdated, setDataLastUpdated] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -82,12 +99,13 @@ export default function Backtest() {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    Promise.all([fetchSnapshot(date), fetchHrsOn(date), fetchDataLastUpdated()])
-      .then(([s, h, lu]) => {
+    Promise.all([fetchSnapshot(date), fetchHrsOn(date), fetchDataLastUpdated(), fetchGamesCountOn(date)])
+      .then(([s, h, lu, gc]) => {
         if (cancelled) return;
         setSnapshot(s);
         setHrs(h);
         setDataLastUpdated(lu);
+        setGamesCount(gc);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -123,8 +141,9 @@ export default function Backtest() {
       snapshot.map((s) => ({ rank: s.rank, player_id: s.player_id, player_name: s.player_name })),
       hrs.map((h) => ({ player_id: h.player_id, player_name: h.player_name })),
       [10, 25, 50],
+      { gamesToday: gamesCount },
     );
-  }, [snapshot, hrs, date]);
+  }, [snapshot, hrs, date, gamesCount]);
 
   // ---- Task #166: miss analysis — homered, ranked > 50 (or unranked) ----
   // Phase 1 passes an empty liveTargets array — the miss row carries the
@@ -453,21 +472,68 @@ function HitRateCell({ label, hits, total }: { label: string; hits: number; tota
 }
 
 // ============================================================
-// Task #166: Daily performance — Top N hit-rate + random lift
+// Task #167: Daily performance — Top N hit-rate + TWO baselines
+//   (a) headline: lift vs MLB-wide random (games × 18 hitters)
+//   (b) diagnostic: lift vs the model's pre-filtered pool
 // ============================================================
 function PerformancePanel({ perf }: { perf: BacktestPerformance }) {
+  const hasGamesData = perf.games_today > 0;
+
   return (
     <div className="panel" style={{ marginBottom: 16 }}>
       <h2 style={{ marginTop: 0, fontSize: 16 }}>
         Model performance — Top 10 / 25 / 50 vs random baseline
       </h2>
-      <div className="subtle" style={{ fontSize: 12, marginBottom: 12 }}>
-        Base rate: <strong>{perf.hr_hitters_total}</strong> distinct HR-hitters
-        out of <strong>{perf.random_denominator}</strong> ranked players today
-        ={' '}
-        <strong>{(perf.random_base_rate * 100).toFixed(1)}%</strong>. Total HRs:{' '}
-        <strong>{perf.total_hrs}</strong>. Random baseline = the chance that a
-        randomly picked player from the model's ranked pool would have homered.
+
+      {/* Two-baseline summary tiles. Lets the user see at a glance that the
+          pool rate is naturally elevated and shouldn't be the "random" floor. */}
+      <div
+        style={{
+          display: 'grid',
+          gap: 10,
+          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+          marginBottom: 10,
+        }}
+      >
+        <BaselineTile
+          label="League-wide random baseline"
+          accent
+          value={hasGamesData ? `${(perf.league_base_rate * 100).toFixed(1)}%` : '—'}
+          note={
+            hasGamesData
+              ? `${perf.hr_hitters_total} HR hitters / ~${perf.league_hitters_estimated} MLB hitters (${perf.games_today} games × 18 lineup slots)`
+              : 'No games on file for this date'
+          }
+        />
+        <BaselineTile
+          label="Model pool HR rate"
+          value={`${(perf.pool_base_rate * 100).toFixed(1)}%`}
+          note={`${perf.hr_hitters_total} HR hitters / ${perf.ranked_players} ranked players`}
+        />
+        <BaselineTile
+          label="Total HRs today"
+          value={`${perf.total_hrs}`}
+          note={`across ${perf.hr_hitters_total} distinct hitters`}
+        />
+      </div>
+
+      <div
+        className="subtle"
+        style={{
+          fontSize: 11,
+          marginBottom: 10,
+          padding: '6px 8px',
+          background: 'var(--panel-2)',
+          border: '1px solid var(--border)',
+          borderRadius: 6,
+          lineHeight: 1.5,
+        }}
+      >
+        The ranked pool is already curated by the model, so its HR rate is
+        naturally higher than the MLB average. "Lift vs random" below uses the{' '}
+        <strong>league-wide</strong> baseline — what a coin flip across all
+        ~{perf.league_hitters_estimated} MLB hitters today would produce — not
+        the model-pool rate.
       </div>
 
       <div className="table-wrap">
@@ -477,19 +543,21 @@ function PerformancePanel({ perf }: { perf: BacktestPerformance }) {
               <th>Cutoff</th>
               <th className="num">Hits</th>
               <th className="num">Hit rate</th>
-              <th className="num">Expected (random)</th>
-              <th className="num">Lift vs random</th>
+              <th className="num">Expected (MLB)</th>
+              <th className="num">Lift vs MLB</th>
+              <th className="num subtle">Lift vs pool</th>
             </tr>
           </thead>
           <tbody>
             {perf.buckets.map((b) => {
-              const liftPct = b.lift_vs_random != null ? b.lift_vs_random * 100 : null;
-              const liftColor =
-                liftPct == null
+              const liftLeaguePct = b.lift_vs_league != null ? b.lift_vs_league * 100 : null;
+              const liftPoolPct = b.lift_vs_pool != null ? b.lift_vs_pool * 100 : null;
+              const colorFor = (pct: number | null) =>
+                pct == null
                   ? 'var(--muted)'
-                  : liftPct > 0
+                  : pct > 0
                   ? 'var(--good, #4cd97a)'
-                  : liftPct < 0
+                  : pct < 0
                   ? '#ff8d8d'
                   : 'var(--muted)';
               return (
@@ -497,11 +565,16 @@ function PerformancePanel({ perf }: { perf: BacktestPerformance }) {
                   <td><strong>Top {b.topN}</strong></td>
                   <td className="num">{b.hits} / {b.ranked}</td>
                   <td className="num">{(b.hit_rate * 100).toFixed(1)}%</td>
-                  <td className="num subtle">{b.expected_random_hits.toFixed(1)}</td>
-                  <td className="num" style={{ color: liftColor, fontWeight: 600 }}>
-                    {liftPct == null
+                  <td className="num subtle">{b.expected_random_hits_league.toFixed(2)}</td>
+                  <td className="num" style={{ color: colorFor(liftLeaguePct), fontWeight: 600 }}>
+                    {liftLeaguePct == null
                       ? '—'
-                      : `${liftPct > 0 ? '+' : ''}${liftPct.toFixed(0)}%`}
+                      : `${liftLeaguePct > 0 ? '+' : ''}${liftLeaguePct.toFixed(0)}%`}
+                  </td>
+                  <td className="num subtle" style={{ color: colorFor(liftPoolPct), opacity: 0.7 }}>
+                    {liftPoolPct == null
+                      ? '—'
+                      : `${liftPoolPct > 0 ? '+' : ''}${liftPoolPct.toFixed(0)}%`}
                   </td>
                 </tr>
               );
@@ -511,10 +584,45 @@ function PerformancePanel({ perf }: { perf: BacktestPerformance }) {
       </div>
 
       <div className="subtle" style={{ marginTop: 8, fontSize: 11, lineHeight: 1.5 }}>
-        Read: lift +80% means the model's Top-N had 80% more HR-hitters than a
-        random pick from the same pool would have produced. Negative lift = the
-        model is worse than random for that cutoff on this date. One day is noise
-        — look at the trend across many days before drawing conclusions.
+        Read: lift +500% on Top 10 means the model's Top 10 had ~6× more
+        HR-hitters than a random pick from all MLB hitters today. The "Lift vs
+        pool" column compares against the already-curated pool — a tougher
+        benchmark, kept here for transparency. Single-day numbers are noisy;
+        track the trend over weeks. The league baseline assumes 18 starting
+        hitters per game (excludes pinch hitters — a small underestimate).
+      </div>
+    </div>
+  );
+}
+
+function BaselineTile({
+  label,
+  value,
+  note,
+  accent,
+}: {
+  label: string;
+  value: string;
+  note: string;
+  accent?: boolean;
+}) {
+  return (
+    <div
+      style={{
+        padding: '8px 10px',
+        borderRadius: 6,
+        background: accent ? 'rgba(74,222,128,0.08)' : 'var(--panel-2)',
+        border: `1px solid ${accent ? 'rgba(74,222,128,0.45)' : 'var(--border)'}`,
+      }}
+    >
+      <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 18, fontWeight: 700, color: accent ? 'var(--good, #4cd97a)' : 'var(--text)' }}>
+        {value}
+      </div>
+      <div className="subtle" style={{ fontSize: 11, marginTop: 2, lineHeight: 1.4 }}>
+        {note}
       </div>
     </div>
   );
