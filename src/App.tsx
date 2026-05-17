@@ -1,25 +1,22 @@
-import { Routes, Route, NavLink, Link } from 'react-router-dom';
+import { Routes, Route, Link } from 'react-router-dom';
 import Dashboard from './pages/Dashboard';
 import PlayerDetail from './pages/PlayerDetail';
 import Matchups from './pages/Matchups';
 import HrTargets from './pages/HrTargets';
 import Backtest from './pages/Backtest';
 import Odds from './pages/Odds';
+import ClubhouseMenu from './components/ClubhouseMenu';
 
 export default function App() {
   return (
     <div className="container">
-      <header className="header">
+      <header className="header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <Link to="/" className="brand" style={{ color: 'inherit' }}>
           HR <span className="accent">Tracker</span>
         </Link>
-        <nav className="nav">
-          <NavLink to="/" end>Dashboard</NavLink>
-          <NavLink to="/matchups">Matchups</NavLink>
-          <NavLink to="/targets">HR Targets</NavLink>
-          <NavLink to="/odds">Odds</NavLink>
-          <NavLink to="/backtest">Backtest</NavLink>
-        </nav>
+        {/* Single branded menu — replaces inline nav links on both
+            desktop and mobile (no separate hamburger). */}
+        <ClubhouseMenu />
       </header>
 
       <Routes>
