@@ -14,14 +14,17 @@
  */
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { supabase, fetchDataLastUpdated, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
+import { supabase, fetchDataLastUpdated, fetchOddsSnapshots, type HomeRunRow, type HrTargetSnapshotRow, type OddsSnapshotRow } from '../lib/supabase';
 import { mlbToday, addDays } from '../lib/mlbDate';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
 import {
   computeBacktestPerformance,
   computeMissAnalysis,
+  computeMissChips,
   type BacktestPerformance,
   type MissRow,
+  type MissChip,
+  type MissChipContext,
 } from '../lib/stats';
 
 // Pacific calendar date — see src/lib/mlbDate.ts.
@@ -62,6 +65,79 @@ async function fetchGamesCountOn(date: string): Promise<number> {
   return count ?? 0;
 }
 
+/** Pull full games on the date — used by Miss Analysis to attach
+ *  weather / opposing pitcher / venue context per miss row. */
+interface BacktestGameRow {
+  game_pk: number;
+  home_team: string;
+  away_team: string;
+  venue_name: string | null;
+  home_probable_pitcher_id: number | null;
+  home_probable_pitcher_name: string | null;
+  home_probable_pitcher_hand: string | null;
+  away_probable_pitcher_id: number | null;
+  away_probable_pitcher_name: string | null;
+  away_probable_pitcher_hand: string | null;
+  weather: { condition?: string } | null;
+  weather_temp_f: number | null;
+  weather_wind_mph: number | null;
+  weather_wind_dir: string | null;
+}
+async function fetchGamesOnFull(date: string): Promise<BacktestGameRow[]> {
+  const { data, error } = await supabase
+    .from('games')
+    .select('game_pk, home_team, away_team, venue_name, ' +
+      'home_probable_pitcher_id, home_probable_pitcher_name, home_probable_pitcher_hand, ' +
+      'away_probable_pitcher_id, away_probable_pitcher_name, away_probable_pitcher_hand, ' +
+      'weather, weather_temp_f, weather_wind_mph, weather_wind_dir')
+    .eq('game_date', date);
+  if (error) return [];
+  return (data ?? []) as unknown as BacktestGameRow[];
+}
+
+/** Pull HRs from the season-anchor up to date-1 so we can compute each
+ *  miss player's L7/L14/season HR baseline as the model saw it at
+ *  snapshot time. Caps at 5000 rows (a full season is comfortably under
+ *  that on any one date). */
+async function fetchPriorSeasonHrs(date: string): Promise<HomeRunRow[]> {
+  const yearStart = `${date.slice(0, 4)}-01-01`;
+  const dayBefore = addDays(date, -1);
+  const PAGE = 1000;
+  const all: HomeRunRow[] = [];
+  for (let page = 0; page < 5; page++) {
+    const { data, error } = await supabase
+      .from('home_runs')
+      .select('*')
+      .gte('game_date', yearStart)
+      .lte('game_date', dayBefore)
+      .order('game_date', { ascending: false })
+      .range(page * PAGE, page * PAGE + PAGE - 1);
+    if (error) break;
+    const rows = (data ?? []) as HomeRunRow[];
+    all.push(...rows);
+    if (rows.length < PAGE) break;
+  }
+  return all;
+}
+
+/** Players-catalog batter side lookup — small, single-page. Used to
+ *  detect reverse-split misses. */
+async function fetchBatterSideIndex(): Promise<Map<number, string | null>> {
+  const out = new Map<number, string | null>();
+  const PAGE = 1000;
+  for (let page = 0; page < 5; page++) {
+    const { data, error } = await supabase
+      .from('players')
+      .select('player_id, bat_side')
+      .range(page * PAGE, page * PAGE + PAGE - 1);
+    if (error) break;
+    const rows = (data ?? []) as { player_id: number; bat_side: string | null }[];
+    for (const r of rows) out.set(r.player_id, r.bat_side);
+    if (rows.length < PAGE) break;
+  }
+  return out;
+}
+
 interface ResolvedRow extends HrTargetSnapshotRow {
   hit: boolean;
   hrs_today: number;
@@ -82,6 +158,11 @@ export default function Backtest() {
   const [hrs, setHrs] = useState<HomeRunRow[]>([]);
   const [gamesCount, setGamesCount] = useState<number>(0);
   const [dataLastUpdated, setDataLastUpdated] = useState<string | null>(null);
+  // ---- Miss Analysis enrichment data (task #168) ----
+  const [priorSeasonHrs, setPriorSeasonHrs] = useState<HomeRunRow[]>([]);
+  const [gamesFull, setGamesFull] = useState<BacktestGameRow[]>([]);
+  const [oddsRows, setOddsRows] = useState<OddsSnapshotRow[]>([]);
+  const [batterSideIdx, setBatterSideIdx] = useState<Map<number, string | null>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -99,13 +180,26 @@ export default function Backtest() {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    Promise.all([fetchSnapshot(date), fetchHrsOn(date), fetchDataLastUpdated(), fetchGamesCountOn(date)])
-      .then(([s, h, lu, gc]) => {
+    Promise.all([
+      fetchSnapshot(date),
+      fetchHrsOn(date),
+      fetchDataLastUpdated(),
+      fetchGamesCountOn(date),
+      fetchPriorSeasonHrs(date),
+      fetchGamesOnFull(date),
+      fetchOddsSnapshots(date),
+      fetchBatterSideIndex(),
+    ])
+      .then(([s, h, lu, gc, psh, gf, odds, bsi]) => {
         if (cancelled) return;
         setSnapshot(s);
         setHrs(h);
         setDataLastUpdated(lu);
         setGamesCount(gc);
+        setPriorSeasonHrs(psh);
+        setGamesFull(gf);
+        setOddsRows(odds);
+        setBatterSideIdx(bsi);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -151,13 +245,157 @@ export default function Backtest() {
   // for the date to fill in weather / pitcher / park signals per miss.
   const misses: MissRow[] = useMemo(() => {
     if (snapshot.length === 0 || hrs.length === 0) return [];
-    return computeMissAnalysis(
+    // Fill team / opponent from today's HR rows so the chip helper can
+    // locate the player's game in `gameByPk` without needing live targets.
+    const teamByPlayer = new Map<number, { team: string | null; opponent: string | null }>();
+    for (const h of hrs) {
+      if (!teamByPlayer.has(h.player_id)) {
+        teamByPlayer.set(h.player_id, { team: h.team ?? null, opponent: h.opponent ?? null });
+      }
+    }
+    const rows = computeMissAnalysis(
       hrs.map((h) => ({ player_id: h.player_id, player_name: h.player_name })),
       snapshot.map((s) => ({ rank: s.rank, player_id: s.player_id, player_name: s.player_name })),
       [],
       { cutoff: 50 },
     );
+    // Backfill team/opponent — computeMissAnalysis leaves them null when no
+    // live target is passed. We have them from the HR rows themselves.
+    for (const r of rows) {
+      const tb = teamByPlayer.get(r.player_id);
+      if (tb) { r.team = tb.team; r.opponent = tb.opponent; }
+    }
+    return rows;
   }, [snapshot, hrs]);
+
+  // ---- Build the chip context bundle ONCE per date load (task #168) ----
+  const missChipsByPlayer: Map<number, MissChip[]> = useMemo(() => {
+    const out = new Map<number, MissChip[]>();
+    if (misses.length === 0) return out;
+
+    // seasonHrsByPlayer: prior-to-date HRs grouped by player
+    const seasonHrsByPlayer = new Map<number, { game_date: string }[]>();
+    for (const h of priorSeasonHrs) {
+      let arr = seasonHrsByPlayer.get(h.player_id);
+      if (!arr) { arr = []; seasonHrsByPlayer.set(h.player_id, arr); }
+      arr.push({ game_date: h.game_date });
+    }
+
+    // pitcherL14dAllowed: count HRs allowed in the 14-day window prior
+    // to date, keyed by pitcher_id. Uses home_runs as a cheap proxy for
+    // the full pitcher_starts read.
+    const fourteenStart = addDays(date, -14);
+    const dayBefore = addDays(date, -1);
+    const pitcherL14dAllowed = new Map<number, number>();
+    for (const h of priorSeasonHrs) {
+      if (h.pitcher_id == null) continue;
+      if (h.game_date < fourteenStart || h.game_date > dayBefore) continue;
+      pitcherL14dAllowed.set(h.pitcher_id, (pitcherL14dAllowed.get(h.pitcher_id) ?? 0) + 1);
+    }
+
+    // gameByPk: enrich with venue rank (cheap rank-by-l14d from the
+    // priorSeasonHrs distribution across venues).
+    const venueL14d = new Map<string, number>();
+    for (const h of priorSeasonHrs) {
+      if (!h.venue_name) continue;
+      if (h.game_date < fourteenStart || h.game_date > dayBefore) continue;
+      venueL14d.set(h.venue_name, (venueL14d.get(h.venue_name) ?? 0) + 1);
+    }
+    const venueRanking = Array.from(venueL14d.entries()).sort((a, b) => b[1] - a[1]);
+    const venueRankByName = new Map<string, number>();
+    venueRanking.forEach(([name], i) => venueRankByName.set(name, i + 1));
+    const venueTotal = venueRanking.length;
+
+    const gameByPk = new Map<number, MissChipContext['gameByPk'] extends Map<number, infer V> ? V : never>();
+    for (const g of gamesFull) {
+      // For each game, both teams' batters face the OPPOSING probable pitcher.
+      // We pre-bake that into the game row so the chip helper doesn't need
+      // to know which side the miss player is on (it uses team matching).
+      // To handle this cleanly, we store BOTH directions keyed by team in a
+      // separate lookup the helper picks via team membership at chip time.
+      gameByPk.set(g.game_pk, {
+        home_team: g.home_team,
+        away_team: g.away_team,
+        venue_name: g.venue_name,
+        venue_l14d_rank: g.venue_name ? venueRankByName.get(g.venue_name) ?? null : null,
+        venue_total_ranked: venueTotal,
+        weather_condition: g.weather?.condition ?? null,
+        weather_temp_f: g.weather_temp_f,
+        weather_wind_mph: g.weather_wind_mph,
+        weather_wind_dir: g.weather_wind_dir,
+        // Placeholder: we'll override per-row below using team-aware lookup.
+        opposing_pitcher_id: null,
+        opposing_pitcher_name: null,
+        opposing_pitcher_hand: null,
+      });
+    }
+    // Team-aware opposing pitcher lookup: team → { pitcher_id, name, hand }.
+    const opposingPitcherByTeam = new Map<string, { id: number | null; name: string | null; hand: string | null }>();
+    for (const g of gamesFull) {
+      opposingPitcherByTeam.set(g.home_team, { id: g.away_probable_pitcher_id, name: g.away_probable_pitcher_name, hand: g.away_probable_pitcher_hand });
+      opposingPitcherByTeam.set(g.away_team, { id: g.home_probable_pitcher_id, name: g.home_probable_pitcher_name, hand: g.home_probable_pitcher_hand });
+    }
+
+    // Odds: pick morning and latest per player.
+    const morningOddsByPlayer = new Map<number, { american_odds: number; implied_prob: number }>();
+    const latestOddsByPlayer = new Map<number, { american_odds: number; implied_prob: number }>();
+    // Sort rows by snapshot_time so "latest" is straightforward.
+    const oddsSorted = oddsRows.slice().sort((a, b) => (a.snapshot_time < b.snapshot_time ? -1 : 1));
+    for (const r of oddsSorted) {
+      if (r.player_id == null) continue;
+      if (r.snapshot_type === 'morning' && !morningOddsByPlayer.has(r.player_id)) {
+        morningOddsByPlayer.set(r.player_id, { american_odds: r.american_odds, implied_prob: r.implied_prob });
+      }
+      latestOddsByPlayer.set(r.player_id, { american_odds: r.american_odds, implied_prob: r.implied_prob });
+    }
+
+    // hrsOnDateByPlayer: today's HRs grouped per player (multi-HR + distance + EV).
+    const hrsOnDateByPlayer = new Map<number, { distance: number | null; exit_velocity: number | null }[]>();
+    for (const h of hrs) {
+      let arr = hrsOnDateByPlayer.get(h.player_id);
+      if (!arr) { arr = []; hrsOnDateByPlayer.set(h.player_id, arr); }
+      arr.push({ distance: h.distance, exit_velocity: h.exit_velocity });
+    }
+
+    // Compute chips per miss row. Patch the gameByPk entry with the
+    // OPPOSING pitcher for the miss player's team right before calling
+    // the helper — this is the cleanest place to do team-side selection.
+    for (const m of misses) {
+      // Find the game for this miss player (by team membership).
+      let matchedPk: number | null = null;
+      if (m.team) {
+        for (const [pk, g] of gameByPk) {
+          if (g.home_team === m.team || g.away_team === m.team) { matchedPk = pk; break; }
+        }
+      }
+      // Patch opposing pitcher for the matched game.
+      const patchedGameByPk = new Map(gameByPk);
+      if (matchedPk != null && m.team) {
+        const opp = opposingPitcherByTeam.get(m.team);
+        const base = patchedGameByPk.get(matchedPk);
+        if (opp && base) {
+          patchedGameByPk.set(matchedPk, {
+            ...base,
+            opposing_pitcher_id: opp.id,
+            opposing_pitcher_name: opp.name,
+            opposing_pitcher_hand: opp.hand,
+          });
+        }
+      }
+      const ctx: MissChipContext = {
+        seasonHrsByPlayer,
+        gameByPk: patchedGameByPk,
+        pitcherL14dAllowed,
+        batterSideById: batterSideIdx,
+        morningOddsByPlayer,
+        latestOddsByPlayer,
+        hrsOnDateByPlayer,
+        date,
+      };
+      out.set(m.player_id, computeMissChips(m, ctx));
+    }
+    return out;
+  }, [misses, priorSeasonHrs, gamesFull, oddsRows, batterSideIdx, hrs, date]);
 
   const today = todayISO();
   const yesterday = addDays(today, -1);
@@ -237,9 +475,9 @@ export default function Backtest() {
         <PerformancePanel perf={performance} />
       )}
 
-      {/* ---- Task #166: Miss analysis — players who homered outside Top 50 ---- */}
+      {/* ---- Task #166 + #168: Miss analysis — homered outside Top 50, with diagnostic chips ---- */}
       {misses.length > 0 && (
-        <MissPanel misses={misses} cutoff={50} />
+        <MissPanel misses={misses} cutoff={50} chipsByPlayer={missChipsByPlayer} />
       )}
 
       {!loading && snapshot.length === 0 && !error && (
@@ -629,9 +867,17 @@ function BaselineTile({
 }
 
 // ============================================================
-// Task #166: Miss analysis — homered but ranked > 50
+// Task #168: Miss analysis — homered outside Top 50, with chips
 // ============================================================
-function MissPanel({ misses, cutoff }: { misses: MissRow[]; cutoff: number }) {
+function MissPanel({
+  misses,
+  cutoff,
+  chipsByPlayer,
+}: {
+  misses: MissRow[];
+  cutoff: number;
+  chipsByPlayer: Map<number, MissChip[]>;
+}) {
   return (
     <div className="panel" style={{ marginBottom: 16 }}>
       <h2 style={{ marginTop: 0, fontSize: 16 }}>
@@ -639,9 +885,11 @@ function MissPanel({ misses, cutoff }: { misses: MissRow[]; cutoff: number }) {
       </h2>
       <div className="subtle" style={{ fontSize: 12, marginBottom: 8 }}>
         Players the model passed on who hit HRs today. <strong>{misses.length}</strong>{' '}
-        miss{misses.length === 1 ? '' : 'es'}. Sort: most-snubbed first (highest
-        snapshot rank, or "unranked"). Look for patterns — if many misses had
-        high season HR + cold L7d, the cold penalty might be too aggressive.
+        miss{misses.length === 1 ? '' : 'es'}. Sort: most-snubbed first
+        (highest snapshot rank, or "unranked"). Each row carries up to six
+        diagnostic chips so you can see WHY the model passed and which signals
+        existed. Look for patterns —{' '}
+        <em>if many misses share the same chips, that's a tuning lever.</em>
       </div>
 
       <div className="table-wrap">
@@ -650,94 +898,86 @@ function MissPanel({ misses, cutoff }: { misses: MissRow[]; cutoff: number }) {
             <tr>
               <th>Player</th>
               <th>Team</th>
-              <th>Snapshot rank</th>
-              <th className="num">Heat</th>
-              <th className="num">Season HR</th>
-              <th className="num">L7d</th>
-              <th className="num">Streak</th>
-              <th>Signals on file</th>
+              <th>Opp</th>
+              <th>Signals (chips)</th>
             </tr>
           </thead>
           <tbody>
-            {misses.map((m) => (
-              <tr key={m.player_id}>
-                <td>
-                  <Link className="player-link" to={`/player/${m.player_id}`}>
-                    {m.player_name}
-                  </Link>
-                </td>
-                <td>{m.team ? <span className="pill">{m.team}</span> : '—'}</td>
-                <td className="subtle" style={{ fontSize: 12 }}>
-                  {m.snapshot_rank != null ? `#${m.snapshot_rank}` : 'unranked'}
-                </td>
-                <td className="num">
-                  {m.signals.heat_score != null ? m.signals.heat_score.toFixed(1) : '—'}
-                </td>
-                <td className="num">{m.signals.season_hr}</td>
-                <td className="num">{m.signals.hrs_l7d}</td>
-                <td className="num">{m.signals.hr_streak}</td>
-                <td className="subtle" style={{ fontSize: 11, lineHeight: 1.4 }}>
-                  <SignalTags m={m} />
-                </td>
-              </tr>
-            ))}
+            {misses.map((m) => {
+              const chips = chipsByPlayer.get(m.player_id) ?? [];
+              return (
+                <tr key={m.player_id}>
+                  <td>
+                    <Link className="player-link" to={`/player/${m.player_id}`}>
+                      {m.player_name}
+                    </Link>
+                  </td>
+                  <td>{m.team ? <span className="pill">{m.team}</span> : '—'}</td>
+                  <td className="subtle" style={{ fontSize: 12 }}>
+                    {m.opponent ? `vs ${m.opponent}` : '—'}
+                  </td>
+                  <td>
+                    <MissChipRow chips={chips} />
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
 
-      <div className="subtle" style={{ marginTop: 8, fontSize: 11, lineHeight: 1.5 }}>
-        Signals shown are from the LIVE HrTarget computation if available.
-        Empty signals mean the player wasn't in today's matchup pool (e.g. spot
-        starter, traded, no probable pitcher resolved). Use this view to feed
-        scoring changes — frequent miss patterns are the strongest tuning signal.
+      <div className="subtle" style={{ marginTop: 8, fontSize: 11, lineHeight: 1.6 }}>
+        <strong>Chip glossary</strong> —{' '}
+        <span style={{ color: 'var(--good, #4cd97a)' }}>green</span> = signal
+        model SHOULD have weighted higher (real miss);{' '}
+        <span style={{ color: '#ff8d8d' }}>red</span> = penalty model applied
+        with justification (miss you accept);{' '}
+        <span style={{ color: 'var(--muted)' }}>gray</span> = informational
+        context (pool position, raw outcome).{' '}
+        <strong>Wind Out / HR Pitcher / Power Park / Odds Steam / Hot last 7d</strong>{' '}
+        are the highest-signal "model snubbed real edge" markers. Hover any
+        chip for the source value.
       </div>
     </div>
   );
 }
 
-/** Pulls a short list of badge-like signal tags off a miss row. */
-function SignalTags({ m }: { m: MissRow }) {
-  const tags: { label: string; tone: 'good' | 'bad' | 'neutral' }[] = [];
-  if (m.signals.is_elite_power) tags.push({ label: 'Elite power', tone: 'good' });
-  if ((m.signals.season_hr ?? 0) >= 15) tags.push({ label: `${m.signals.season_hr} HR`, tone: 'good' });
-  if ((m.signals.hrs_l7d ?? 0) >= 2) tags.push({ label: `Hot L7d (${m.signals.hrs_l7d})`, tone: 'good' });
-  if ((m.signals.hr_streak ?? 0) >= 2) tags.push({ label: `${m.signals.hr_streak}d streak`, tone: 'good' });
-  if (m.signals.weather_included) {
-    const t = m.signals.weather_temp_boost ?? 0;
-    const w = m.signals.weather_wind_boost ?? 0;
-    if (t + w > 0) tags.push({ label: `Weather +${t + w}`, tone: 'good' });
-    if (t + w < 0) tags.push({ label: `Weather ${t + w}`, tone: 'bad' });
+function MissChipRow({ chips }: { chips: MissChip[] }) {
+  if (!chips || chips.length === 0) {
+    return (
+      <span className="subtle" style={{ fontSize: 11 }}>
+        Loading context…
+      </span>
+    );
   }
-  if ((m.signals.pitcher_l14d_allowed ?? 0) >= 3) tags.push({ label: `Pitcher ${m.signals.pitcher_l14d_allowed} HR L14d`, tone: 'good' });
-  if (m.signals.venue_l14d_rank != null && m.signals.venue_l14d_rank <= 5) tags.push({ label: `Top-${m.signals.venue_l14d_rank} park`, tone: 'good' });
-  if (m.live_target == null) tags.push({ label: 'Not in today\'s pool', tone: 'neutral' });
-  if (tags.length === 0) tags.push({ label: 'No live signals', tone: 'neutral' });
-
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-      {tags.map((t) => (
+      {chips.map((c) => (
         <span
-          key={t.label}
+          key={c.kind}
+          title={c.detail ?? c.label}
           style={{
             display: 'inline-block',
-            padding: '1px 6px',
+            padding: '2px 7px',
             borderRadius: 999,
-            fontSize: 10,
+            fontSize: 11,
+            fontWeight: 600,
+            whiteSpace: 'nowrap',
             background:
-              t.tone === 'good' ? 'rgba(64,200,120,0.14)' :
-              t.tone === 'bad'  ? 'rgba(255,110,110,0.14)' :
+              c.tone === 'good' ? 'rgba(64,200,120,0.14)' :
+              c.tone === 'bad'  ? 'rgba(255,110,110,0.14)' :
                                   'rgba(160,160,160,0.14)',
             border:
-              t.tone === 'good' ? '1px solid rgba(64,200,120,0.45)' :
-              t.tone === 'bad'  ? '1px solid rgba(255,110,110,0.45)' :
+              c.tone === 'good' ? '1px solid rgba(64,200,120,0.45)' :
+              c.tone === 'bad'  ? '1px solid rgba(255,110,110,0.45)' :
                                   '1px solid rgba(160,160,160,0.45)',
             color:
-              t.tone === 'good' ? 'var(--good, #4cd97a)' :
-              t.tone === 'bad'  ? '#ff8d8d' :
+              c.tone === 'good' ? 'var(--good, #4cd97a)' :
+              c.tone === 'bad'  ? '#ff8d8d' :
                                   'var(--muted)',
           }}
         >
-          {t.label}
+          {c.label}
         </span>
       ))}
     </div>

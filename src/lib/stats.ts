@@ -2353,3 +2353,206 @@ export function computeMissAnalysis(
   });
   return out;
 }
+
+// ---------------------------------------------------------------------
+// Miss-row diagnostic chips (task #168)
+// ---------------------------------------------------------------------
+//
+// Why this lives here instead of in the Backtest page: the chip rules
+// are pure and easy to unit test. The page assembles a context bundle
+// of game-day data (weather, opposing pitcher, odds snapshot) and calls
+// this helper per miss row. Each chip carries a tone so the UI can
+// color-code without a translation layer.
+//
+// Tones:
+//   'good'    — a strong signal the model SHOULD have used (model missed)
+//   'bad'     — a justifying penalty the model applied (model was right
+//               by its own rules — this is the type of miss you accept)
+//   'neutral' — informational context (raw outcome, pool position)
+//
+// Chips capped at 6 per row so the column stays scannable on mobile.
+
+export interface MissChipContext {
+  /** All HRs from a chosen anchor date back to season start, used to
+   *  compute L7d / L14d / season HR per player as of the snapshot's
+   *  asOf. Pass HRs with game_date ≤ (date - 1) for honest pre-game view. */
+  seasonHrsByPlayer: Map<number, { game_date: string }[]>;
+  /** game_pk → game-day context (weather, opposing pitcher, venue). */
+  gameByPk: Map<number, {
+    home_team: string;
+    away_team: string;
+    venue_name: string | null;
+    venue_l14d_rank?: number | null;
+    venue_total_ranked?: number | null;
+    weather_condition: string | null;
+    weather_temp_f: number | null;
+    weather_wind_mph: number | null;
+    weather_wind_dir: string | null;
+    /** The pitcher the MISS hitter would have faced (opposite team). */
+    opposing_pitcher_id: number | null;
+    opposing_pitcher_name: string | null;
+    opposing_pitcher_hand: string | null;
+  }>;
+  /** Pitcher HR-allowed lookup. Phase 1 uses the home_runs-derived L14d count. */
+  pitcherL14dAllowed: Map<number, number>;
+  /** player_id → batter side ('L' | 'R' | 'S' | null) from the players catalog. */
+  batterSideById: Map<number, string | null>;
+  /** Morning odds snapshot per player_id (if we captured one this date). */
+  morningOddsByPlayer: Map<number, { american_odds: number; implied_prob: number }>;
+  /** Current / latest odds snapshot per player_id. */
+  latestOddsByPlayer: Map<number, { american_odds: number; implied_prob: number }>;
+  /** The miss hitter's actual HRs on the date — drives Multi-HR / Distance / Hard Hit chips. */
+  hrsOnDateByPlayer: Map<number, { distance: number | null; exit_velocity: number | null }[]>;
+  /** Anchor date for L7d / L14d windows (typically the backtest target date). */
+  date: string;
+}
+
+export interface MissChip {
+  label: string;
+  tone: 'good' | 'bad' | 'neutral';
+  kind: string;
+  detail?: string;
+}
+
+const ROOF_RX_MISS = /roof closed|dome|indoor/i;
+const MAX_CHIPS_PER_ROW = 6;
+
+export function computeMissChips(missRow: MissRow, ctx: MissChipContext): MissChip[] {
+  const chips: { weight: number; chip: MissChip }[] = [];
+  const date = ctx.date;
+  const hrs = ctx.seasonHrsByPlayer.get(missRow.player_id) ?? [];
+  const sevenStart = addDays(date, -7);
+  const fourteenStart = addDays(date, -14);
+
+  // Pre-snapshot windows: only count HRs ≤ date - 1 (don't include today's HR
+  // in "recent form"; that would be circular for a backtest of what the model knew).
+  const dayBefore = addDays(date, -1);
+  const priorHrs = hrs.filter((h) => h.game_date <= dayBefore);
+  const hrs_l7d = priorHrs.filter((h) => h.game_date >= sevenStart).length;
+  const hrs_l14d = priorHrs.filter((h) => h.game_date >= fourteenStart).length;
+  const season_hr = priorHrs.length;
+
+  // Today's actual HRs for this player (could be multi-HR, distance, EV).
+  const dayHrs = ctx.hrsOnDateByPlayer.get(missRow.player_id) ?? [];
+
+  // ---- POOL POSITION (always at least one chip in this bucket) ----
+  if (missRow.snapshot_rank == null) {
+    chips.push({ weight: 100, chip: { kind: 'not_in_pool', label: 'Not in Model Pool', tone: 'neutral', detail: 'Player did not appear in the snapshot at all' } });
+  } else if (missRow.snapshot_rank > 100) {
+    chips.push({ weight: 95, chip: { kind: 'buried', label: `Buried #${missRow.snapshot_rank}`, tone: 'neutral', detail: 'Ranked deep in the pool' } });
+  } else {
+    chips.push({ weight: 80, chip: { kind: 'outside_top50', label: `Rank #${missRow.snapshot_rank}`, tone: 'neutral', detail: 'Just outside Top 50' } });
+  }
+
+  // ---- POWER TIER ----
+  if (season_hr >= 15) {
+    chips.push({ weight: 75, chip: { kind: 'big_power', label: 'Big power', tone: 'good', detail: `${season_hr} HR season` } });
+  } else if (season_hr >= 8) {
+    chips.push({ weight: 50, chip: { kind: 'mid_power', label: 'Mid power', tone: 'good', detail: `${season_hr} HR season` } });
+  } else if (season_hr <= 4) {
+    chips.push({ weight: 30, chip: { kind: 'low_power', label: 'Low season power', tone: 'bad', detail: `${season_hr} HR season — model justified passing` } });
+  }
+
+  // ---- RECENT FORM ----
+  if (hrs_l7d >= 2) {
+    chips.push({ weight: 70, chip: { kind: 'hot_l7d', label: 'Hot last 7d', tone: 'good', detail: `${hrs_l7d} HR in last 7 days before today` } });
+  } else if (hrs_l14d >= 3) {
+    chips.push({ weight: 55, chip: { kind: 'hot_l14d', label: 'Hot last 14d', tone: 'good', detail: `${hrs_l14d} HR in last 14 days before today` } });
+  } else if (hrs_l7d === 0 && hrs_l14d <= 1) {
+    chips.push({ weight: 60, chip: { kind: 'cold_batter', label: 'Cold batter', tone: 'bad', detail: `${hrs_l7d} HR L7d, ${hrs_l14d} HR L14d — model justified passing` } });
+  } else if (hrs_l14d === 0) {
+    chips.push({ weight: 65, chip: { kind: 'boom_bust', label: 'Boom/Bust', tone: 'neutral', detail: 'First HR in 14+ days — unpredictable spike' } });
+  }
+
+  // ---- GAME-DAY CONTEXT ----
+  // Find the actual game from any HR row for the player today.
+  const gamePk = dayHrs.length > 0 ? undefined : undefined; // we don't have game_pk on dayHrs here
+  // Caller can pass game_pk via ctx if needed; for now scan gameByPk for the team match.
+  let game = null as ReturnType<MissChipContext['gameByPk']['get']> | null;
+  if (missRow.team) {
+    for (const g of ctx.gameByPk.values()) {
+      if (g.home_team === missRow.team || g.away_team === missRow.team) { game = g; break; }
+    }
+  }
+
+  if (game) {
+    // ---- WEATHER ----
+    const cond = game.weather_condition ?? null;
+    const isDome = cond != null && ROOF_RX_MISS.test(cond);
+    const windDir = (game.weather_wind_dir ?? '').toLowerCase();
+    const windMph = game.weather_wind_mph ?? 0;
+    if (isDome) {
+      chips.push({ weight: 35, chip: { kind: 'dome', label: 'Dome neutral', tone: 'neutral', detail: 'Indoors — weather not a factor' } });
+    } else if (windMph >= 10 && windDir.includes('out')) {
+      chips.push({ weight: 78, chip: { kind: 'wind_out', label: 'Wind Out', tone: 'good', detail: `${windMph}mph ${windDir} — favored HRs` } });
+    } else if (windMph >= 10 && (windDir.includes('in from') || /\bin\b/.test(windDir))) {
+      chips.push({ weight: 45, chip: { kind: 'wind_in', label: 'Wind In', tone: 'bad', detail: `${windMph}mph ${windDir} — suppressed HRs` } });
+    }
+    if (game.weather_temp_f != null && game.weather_temp_f >= 85) {
+      chips.push({ weight: 40, chip: { kind: 'warm', label: 'Warm', tone: 'good', detail: `${game.weather_temp_f}°F` } });
+    } else if (game.weather_temp_f != null && game.weather_temp_f <= 50) {
+      chips.push({ weight: 25, chip: { kind: 'cold_weather', label: 'Cold weather', tone: 'bad', detail: `${game.weather_temp_f}°F` } });
+    }
+
+    // ---- PITCHER ----
+    const opp_pitcher_id = game.opposing_pitcher_id;
+    const opp_pitcher_hand = game.opposing_pitcher_hand;
+    const allowed = opp_pitcher_id != null ? ctx.pitcherL14dAllowed.get(opp_pitcher_id) ?? 0 : 0;
+    if (allowed >= 3) {
+      chips.push({ weight: 85, chip: { kind: 'hr_pitcher', label: 'HR Pitcher', tone: 'good', detail: `Pitcher allowed ${allowed} HR in L14d — strong miss signal` } });
+    }
+    const bat_side = ctx.batterSideById.get(missRow.player_id) ?? null;
+    if (bat_side && opp_pitcher_hand && bat_side === opp_pitcher_hand) {
+      chips.push({ weight: 50, chip: { kind: 'reverse_split', label: 'Reverse Split', tone: 'neutral', detail: `${bat_side}HB vs ${opp_pitcher_hand}HP — same-side, model penalized` } });
+    }
+
+    // ---- PARK ----
+    if (game.venue_l14d_rank != null && game.venue_l14d_rank <= 5) {
+      chips.push({ weight: 70, chip: { kind: 'power_park', label: 'Power park', tone: 'good', detail: `Top ${game.venue_l14d_rank} venue in L14d HRs` } });
+    } else if (game.venue_l14d_rank != null && game.venue_total_ranked != null && game.venue_l14d_rank >= game.venue_total_ranked - 4) {
+      chips.push({ weight: 30, chip: { kind: 'pitchers_park', label: 'Pitcher park', tone: 'bad', detail: `Bottom-${game.venue_total_ranked - game.venue_l14d_rank + 1} venue in L14d HRs — model justified discounting` } });
+    }
+  } else {
+    chips.push({ weight: 20, chip: { kind: 'no_game_ctx', label: 'No game context', tone: 'neutral', detail: 'Could not match player to a game on this date' } });
+  }
+
+  // ---- ODDS ----
+  const morn = ctx.morningOddsByPlayer.get(missRow.player_id) ?? null;
+  const latest = ctx.latestOddsByPlayer.get(missRow.player_id) ?? null;
+  if (morn && latest) {
+    const delta = latest.implied_prob - morn.implied_prob;
+    if (delta >= 0.02) {
+      chips.push({ weight: 90, chip: { kind: 'odds_steam', label: 'Odds Steam', tone: 'good', detail: `Market shortened ${(delta * 100).toFixed(1)}% from morning — sharp money agreed` } });
+    } else if (delta <= -0.02) {
+      chips.push({ weight: 30, chip: { kind: 'odds_drift', label: 'Odds Drift', tone: 'bad', detail: `Market drifted ${(Math.abs(delta) * 100).toFixed(1)}% — public faded` } });
+    }
+  }
+  if (morn && morn.implied_prob <= 0.05) {
+    chips.push({ weight: 25, chip: { kind: 'longshot', label: 'Long shot', tone: 'neutral', detail: `Morning implied ${(morn.implied_prob * 100).toFixed(1)}% — book agreed with model` } });
+  }
+
+  // ---- OUTCOME chips (informational, always last) ----
+  if (dayHrs.length >= 2) {
+    chips.push({ weight: 60, chip: { kind: 'multi_hr', label: `Multi HR (${dayHrs.length})`, tone: 'neutral', detail: 'Multiple HRs this game' } });
+  }
+  const maxDist = dayHrs.reduce((m, h) => Math.max(m, h.distance ?? 0), 0);
+  if (maxDist >= 430) {
+    chips.push({ weight: 20, chip: { kind: 'long_hr', label: `${Math.round(maxDist)} ft`, tone: 'neutral', detail: 'Long HR — raw power was there' } });
+  }
+  const maxEv = dayHrs.reduce((m, h) => Math.max(m, h.exit_velocity ?? 0), 0);
+  if (maxEv >= 108) {
+    chips.push({ weight: 20, chip: { kind: 'hard_hit', label: `${maxEv.toFixed(0)} mph EV`, tone: 'neutral', detail: 'Elite exit velocity on this HR' } });
+  }
+
+  // Sort by weight desc, de-dup by kind, cap.
+  chips.sort((a, b) => b.weight - a.weight);
+  const seen = new Set<string>();
+  const out: MissChip[] = [];
+  for (const c of chips) {
+    if (seen.has(c.chip.kind)) continue;
+    seen.add(c.chip.kind);
+    out.push(c.chip);
+    if (out.length >= MAX_CHIPS_PER_ROW) break;
+  }
+  return out;
+}
