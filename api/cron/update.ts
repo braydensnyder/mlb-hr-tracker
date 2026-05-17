@@ -78,6 +78,16 @@ function isAuthorized(req: VercelReqLike): boolean {
   return authHeader === `Bearer ${secret}`;
 }
 
+/** Optional manual override — ?force_odds=morning|midday|pregame|manual
+ *  bypasses decideOddsSnapshot() and takes the snapshot immediately.
+ *  Useful for testing without waiting on the PT window. */
+const VALID_ODDS_TYPES: OddsSnapshotType[] = ['morning', 'midday', 'pregame', 'manual'];
+function parseForceOdds(req: VercelReqLike): OddsSnapshotType | null {
+  const raw = req.query['force_odds'];
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  return v && (VALID_ODDS_TYPES as string[]).includes(v) ? (v as OddsSnapshotType) : null;
+}
+
 /** Optional manual override — ?mode=... runs that mode directly. */
 function parseModeOverride(req: VercelReqLike): UpdateMode | null {
   const raw = req.query['mode'];
@@ -193,23 +203,37 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
     const result = await updateDaily(tier, { forceSnapshot });
 
     // ---- Phase 1 Odds snapshot decision ----
+    // Manual ?force_odds= override wins over the time-window check so the
+    // operator can take a snapshot on demand for debugging.
     try {
-      const decision = await decideOddsSnapshot(cronStartDate, dateContext.mlbTargetDate);
-      oddsAttempt.decision = decision;
-      if (decision.type) {
-        console.log(`[cron] odds snapshot due: type=${decision.type} (${decision.reason})`);
+      const forceOdds = parseForceOdds(req);
+      let snapshotType: OddsSnapshotType | null = null;
+      if (forceOdds) {
+        snapshotType = forceOdds;
+        oddsAttempt.decision = { type: forceOdds, reason: `manual override ?force_odds=${forceOdds}` };
+        console.log(`[cron] odds snapshot FORCED: type=${forceOdds} (bypassing window check)`);
+      } else {
+        const decision = await decideOddsSnapshot(cronStartDate, dateContext.mlbTargetDate);
+        oddsAttempt.decision = decision;
+        if (decision.type) {
+          snapshotType = decision.type;
+          console.log(`[cron] odds snapshot due: type=${decision.type} (${decision.reason})`);
+        } else {
+          console.log(`[cron] no odds snapshot due (${decision.reason})`);
+        }
+      }
+
+      if (snapshotType) {
         if (!process.env.ODDS_API_KEY) {
           console.warn('[cron] ODDS_API_KEY not set in env — skipping odds snapshot.');
           oddsAttempt.error = 'ODDS_API_KEY missing';
         } else {
           oddsAttempt.result = await snapshotOdds({
             date: dateContext.mlbTargetDate,
-            snapshotType: decision.type,
+            snapshotType,
           });
-          console.log(`[cron] odds snapshot ${decision.type} upserted ${oddsAttempt.result.rows_upserted} rows`);
+          console.log(`[cron] odds snapshot ${snapshotType} upserted ${oddsAttempt.result.rows_upserted} rows`);
         }
-      } else {
-        console.log(`[cron] no odds snapshot due (${decision.reason})`);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : JSON.stringify(err);

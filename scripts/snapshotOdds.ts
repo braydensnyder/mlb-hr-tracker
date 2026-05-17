@@ -260,11 +260,40 @@ export async function snapshotOdds(opts: SnapshotOddsOptions = {}): Promise<Snap
   const snapshot_type: OddsSnapshotType = opts.snapshotType ?? 'manual';
   const dryRun = !!opts.dryRun;
 
-  console.log(`\n[snapshotOdds] date=${date} type=${snapshot_type} dryRun=${dryRun}`);
+  // VERBOSE preflight log — surfaces env presence + intent. Never logs the
+  // actual ODDS_API_KEY value, only the boolean.
+  const haveKey = !!process.env.ODDS_API_KEY;
+  console.log(`\n[snapshotOdds] === START ===`);
+  console.log(`[snapshotOdds] date=${date} type=${snapshot_type} dryRun=${dryRun}`);
+  console.log(`[snapshotOdds] ODDS_API_KEY present: ${haveKey}`);
+  if (opts.books?.length) console.log(`[snapshotOdds] book filter: ${opts.books.join(',')}`);
+  if (!haveKey) {
+    console.warn(
+      `[snapshotOdds] WARNING: ODDS_API_KEY not in env. listMlbEvents will throw.`,
+    );
+  }
 
   const { fromIso, toIso } = ptDayUtcBounds(date);
-  const events = await listMlbEvents(fromIso, toIso, { bookmakers: opts.books });
-  console.log(`[snapshotOdds] ${events.length} events in window ${fromIso} → ${toIso}`);
+  console.log(`[snapshotOdds] event window: ${fromIso} → ${toIso} (Pacific calendar day ${date} with 1h slop)`);
+
+  let events: Awaited<ReturnType<typeof listMlbEvents>> = [];
+  try {
+    events = await listMlbEvents(fromIso, toIso, { bookmakers: opts.books });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : JSON.stringify(err);
+    console.error(`[snapshotOdds] listMlbEvents FAILED: ${msg}`);
+    throw err;
+  }
+  console.log(`[snapshotOdds] events listed: ${events.length}`);
+  if (events.length === 0) {
+    console.warn(
+      `[snapshotOdds] WARNING: 0 events in window. ` +
+        `If you expect games on ${date}, check (a) ODDS_API_KEY is valid and not rate-limited, ` +
+        `(b) PT/UTC window bounds, (c) The Odds API actually has MLB props for this date.`,
+    );
+  } else {
+    console.log(`[snapshotOdds] first 3 event ids: ${events.slice(0, 3).map((e) => `${e.id}(${e.away_team}@${e.home_team})`).join(', ')}`);
+  }
 
   // Load supporting indexes in parallel.
   const [lookup, heatIndex, gamesData] = await Promise.all([
@@ -322,24 +351,31 @@ export async function snapshotOdds(opts: SnapshotOddsOptions = {}): Promise<Snap
   const rows: RowToInsert[] = [];
   const nowIso = new Date().toISOString();
 
+  const unmatchedSamples: string[] = [];
+
   for (const evt of events) {
     let flat: FlatOddsRow[] = [];
     try {
       const evtOdds = await fetchEventHrOdds(evt.id, { bookmakers: opts.books });
       flat = flattenEventOdds(evtOdds);
       result.events_fetched++;
+      console.log(
+        `[snapshotOdds]  ✓ event ${evt.id} ${evt.away_team} @ ${evt.home_team} → ${flat.length} flat rows ` +
+          `from ${new Set(flat.map((f) => f.book)).size} book(s)`,
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : JSON.stringify(err);
       result.events_failed++;
       result.failures.push({ event_id: evt.id, error: msg });
-      console.warn(`[snapshotOdds] event ${evt.id} fetch FAILED: ${msg}`);
+      console.warn(`[snapshotOdds]  ✗ event ${evt.id} fetch FAILED: ${msg}`);
       continue;
     }
 
     const matchedGame = matchGameForOdds(evt.away_team, evt.home_team, gamesData);
     if (!matchedGame) {
       console.warn(
-        `[snapshotOdds] event ${evt.id} (${evt.away_team} @ ${evt.home_team}) had no matching game_pk in games for ${date} — skipping ${flat.length} odds rows`,
+        `[snapshotOdds]  ! event ${evt.id} (${evt.away_team} @ ${evt.home_team}) had no matching game_pk in games for ${date} — skipping ${flat.length} odds rows. ` +
+          `Check that enrich:schedule has populated games.away_team / home_team for this date.`,
       );
       continue;
     }
@@ -349,7 +385,10 @@ export async function snapshotOdds(opts: SnapshotOddsOptions = {}): Promise<Snap
     for (const f of flat) {
       const lookupHit = lookup.byNorm.get(normName(f.player_name)) ?? null;
       const playerId = lookupHit?.player_id ?? null;
-      if (!playerId) result.unmatched_players++;
+      if (!playerId) {
+        result.unmatched_players++;
+        if (unmatchedSamples.length < 8) unmatchedSamples.push(f.player_name);
+      }
 
       const heat = playerId != null ? heatIndex.get(playerId) : null;
       const heat_score = heat?.heat_score ?? null;
@@ -396,8 +435,14 @@ export async function snapshotOdds(opts: SnapshotOddsOptions = {}): Promise<Snap
 
   console.log(
     `[snapshotOdds] built ${result.rows_built} rows ` +
-      `(unmatched players=${result.unmatched_players}, failed events=${result.events_failed})`,
+      `(events fetched=${result.events_fetched}, failed=${result.events_failed}, ` +
+      `unmatched players=${result.unmatched_players})`,
   );
+  if (unmatchedSamples.length > 0) {
+    console.log(
+      `[snapshotOdds] sample unmatched player names (run enrich:players to add them): ${unmatchedSamples.join(', ')}`,
+    );
+  }
 
   if (dryRun) {
     console.log('[snapshotOdds] dry-run — skipping upsert. First 5 rows:');
@@ -435,6 +480,6 @@ export async function snapshotOdds(opts: SnapshotOddsOptions = {}): Promise<Snap
     result.rows_upserted += slice.length;
   }
 
-  console.log(`[snapshotOdds] DONE upserted=${result.rows_upserted}`);
+  console.log(`[snapshotOdds] === DONE === upserted=${result.rows_upserted}`);
   return result;
 }
