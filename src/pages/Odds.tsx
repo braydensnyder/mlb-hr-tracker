@@ -1,31 +1,29 @@
 /**
  * /odds — Phase 1 HR-prop odds tracker.
  *
- * What this page shows:
- *   - For each (player, book) on the target date, the morning / midday /
- *     pregame / current snapshots stitched together.
- *   - Player, Team, Opponent, Current odds, Morning odds, Δ (movement)
- *   - Heat Score, Confidence, Weather boost (if any)
- *   - Implied probability, Model probability, Edge (Model − Market)
+ * Day-over-day model (free-tier-friendly):
+ *   We only take ONE snapshot per day (morning) on the free tier of The Odds
+ *   API. Intra-day movement (morning → midday → pregame) can't be tracked
+ *   without 3× the credit burn. Instead we compare TODAY's morning snapshot
+ *   against YESTERDAY's morning snapshot for the same (player, book) and
+ *   show the day-over-day delta. That's a meaningful signal: it tells you
+ *   whether the market is sharpening or fading a player relative to their
+ *   prior-day price.
  *
- * What this page DOES NOT do (per user spec):
- *   - Influence the HR ranking model
- *   - Make betting recommendations
+ * Columns:
+ *   - Player / Team / Opp / Book
+ *   - Today (today's latest snapshot)
+ *   - Yesterday (latest snapshot from target_date - 1)
+ *   - Change (implied prob delta — green=shortened, red=drifted)
+ *   - Heat Score / Confidence / Implied / Model / Edge
  *
- * Visual rules:
- *   - Green delta  → odds shortened (e.g. +600 → +450); market is more confident
- *   - Red delta    → odds drifted (e.g. +500 → +650); market is less confident
- *   - Neutral gray → unchanged or no morning baseline yet
- *
- * Sorting (column headers click to toggle):
- *   - movement (default)
+ * Sorting:
+ *   - movement (biggest |day-over-day change|, default)
  *   - shortest odds
  *   - best Heat Score
  *   - best Edge
  *
- * Mobile: the table uses overflow-x scroll inside `.table-wrap` so the
- * full column set is reachable. The summary "Model vs Market" cards
- * stack vertically.
+ * Mobile: `.table-wrap` overflow handles narrow viewports.
  */
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
@@ -50,54 +48,60 @@ interface AggRow {
   opponent: string | null;
   book: string;
   game_pk: number;
-  morning: OddsSnapshotRow | null;
-  midday: OddsSnapshotRow | null;
-  pregame: OddsSnapshotRow | null;
-  /** The freshest snapshot for the row — used as "current odds". */
-  current: OddsSnapshotRow;
-  /** Movement = morning_american - current_american. Positive = shortened
-   *  if both are positive American; negative = drifted (we render with
-   *  a sign that matches what the user sees on a sportsbook). */
+  /** Today's latest snapshot for this (player, book) — always present. */
+  today: OddsSnapshotRow;
+  /** Yesterday's latest snapshot for the same (player, book). Null on day 1
+   *  or for players who weren't in yesterday's slate. */
+  yesterday: OddsSnapshotRow | null;
+  /** today.american - yesterday.american. Positive American value means
+   *  odds got LONGER (less likely per the book); negative means SHORTER.
+   *  American sign-flips around zero make this less intuitive than
+   *  delta_implied — prefer that one for sorting/coloring. */
   delta_american: number | null;
-  /** Implied probability delta (current - morning). Positive = market thinks
-   *  HR more likely now than at morning. Cleaner than American-delta for
-   *  cross-sign comparisons. */
+  /** today.implied_prob - yesterday.implied_prob. Positive = market shortened
+   *  (player more likely to homer per book); negative = drifted. */
   delta_implied: number | null;
 }
 
-function aggregateRows(rows: OddsSnapshotRow[]): AggRow[] {
-  // Group by (player_id, book).
-  const groups = new Map<string, OddsSnapshotRow[]>();
-  for (const r of rows) {
-    if (r.player_id == null) continue;        // Phase 1 ignores unmatched names
-    const k = `${r.player_id}-${r.book}`;
-    let arr = groups.get(k);
-    if (!arr) { arr = []; groups.set(k, arr); }
-    arr.push(r);
+/**
+ * Group today's + yesterday's odds rows by (player_id, book) and stitch
+ * them into a row that can show day-over-day movement. Yesterday-only
+ * rows (player not in today's slate) are dropped — we always anchor on
+ * a player who has a TODAY snapshot.
+ */
+function aggregateRows(
+  todayRows: OddsSnapshotRow[],
+  yesterdayRows: OddsSnapshotRow[],
+): AggRow[] {
+  // Helper: pick the LATEST row per (player_id, book) within a slice.
+  function latestByKey(rows: OddsSnapshotRow[]): Map<string, OddsSnapshotRow> {
+    const out = new Map<string, OddsSnapshotRow>();
+    const sorted = rows.slice().sort((a, b) => (a.snapshot_time < b.snapshot_time ? -1 : 1));
+    for (const r of sorted) {
+      if (r.player_id == null) continue;
+      out.set(`${r.player_id}-${r.book}`, r); // last write wins → latest
+    }
+    return out;
   }
 
-  const out: AggRow[] = [];
-  for (const [key, arr] of groups) {
-    // Sort by snapshot_time so `current` is freshest.
-    arr.sort((a, b) => (a.snapshot_time < b.snapshot_time ? -1 : 1));
-    const morning = arr.find((r) => r.snapshot_type === 'morning') ?? null;
-    const midday  = arr.find((r) => r.snapshot_type === 'midday')  ?? null;
-    const pregame = arr.find((r) => r.snapshot_type === 'pregame') ?? null;
-    const current = arr[arr.length - 1];
-    const delta_american =
-      morning != null ? current.american_odds - morning.american_odds : null;
-    const delta_implied =
-      morning != null ? current.implied_prob - morning.implied_prob : null;
+  const todayMap = latestByKey(todayRows);
+  const yesterdayMap = latestByKey(yesterdayRows);
 
+  const out: AggRow[] = [];
+  for (const [key, today] of todayMap) {
+    const yesterday = yesterdayMap.get(key) ?? null;
+    const delta_american = yesterday ? today.american_odds - yesterday.american_odds : null;
+    const delta_implied = yesterday ? today.implied_prob - yesterday.implied_prob : null;
     out.push({
       key,
-      player_id: current.player_id!,
-      player_name: current.player_name,
-      team: current.team,
-      opponent: current.opponent,
-      book: current.book,
-      game_pk: current.game_pk,
-      morning, midday, pregame, current,
+      player_id: today.player_id!,
+      player_name: today.player_name,
+      team: today.team,
+      opponent: today.opponent,
+      book: today.book,
+      game_pk: today.game_pk,
+      today,
+      yesterday,
       delta_american,
       delta_implied,
     });
@@ -113,9 +117,9 @@ function movementColor(deltaImplied: number | null): string | undefined {
   return undefined;
 }
 
-/** Human label for a delta. e.g. +0.022 → "Shortened (+2.2%)" */
+/** Human label for a day-over-day delta. e.g. +0.022 → "Shortened (+2.2%)" */
 function movementLabel(deltaImplied: number | null, deltaAmerican: number | null): string {
-  if (deltaImplied == null || deltaAmerican == null) return 'No morning line yet';
+  if (deltaImplied == null || deltaAmerican == null) return 'No prior-day line';
   if (Math.abs(deltaImplied) < 0.005) return 'Unchanged';
   const dir = deltaImplied > 0 ? 'Shortened' : 'Drifted';
   const sign = deltaImplied > 0 ? '+' : '';
@@ -128,6 +132,7 @@ export default function Odds() {
   const [book, setBook] = useState<string>(searchParams.get('book') ?? '');
   const [sortKey, setSortKey] = useState<SortKey>('movement');
   const [rows, setRows] = useState<OddsSnapshotRow[]>([]);
+  const [yesterdayRows, setYesterdayRows] = useState<OddsSnapshotRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const refreshKey = useRevalidationKey();
@@ -149,17 +154,28 @@ export default function Odds() {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    fetchOddsSnapshots(targetDate)
-      .then((r) => { if (!cancelled) setRows(r); })
+    // Fetch today + yesterday in parallel so we can compute day-over-day deltas.
+    const yesterday = addDays(targetDate, -1);
+    Promise.all([fetchOddsSnapshots(targetDate), fetchOddsSnapshots(yesterday)])
+      .then(([t, y]) => {
+        if (!cancelled) { setRows(t); setYesterdayRows(y); }
+      })
       .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [targetDate, refreshKey]);
 
   const allBooks = useMemo(() => Array.from(new Set(rows.map((r) => r.book))).sort(), [rows]);
-  const filteredRows = useMemo(() => (book ? rows.filter((r) => r.book === book) : rows), [rows, book]);
+  const filteredToday = useMemo(() => (book ? rows.filter((r) => r.book === book) : rows), [rows, book]);
+  const filteredYesterday = useMemo(
+    () => (book ? yesterdayRows.filter((r) => r.book === book) : yesterdayRows),
+    [yesterdayRows, book],
+  );
 
-  const agg = useMemo(() => aggregateRows(filteredRows), [filteredRows]);
+  const agg = useMemo(
+    () => aggregateRows(filteredToday, filteredYesterday),
+    [filteredToday, filteredYesterday],
+  );
 
   const sorted = useMemo(() => {
     const c = agg.slice();
@@ -171,14 +187,13 @@ export default function Odds() {
         return Math.abs(bi) - Math.abs(ai);
       });
     } else if (sortKey === 'shortestOdds') {
-      // Most "favored to homer" = lowest American-implied price.
-      // For HR props that's typically the smallest positive odds.
-      c.sort((a, b) => a.current.american_odds - b.current.american_odds);
+      // Most "favored to homer" = lowest American price.
+      c.sort((a, b) => a.today.american_odds - b.today.american_odds);
     } else if (sortKey === 'heat') {
-      c.sort((a, b) => (b.current.heat_score ?? -Infinity) - (a.current.heat_score ?? -Infinity));
+      c.sort((a, b) => (b.today.heat_score ?? -Infinity) - (a.today.heat_score ?? -Infinity));
     } else {
       // edge
-      c.sort((a, b) => (b.current.edge ?? -Infinity) - (a.current.edge ?? -Infinity));
+      c.sort((a, b) => (b.today.edge ?? -Infinity) - (a.today.edge ?? -Infinity));
     }
     return c;
   }, [agg, sortKey]);
@@ -193,7 +208,7 @@ export default function Odds() {
       if (d > 0.005) shortened++;
       else if (d < -0.005) drifted++;
       else unchanged++;
-      const e = r.current.edge;
+      const e = r.today.edge;
       if (e == null) continue;
       if (e > 0) edgePos++;
       else if (e < 0) edgeNeg++;
@@ -241,8 +256,9 @@ export default function Odds() {
         </div>
         <div className="subtle" style={{ fontSize: 12, marginTop: 6, lineHeight: 1.4 }}>
           Cadence: one <strong>morning</strong> snapshot per day (PT 7–11) to fit inside The Odds
-          API free-tier quota. Midday / pregame columns will stay empty until a paid tier is wired —
-          edit <code>scripts/lib/oddsCron.ts</code> to enable them.
+          API free-tier quota. Movement is tracked <strong>day-over-day</strong> instead of intra-day —
+          we compare today's morning line to yesterday's morning line for the same (player, book).
+          Edit <code>scripts/lib/oddsCron.ts</code> to enable intra-day snapshots on a paid tier.
         </div>
       </div>
 
@@ -279,11 +295,9 @@ export default function Odds() {
                   <th>Team</th>
                   <th>Opp</th>
                   <th>Book</th>
-                  <th className="num">Morning</th>
-                  <th className="num">Midday</th>
-                  <th className="num">Pregame</th>
-                  <th className="num">Current</th>
-                  <th>Movement</th>
+                  <th className="num">Today</th>
+                  <th className="num">Yesterday</th>
+                  <th>Change (day-over-day)</th>
                   <th className="num">Heat</th>
                   <th className="num">Conf</th>
                   <th className="num">Implied</th>
@@ -302,19 +316,17 @@ export default function Odds() {
                     <td><span className="pill">{r.team ?? '—'}</span></td>
                     <td className="subtle" style={{ fontSize: 12 }}>vs {r.opponent ?? '—'}</td>
                     <td className="subtle" style={{ fontSize: 12 }}>{r.book}</td>
-                    <td className="num">{r.morning ? formatAmerican(r.morning.american_odds) : '—'}</td>
-                    <td className="num">{r.midday ? formatAmerican(r.midday.american_odds) : '—'}</td>
-                    <td className="num">{r.pregame ? formatAmerican(r.pregame.american_odds) : '—'}</td>
-                    <td className="num"><strong>{formatAmerican(r.current.american_odds)}</strong></td>
+                    <td className="num"><strong>{formatAmerican(r.today.american_odds)}</strong></td>
+                    <td className="num">{r.yesterday ? formatAmerican(r.yesterday.american_odds) : '—'}</td>
                     <td style={{ color: movementColor(r.delta_implied), fontSize: 12, whiteSpace: 'nowrap' }}>
                       {movementLabel(r.delta_implied, r.delta_american)}
                     </td>
-                    <td className="num">{r.current.heat_score != null ? r.current.heat_score.toFixed(1) : '—'}</td>
-                    <td className="num">{r.current.confidence ?? '—'}</td>
-                    <td className="num">{formatPct(r.current.implied_prob)}</td>
-                    <td className="num">{formatPct(r.current.model_prob)}</td>
-                    <td className="num" style={{ color: (r.current.edge ?? 0) > 0 ? 'var(--good, #4cd97a)' : (r.current.edge ?? 0) < 0 ? '#ff8d8d' : undefined }}>
-                      {formatEdge(r.current.edge)}
+                    <td className="num">{r.today.heat_score != null ? r.today.heat_score.toFixed(1) : '—'}</td>
+                    <td className="num">{r.today.confidence ?? '—'}</td>
+                    <td className="num">{formatPct(r.today.implied_prob)}</td>
+                    <td className="num">{formatPct(r.today.model_prob)}</td>
+                    <td className="num" style={{ color: (r.today.edge ?? 0) > 0 ? 'var(--good, #4cd97a)' : (r.today.edge ?? 0) < 0 ? '#ff8d8d' : undefined }}>
+                      {formatEdge(r.today.edge)}
                     </td>
                   </tr>
                 ))}
@@ -323,8 +335,9 @@ export default function Odds() {
           </div>
 
           <div className="subtle" style={{ marginTop: 8, fontSize: 11, lineHeight: 1.5 }}>
-            Movement compares <strong>current</strong> against the <strong>morning</strong> snapshot's
-            implied probability. Green = market shortened (more confident); red = drifted (less confident).
+            Change compares today's morning snapshot against yesterday's morning snapshot's
+            implied probability for the same (player, book). <strong style={{ color: 'var(--good, #4cd97a)' }}>Green</strong> = market shortened the player day-over-day (more confident);{' '}
+            <strong style={{ color: '#ff8d8d' }}>red</strong> = drifted (less confident); <em>"No prior-day line"</em> means the player wasn't on yesterday's slate or wasn't snapshotted yet.
             Edge column = our model_prob (sigmoid of Heat Score) − the book's implied_prob;{' '}
             <strong>positive ≠ a bet recommendation</strong>, it just means the model disagrees with the market.
           </div>
