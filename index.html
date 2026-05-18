@@ -5,6 +5,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="HR Tracker - daily MLB home run tracking and rolling stats" />
     <title>HR Tracker</title>
+
+    <!-- Brand color (matches the orange in the logo + the --accent CSS var). -->
+    <meta name="theme-color" content="#ff7a18" />
+
+    <!-- Browser tab icon. We point .ico at a .png — modern browsers handle it.
+         If you want true multi-resolution favicon support later, generate a
+         .ico from the source via realfavicongenerator.net and replace this. -->
+    <link rel="icon" type="image/png" href="/hr-tracker-logo.png" />
+
+    <!-- iOS "Add to Home Screen" icon — must be a PNG, not a manifest reference. -->
+    <link rel="apple-touch-icon" href="/hr-tracker-logo.png" />
+
+    <!-- Progressive Web App manifest — drives icon + label on Android home
+         screen and on the desktop browser install prompt. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
   </head>
   <body>
     <div id="root"></div>

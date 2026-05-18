@@ -11,8 +11,20 @@ export default function App() {
   return (
     <div className="container">
       <header className="header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-        <Link to="/" className="brand" style={{ color: 'inherit' }}>
-          HR <span className="accent">Tracker</span>
+        {/* Logo image already contains the 'HR TRACKER' wordmark, so we
+            don't render text alongside it. Image lives in /public so Vite
+            serves it from the site root. alt= keeps it accessible. */}
+        <Link to="/" className="brand" style={{ color: 'inherit', display: 'inline-flex', alignItems: 'center' }} aria-label="HR Tracker — home">
+          <img
+            src="/hr-tracker-logo.png"
+            alt="HR Tracker"
+            style={{
+              height: 44,
+              width: 'auto',
+              display: 'block',
+              borderRadius: 8,
+            }}
+          />
         </Link>
         {/* Single branded menu — replaces inline nav links on both
             desktop and mobile (no separate hamburger). */}
