@@ -2975,3 +2975,178 @@ export function consensusScore(
   const confFactor = confidence === 'high' ? 1.0 : confidence === 'low' ? 0.9 : 0.95;
   return ((modelProb + impliedProb) / 2) * confFactor;
 }
+
+// =====================================================================
+// Certified Sleeper / Smart Money board (task #177)
+// =====================================================================
+//
+// A CURATED subsection of the Sleeper layer — the "serious sleeper card"
+// area. Far stricter than the chaos/longshot lists: only confirmed
+// starters with medium+ confidence and STACKED positive signals (≥2,
+// with ≥1 strong) survive, and players in bad matchup/weather spots are
+// rejected. Prefers odds value but doesn't require it.
+//
+// This never feeds back into Heat Score. It's a filter + presentation
+// layer on top of the existing model output.
+
+/** Local sigmoid (mirrors oddsMath.heatScoreToModelProb) so this module
+ *  stays self-contained and doesn't cross-import. Keep in sync. */
+function heatToModelProbLocal(heat: number | null | undefined): number {
+  if (heat == null || !Number.isFinite(heat)) return 0.005;
+  const floor = 0.005, ceiling = 0.30, midpoint = 55, slope = 10;
+  const s = 1 / (1 + Math.exp(-((heat - midpoint) / slope)));
+  return floor + (ceiling - floor) * s;
+}
+
+export type CertifiedMarketSignal = 'model_loves' | 'books_love' | 'consensus' | 'quiet_value';
+
+export interface CertifiedSleeper {
+  player_id: number;
+  player_name: string;
+  team: string;
+  opponent: string;
+  heat_score: number;
+  heat_rank: number;
+  confidence: 'high' | 'medium' | 'low';
+  upside_score: number;
+  /** Why it qualified — Wind Out, HR Pitcher, Odds Value, etc. */
+  tags: ReasonChip[];
+  /** Market-vs-model read for the badge. */
+  market_signal: CertifiedMarketSignal;
+  /** One-line plain-English summary for the card. */
+  explanation: string;
+  implied_prob: number | null;
+  american_odds: number | null;
+  model_prob: number | null;
+}
+
+export function computeCertifiedSleepers(
+  ranked: HrTarget[],
+  oddsByPlayer: Map<number, SleeperOddsLite>,
+  opts: { max?: number } = {},
+): CertifiedSleeper[] {
+  const max = opts.max ?? 6;
+  const sorted = ranked.slice().sort((a, b) => b.heat_score - a.heat_score);
+
+  const out: { weight: number; pick: CertifiedSleeper }[] = [];
+
+  for (let i = 0; i < sorted.length; i++) {
+    const t = sorted[i];
+    const rank = i + 1;
+
+    // ---- HARD GATES ----
+    // 1. Must be a confirmed starter (no pending/not-starting/postponed).
+    if (t.lineup_status !== 'confirmed') continue;
+    // 2. Medium or high confidence only.
+    if (t.confidence === 'low') continue;
+
+    const odds = oddsByPlayer.get(t.player_id) ?? null;
+    const tags: ReasonChip[] = [];
+    let upside = 0;
+    let strongSignals = 0;
+
+    // ---- DISQUALIFIERS (bad matchup / weather) ----
+    const windDir = (t.weather_wind_dir ?? '').toLowerCase();
+    const windMph = t.weather_wind_mph ?? 0;
+    const strongWindIn = windMph >= 10 && (windDir.includes('in from') || /\bin\b/.test(windDir));
+    if (strongWindIn) continue; // wind blowing in hard — reject
+    const dominantPitcher =
+      t.pitcher_k_per_9 != null && t.pitcher_starts_known >= 3 &&
+      t.pitcher_k_per_9 >= 11 && t.pitcher_l5_starts_allowed <= 1;
+    if (dominantPitcher) continue; // ace shutting down HRs — reject
+    // Volatile cold-elite belongs in Boom/Bust, not the "trustworthy" board.
+    if (t.is_elite_power && t.hrs_l7d === 0) continue;
+
+    // ---- POSITIVE SIGNALS (stacking) ----
+    const windOut = windMph >= 10 && windDir.includes('out');
+    if (windOut) { upside += 16; strongSignals++; tags.push({ kind: 'wind_out', label: 'Wind Out', tone: 'good', detail: `${windMph}mph ${t.weather_wind_dir}` }); }
+    if ((t.weather_temp_f ?? 0) >= 85) { upside += 5; tags.push({ kind: 'warm', label: 'Warm Weather', tone: 'good', detail: `${t.weather_temp_f}°F` }); }
+
+    const hrPitcher = t.pitcher_l14d_allowed >= 3 || (t.pitcher_starts_known >= 3 && t.pitcher_l5_starts_allowed >= 4);
+    if (hrPitcher) { upside += 20; strongSignals++; tags.push({ kind: 'hr_pitcher', label: 'HR Pitcher', tone: 'good', detail: `Allowed ${Math.max(t.pitcher_l14d_allowed, t.pitcher_l5_starts_allowed)} HR recently` }); }
+
+    if (t.pitcher_hand === 'L' || t.pitcher_hand === 'R') {
+      const oppHand = t.batter_side && t.batter_side !== t.pitcher_hand;
+      const vsHand = t.pitcher_hand === 'L' ? t.vs_lhp_season : t.vs_rhp_season;
+      if (oppHand && vsHand >= 3) { upside += 12; tags.push({ kind: 'platoon', label: 'Platoon Edge', tone: 'good', detail: `${t.batter_side}HB vs ${t.pitcher_hand}HP, ${vsHand} HR vs hand` }); }
+    }
+    if (t.venue_l14d_rank != null && t.venue_l14d_rank <= 5) { upside += 8; tags.push({ kind: 'power_park', label: 'Power Park', tone: 'good', detail: `Top ${t.venue_l14d_rank} venue L14d` }); }
+    if (t.season_hr <= 8 && t.hrs_l7d >= 2) { upside += 12; tags.push({ kind: 'hot_contact', label: 'Hot Contact', tone: 'good', detail: `${t.hrs_l7d} HR L7d on ${t.season_hr} season` }); }
+    if (t.hrs_l7d >= 2 && t.season_hr >= 12) { upside += 10; strongSignals++; tags.push({ kind: 'hot7', label: 'Hot last 7d', tone: 'good', detail: `${t.hrs_l7d} HR L7d` }); }
+
+    // ---- ODDS-DERIVED SIGNALS ----
+    const model_prob = heatToModelProbLocal(t.heat_score);
+    let market_signal: CertifiedMarketSignal = 'quiet_value';
+    if (odds) {
+      const ip = odds.implied_prob;
+      const edge = model_prob - ip;
+      if (ip >= 0.10 && ip <= 0.17) { upside += 10; tags.push({ kind: 'odds_value', label: 'Odds Value', tone: 'good', detail: `${odds.american_odds > 0 ? '+' : ''}${odds.american_odds} (${(ip * 100).toFixed(0)}% implied)` }); }
+      if (edge >= 0.06) { upside += 14; strongSignals++; tags.push({ kind: 'strong_ev', label: 'Strong EV', tone: 'good', detail: `Model ${(model_prob * 100).toFixed(0)}% vs book ${(ip * 100).toFixed(0)}%` }); market_signal = 'model_loves'; }
+      else if (edge <= -0.06) market_signal = 'books_love';
+      else market_signal = 'consensus';
+      // Market-disagreement chip when model & books diverge.
+      if (market_signal === 'model_loves') tags.push({ kind: 'market_disagree', label: 'Market Disagreement', tone: 'good', detail: 'Model materially higher than the book price' });
+    }
+
+    // ---- CERTIFICATION RULES ----
+    // ≥2 distinct positive signals AND ≥1 strong signal (no single weak factor).
+    if (tags.length < 2) continue;
+    if (strongSignals < 1) continue;
+
+    // Composite ranking weight — confidence + odds edge + upside.
+    const confBonus = t.confidence === 'high' ? 10 : 5;
+    const evBonus = market_signal === 'model_loves' ? 12 : 0;
+    const weight = upside + confBonus + evBonus;
+
+    out.push({
+      weight,
+      pick: {
+        player_id: t.player_id,
+        player_name: t.player_name,
+        team: t.team,
+        opponent: t.opponent,
+        heat_score: t.heat_score,
+        heat_rank: rank,
+        confidence: t.confidence,
+        upside_score: Math.min(100, Math.round(upside)),
+        tags: tags.slice(0, 5),
+        market_signal,
+        explanation: buildCertifiedExplanation(tags, t.confidence, market_signal),
+        implied_prob: odds?.implied_prob ?? null,
+        american_odds: odds?.american_odds ?? null,
+        model_prob,
+      },
+    });
+  }
+
+  out.sort((a, b) => b.weight - a.weight);
+  return out.slice(0, max).map((x) => x.pick);
+}
+
+/** Plain-English one-liner for a certified card. */
+function buildCertifiedExplanation(
+  tags: ReasonChip[],
+  confidence: 'high' | 'medium' | 'low',
+  market: CertifiedMarketSignal,
+): string {
+  const n = tags.length;
+  const hasOdds = tags.some((t) => t.kind === 'odds_value' || t.kind === 'strong_ev');
+  const oddsPhrase = market === 'model_loves'
+    ? 'plus a model edge over the book price'
+    : hasOdds
+    ? 'with some odds value'
+    : market === 'quiet_value'
+    ? 'with the market quiet (no posted line)'
+    : 'priced in line with the market';
+  return `${n} favorable signal${n === 1 ? '' : 's'} stacked on a confirmed lineup, ${confidence} confidence, ${oddsPhrase}.`;
+}
+
+/** Badge label + tone for a certified pick's market signal. */
+export function certifiedMarketLabel(s: CertifiedMarketSignal): { label: string; tone: 'good' | 'bad' | 'neutral' } {
+  switch (s) {
+    case 'model_loves': return { label: 'MODEL LOVES / BOOKS LOW', tone: 'good' };
+    case 'books_love':  return { label: 'BOOKS LOVE / MODEL LOW', tone: 'bad' };
+    case 'consensus':   return { label: 'Consensus Pick', tone: 'neutral' };
+    case 'quiet_value': return { label: 'Quiet Value', tone: 'neutral' };
+  }
+}

@@ -23,11 +23,13 @@ import { useRevalidationKey } from '../lib/useRevalidationKey';
 import WeatherLine from '../components/WeatherLine';
 import ReasonChips, { ReasonChipDetails } from '../components/ReasonChips';
 import SleeperBoardPanel from '../components/SleeperBoard';
+import CertifiedSleeperBoard from '../components/CertifiedSleeperBoard';
 import {
   addDays,
   applyCanonicalTeams,
   computeHrTargets,
   computeSleepers,
+  computeCertifiedSleepers,
   pitcherHrLeaderboard,
   venueLeaderboard,
   ELITE_POWER_NAMES,
@@ -395,6 +397,15 @@ export default function HrTargets() {
     [allRanked, oddsByPlayer],
   );
 
+  // ---- Certified Sleeper / Smart Money board (task #177) ----
+  // Strict-filtered curated value: confirmed starters + stacked signals.
+  // Built from the full eligible pool (allRanked already excludes
+  // not-starting/postponed). Separate from the chaos sleeper lists above.
+  const certifiedSleepers = useMemo(
+    () => computeCertifiedSleepers(allRanked, oddsByPlayer, { max: 6 }),
+    [allRanked, oddsByPlayer],
+  );
+
   // Model-disagreement warning: surface elite-power hitters who SHOULD be
   // near the top of betting interest but our model ranked low. Threshold:
   // any elite player whose final rank is worse than 30 across all boards.
@@ -585,6 +596,13 @@ export default function HrTargets() {
           </div>
           <CompareTable savedSnapshot={savedSnapshot} liveTop={allRanked.slice(0, 20)} asOf={asOf} />
         </div>
+      )}
+
+      {/* Certified Sleepers / Smart Money — curated value board + bankroll
+          goal tracker. Rendered above the chaos sleeper lists since it's
+          the higher-confidence "serious" board. */}
+      {allRanked.length > 0 && (
+        <CertifiedSleeperBoard picks={certifiedSleepers} asOf={asOf} />
       )}
 
       {/* Sleeper / Chaos discovery layer — separate from core rankings.
