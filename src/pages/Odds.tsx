@@ -35,6 +35,12 @@ import {
   formatPct,
   formatEdge,
 } from '../lib/oddsMath';
+import {
+  consensusScore,
+  classifyMarketDisagreement,
+  marketDisagreementLabel,
+  type MarketDisagreement,
+} from '../lib/stats';
 
 const todayISO = mlbToday;
 
@@ -198,6 +204,31 @@ export default function Odds() {
     return c;
   }, [agg, sortKey]);
 
+  // ---- Consensus Picks ⭐ — blend of model + market, ranked separately.
+  //      Top picks where BOTH the model and the books like the player.
+  //      Only rows that have a model_prob (heat-derived) AND implied_prob. ----
+  const consensusPicks = useMemo(() => {
+    const scored = agg
+      .map((r) => ({
+        row: r,
+        score: consensusScore(r.today.model_prob, r.today.implied_prob, r.today.confidence),
+        disagreement: classifyMarketDisagreement(r.today.model_prob, r.today.implied_prob),
+      }))
+      .filter((x) => x.score > 0);
+    scored.sort((a, b) => b.score - a.score);
+    // De-dup by player (a player can be listed at multiple books) — keep the
+    // single highest-consensus book entry per player.
+    const seen = new Set<number>();
+    const out: typeof scored = [];
+    for (const x of scored) {
+      if (seen.has(x.row.player_id)) continue;
+      seen.add(x.row.player_id);
+      out.push(x);
+      if (out.length >= 10) break;
+    }
+    return out;
+  }, [agg]);
+
   // Summary tiles
   const totals = useMemo(() => {
     let shortened = 0, drifted = 0, unchanged = 0;
@@ -278,6 +309,65 @@ export default function Odds() {
         </div>
       )}
 
+      {/* ---- Consensus Picks ⭐ — model + market agreement ranking ---- */}
+      {!loading && consensusPicks.length > 0 && (
+        <div className="panel" style={{ marginBottom: 16, borderColor: 'var(--accent)' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 8, marginBottom: 4 }}>
+            <h2 style={{ margin: 0, fontSize: 16 }}>Consensus Picks ⭐</h2>
+            <span className="subtle" style={{ fontSize: 12 }}>
+              most likely HRs per BOTH the model and the books
+            </span>
+          </div>
+          <div className="subtle" style={{ fontSize: 12, marginBottom: 10, lineHeight: 1.5 }}>
+            Blends our model probability (Heat Score → sigmoid) with the book's implied
+            probability, lightly scaled by confidence. <strong>Sportsbook odds do NOT touch the
+            Heat Score</strong> — this is a separate ranking. High consensus = both signals agree
+            the player is likely to homer.
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Player</th>
+                  <th>Team</th>
+                  <th className="num">Consensus</th>
+                  <th className="num">Model</th>
+                  <th className="num">Implied</th>
+                  <th className="num">Heat</th>
+                  <th>Read</th>
+                </tr>
+              </thead>
+              <tbody>
+                {consensusPicks.map((x, i) => (
+                  <tr key={x.row.key}>
+                    <td className="num">{i + 1}</td>
+                    <td>
+                      <Link className="player-link" to={`/player/${x.row.player_id}?asOf=${targetDate}`}>
+                        {x.row.player_name}
+                      </Link>
+                    </td>
+                    <td><span className="pill">{x.row.team ?? '—'}</span></td>
+                    <td className="num"><strong>{formatPct(x.score)}</strong></td>
+                    <td className="num">{formatPct(x.row.today.model_prob)}</td>
+                    <td className="num">{formatPct(x.row.today.implied_prob)}</td>
+                    <td className="num">{x.row.today.heat_score != null ? x.row.today.heat_score.toFixed(1) : '—'}</td>
+                    <td><DisagreementBadge d={x.disagreement} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="subtle" style={{ marginTop: 8, fontSize: 11, lineHeight: 1.5 }}>
+            Read column: <strong style={{ color: 'var(--good, #4cd97a)' }}>MODEL LOVES / BOOKS LOW</strong> =
+            potential value/sleeper (model higher than the price);{' '}
+            <strong style={{ color: '#ff8d8d' }}>BOOKS LOVE / MODEL LOW</strong> = potential
+            overpriced favorite (book higher than the model); <em>Consensus</em> = both aligned.
+            Research only — not a betting recommendation.
+          </div>
+        </div>
+      )}
+
       {!loading && agg.length > 0 && (
         <div className="panel" style={{ marginBottom: 16 }}>
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
@@ -303,6 +393,7 @@ export default function Odds() {
                   <th className="num">Implied</th>
                   <th className="num">Model</th>
                   <th className="num">Edge</th>
+                  <th>Read</th>
                 </tr>
               </thead>
               <tbody>
@@ -327,6 +418,9 @@ export default function Odds() {
                     <td className="num">{formatPct(r.today.model_prob)}</td>
                     <td className="num" style={{ color: (r.today.edge ?? 0) > 0 ? 'var(--good, #4cd97a)' : (r.today.edge ?? 0) < 0 ? '#ff8d8d' : undefined }}>
                       {formatEdge(r.today.edge)}
+                    </td>
+                    <td>
+                      <DisagreementBadge d={classifyMarketDisagreement(r.today.model_prob, r.today.implied_prob)} compact />
                     </td>
                   </tr>
                 ))}
@@ -353,6 +447,35 @@ function Kpi({ label, value }: { label: string; value: number | string }) {
       <span className="label">{label}</span>
       <span className="value">{value}</span>
     </div>
+  );
+}
+
+function DisagreementBadge({ d, compact }: { d: MarketDisagreement; compact?: boolean }) {
+  const { label, tone } = marketDisagreementLabel(d);
+  if (d === 'consensus' && compact) {
+    // Keep the main table tidy — show a quiet dash for aligned rows.
+    return <span className="subtle" style={{ fontSize: 11 }}>—</span>;
+  }
+  const bg = tone === 'good' ? 'rgba(64,200,120,0.14)' : tone === 'bad' ? 'rgba(255,110,110,0.14)' : 'rgba(160,160,160,0.14)';
+  const border = tone === 'good' ? '1px solid rgba(64,200,120,0.5)' : tone === 'bad' ? '1px solid rgba(255,110,110,0.5)' : '1px solid rgba(160,160,160,0.4)';
+  const color = tone === 'good' ? 'var(--good, #4cd97a)' : tone === 'bad' ? '#ff8d8d' : 'var(--muted, #aaa)';
+  return (
+    <span
+      style={{
+        display: 'inline-block',
+        padding: '2px 7px',
+        borderRadius: 999,
+        fontSize: 10,
+        fontWeight: 700,
+        whiteSpace: 'nowrap',
+        background: bg,
+        border,
+        color,
+        letterSpacing: 0.3,
+      }}
+    >
+      {label}
+    </span>
   );
 }
 

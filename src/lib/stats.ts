@@ -835,8 +835,26 @@ export const HEAT_SCORE_LOW_POWER_CAP = {
   season_hr_max: 5,
   /** Calendar-7d HRs at or above this exempt the player from the cap. */
   l7d_exemption: 2,
-  /** Maximum heat score for capped players. */
-  cap: 30,
+  /** Maximum heat score for capped players.
+   *  TUNING 2026-05-18: raised 30 → 34 (softer). Miss Pattern Analysis
+   *  showed "Low season power" in ~54% of misses, so the cap was slightly
+   *  too aggressive — low-power hitters with a real matchup edge were
+   *  getting buried below the Top 50. A 4-point lift lets them surface a
+   *  bit higher without a model rewrite. Revert to 30 if Top-10 stability
+   *  degrades. */
+  cap: 34,
+} as const;
+
+/** Cold-streak penalties — tunable so before/after softening is auditable.
+ *  TUNING 2026-05-18: softened elite -10 → -8 and mid -5 → -4 after Miss
+ *  Pattern Analysis flagged "Cold batter" in ~58% of misses. Penalties are
+ *  kept (not removed) — just less punishing. Revert to {-10,-5} if cold
+ *  power hitters start crowding the Top 10 with empty results. */
+export const HEAT_SCORE_COLD_PENALTY = {
+  /** Applied when a quiet hitter has season_hr ≥ auto_elite_hr. */
+  elite: -8,
+  /** Applied when a quiet hitter has season_hr ≥ 8 (but below elite). */
+  mid: -4,
 } as const;
 
 export function stabilityFactor(season_hr: number, isElitePower = false): number {
@@ -1823,7 +1841,7 @@ export function computeHrTargets(
       //     a recent calendar HR doesn't trigger it.
       const isQuiet = hrs_l5 === 0 && hrs_l7d === 0;
       if (isQuiet && season_hr >= HEAT_SCORE_STABILITY.auto_elite_hr) {
-        const penalty = -10;
+        const penalty = HEAT_SCORE_COLD_PENALTY.elite;
         heat += penalty;
         cold_penalty += penalty;
         adjustments.push({
@@ -1831,7 +1849,7 @@ export function computeHrTargets(
           delta: penalty,
         });
       } else if (isQuiet && season_hr >= 8) {
-        const penalty = -5;
+        const penalty = HEAT_SCORE_COLD_PENALTY.mid;
         heat += penalty;
         cold_penalty += penalty;
         adjustments.push({
@@ -2823,4 +2841,61 @@ export function computeSleepers(
     longshots: byCat('longshot'),
     weatherPlays: byCat('weather'),
   };
+}
+
+// =====================================================================
+// Consensus Picks + Market Disagreement (controlled-tuning request)
+// =====================================================================
+//
+// We DO NOT merge sportsbook odds into the Heat Score. Instead, Consensus
+// is a SEPARATE ranking that blends the two independent signals:
+//   - model_prob   (sigmoid of Heat Score — what our model thinks)
+//   - implied_prob (the book's price — what the market thinks)
+//   - confidence   (our data-completeness tier — a light multiplier)
+//
+// A high consensus score means BOTH the model and the books like the
+// player. Disagreement labels flag where they diverge — the value /
+// sleeper / overpriced-favorite signals.
+
+export type MarketDisagreement = 'consensus' | 'model_loves' | 'books_love';
+
+/** Classify model-vs-market divergence. `model_loves` = model thinks the
+ *  player is materially MORE likely to homer than the book's price implies
+ *  (a potential value/sleeper). `books_love` = the book prices the player
+ *  much higher than the model (a potential overpriced favorite). */
+export function classifyMarketDisagreement(
+  modelProb: number | null | undefined,
+  impliedProb: number | null | undefined,
+  opts: { threshold?: number } = {},
+): MarketDisagreement {
+  const th = opts.threshold ?? 0.06; // 6 percentage points
+  if (modelProb == null || impliedProb == null) return 'consensus';
+  const edge = modelProb - impliedProb;
+  if (edge >= th) return 'model_loves';
+  if (edge <= -th) return 'books_love';
+  return 'consensus';
+}
+
+/** Human label + tone for a disagreement state. */
+export function marketDisagreementLabel(d: MarketDisagreement): { label: string; tone: 'good' | 'bad' | 'neutral' } {
+  switch (d) {
+    case 'model_loves': return { label: 'MODEL LOVES / BOOKS LOW', tone: 'good' };
+    case 'books_love':  return { label: 'BOOKS LOVE / MODEL LOW', tone: 'bad' };
+    default:            return { label: 'Consensus', tone: 'neutral' };
+  }
+}
+
+/**
+ * Blended consensus probability (0..1). Average of the model and market
+ * probabilities, lightly scaled by confidence so thin-data rows don't
+ * top the list on a fluky model number. NOT fed back into Heat Score.
+ */
+export function consensusScore(
+  modelProb: number | null | undefined,
+  impliedProb: number | null | undefined,
+  confidence: 'high' | 'medium' | 'low' | null | undefined,
+): number {
+  if (modelProb == null || impliedProb == null) return 0;
+  const confFactor = confidence === 'high' ? 1.0 : confidence === 'low' ? 0.9 : 0.95;
+  return ((modelProb + impliedProb) / 2) * confFactor;
 }
