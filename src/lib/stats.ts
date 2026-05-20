@@ -2556,3 +2556,271 @@ export function computeMissChips(missRow: MissRow, ctx: MissChipContext): MissCh
   }
   return out;
 }
+
+// =====================================================================
+// Task #174 (A) — Miss Pattern Analysis (aggregate / learning layer)
+// =====================================================================
+//
+// Feeds on the per-miss chips computed by computeMissChips across MANY
+// days. Answers: "which traits recur among the HR hitters the model
+// ranks outside the Top 50?" High-frequency chips = patterns the current
+// Heat Score systematically undervalues. This is a LEARNING tool — it
+// does not change scoring.
+
+export interface MissPatternRow {
+  kind: string;
+  label: string;
+  tone: 'good' | 'bad' | 'neutral';
+  /** How many misses carried this chip. */
+  count: number;
+  /** count / total_misses, 0..1. */
+  frequency: number;
+}
+
+export interface MissPatternSummary {
+  /** Total distinct (player, date) misses analyzed. */
+  total_misses: number;
+  /** Days covered. */
+  days_covered: number;
+  /** Chip-frequency rows, sorted by count desc. Only 'good'-toned chips
+   *  are "model undervalued real edge" — those are the actionable ones,
+   *  but we surface all tones so the user sees the full distribution. */
+  patterns: MissPatternRow[];
+  /** Players who were missed on MULTIPLE days — the strongest signal that
+   *  the model has a blind spot for a specific profile. */
+  repeat_offenders: { player_id: number; player_name: string; miss_days: number }[];
+}
+
+/** One day's worth of miss data fed into the aggregator. */
+export interface DailyMissInput {
+  date: string;
+  misses: { player_id: number; player_name: string; chips: MissChip[] }[];
+}
+
+export function computeMissPatterns(days: DailyMissInput[]): MissPatternSummary {
+  const chipCounts = new Map<string, { label: string; tone: 'good' | 'bad' | 'neutral'; count: number }>();
+  const missDaysByPlayer = new Map<number, { name: string; days: Set<string> }>();
+  let totalMisses = 0;
+
+  for (const day of days) {
+    for (const m of day.misses) {
+      totalMisses++;
+      // Track repeat offenders.
+      let rec = missDaysByPlayer.get(m.player_id);
+      if (!rec) { rec = { name: m.player_name, days: new Set() }; missDaysByPlayer.set(m.player_id, rec); }
+      rec.days.add(day.date);
+      // Count each chip once per miss.
+      const seenKinds = new Set<string>();
+      for (const c of m.chips) {
+        if (seenKinds.has(c.kind)) continue;
+        seenKinds.add(c.kind);
+        const cur = chipCounts.get(c.kind) ?? { label: c.label, tone: c.tone, count: 0 };
+        cur.count += 1;
+        // Keep a representative label (labels can vary, e.g. "Buried #80");
+        // prefer the shortest stable label for the kind.
+        if (c.label.length < cur.label.length) cur.label = c.label;
+        cur.tone = c.tone;
+        chipCounts.set(c.kind, cur);
+      }
+    }
+  }
+
+  const patterns: MissPatternRow[] = Array.from(chipCounts.entries())
+    .map(([kind, v]) => ({
+      kind,
+      label: v.label,
+      tone: v.tone,
+      count: v.count,
+      frequency: totalMisses > 0 ? v.count / totalMisses : 0,
+    }))
+    .sort((a, b) => b.count - a.count);
+
+  const repeat_offenders = Array.from(missDaysByPlayer.entries())
+    .map(([player_id, v]) => ({ player_id, player_name: v.name, miss_days: v.days.size }))
+    .filter((r) => r.miss_days >= 2)
+    .sort((a, b) => b.miss_days - a.miss_days)
+    .slice(0, 15);
+
+  return {
+    total_misses: totalMisses,
+    days_covered: days.length,
+    patterns,
+    repeat_offenders,
+  };
+}
+
+// =====================================================================
+// Task #174 (B) — Sleeper / Chaos / Boom-Bust discovery layer
+// =====================================================================
+//
+// FORWARD-looking. Surfaces players OUTSIDE the core Top N whose profile
+// carries volatility/upside the Heat Score underweights. Strictly
+// separate from the main rankings — the core stays stable; this is a
+// "go fishing here" layer. No scoring weights change.
+
+export type SleeperCategory = 'sleeper' | 'boom_bust' | 'longshot' | 'weather';
+
+export interface SleeperCandidate {
+  player_id: number;
+  player_name: string;
+  team: string;
+  opponent: string;
+  /** Heat Score from the main model (unchanged). */
+  heat_score: number;
+  /** 1-based rank in the main board (so the user sees how buried they are). */
+  heat_rank: number;
+  category: SleeperCategory;
+  /** 0..100 upside metric — rewards the volatility signals the Heat Score
+   *  underweights. Distinct from heat_score; never feeds back into it. */
+  upside_score: number;
+  /** Why they surfaced. */
+  tags: ReasonChip[];
+  /** Book implied probability if odds were available, else null. */
+  implied_prob: number | null;
+  american_odds: number | null;
+}
+
+export interface SleeperBoard {
+  sleepers: SleeperCandidate[];
+  boomBust: SleeperCandidate[];
+  longshots: SleeperCandidate[];
+  weatherPlays: SleeperCandidate[];
+}
+
+export interface SleeperOddsLite {
+  implied_prob: number;
+  american_odds: number;
+}
+
+/**
+ * Build the sleeper board from the FULL ranked target list for a date.
+ *
+ * @param ranked   all HrTargets for the date, sorted by heat_score desc
+ * @param oddsByPlayer  player_id → latest odds (optional; enables longshots)
+ * @param opts.coreSize  players ranked <= this are the "stable core" and are
+ *                       EXCLUDED from the sleeper board (default 15)
+ */
+export function computeSleepers(
+  ranked: HrTarget[],
+  oddsByPlayer: Map<number, SleeperOddsLite>,
+  opts: { coreSize?: number; perCategory?: number } = {},
+): SleeperBoard {
+  const coreSize = opts.coreSize ?? 15;
+  const perCategory = opts.perCategory ?? 5;
+
+  // Sort defensively, assign 1-based rank.
+  const sorted = ranked.slice().sort((a, b) => b.heat_score - a.heat_score);
+  const candidates: SleeperCandidate[] = [];
+
+  for (let i = 0; i < sorted.length; i++) {
+    const t = sorted[i];
+    const rank = i + 1;
+    if (rank <= coreSize) continue; // core stays stable — never a "sleeper"
+
+    const odds = oddsByPlayer.get(t.player_id) ?? null;
+    const tags: ReasonChip[] = [];
+    let upside = 0;
+
+    // --- WIND OUT (weather-enhanced) ---
+    const windOut = (t.weather_wind_mph ?? 0) >= 10 && /out/.test((t.weather_wind_dir ?? '').toLowerCase());
+    if (windOut) {
+      upside += 16;
+      tags.push({ kind: 'wind_out', label: 'Wind Out', tone: 'good', detail: `${t.weather_wind_mph}mph ${t.weather_wind_dir}` });
+    }
+    const warm = (t.weather_temp_f ?? 0) >= 85;
+    if (warm) {
+      upside += 5;
+      tags.push({ kind: 'warm', label: 'Warm', tone: 'good', detail: `${t.weather_temp_f}°F` });
+    }
+
+    // --- HR PITCHER ---
+    const hrPitcher = t.pitcher_l14d_allowed >= 3 || (t.pitcher_starts_known >= 3 && t.pitcher_l5_starts_allowed >= 4);
+    if (hrPitcher) {
+      upside += 20;
+      tags.push({ kind: 'hr_pitcher', label: 'HR Pitcher', tone: 'good', detail: `Allowed ${Math.max(t.pitcher_l14d_allowed, t.pitcher_l5_starts_allowed)} HR recently` });
+    }
+
+    // --- PLATOON EDGE (opposite-hand advantage with a real sample) ---
+    if (t.pitcher_hand === 'L' || t.pitcher_hand === 'R') {
+      const opp = t.batter_side && t.batter_side !== t.pitcher_hand; // L vs R or R vs L
+      const vsHand = t.pitcher_hand === 'L' ? t.vs_lhp_season : t.vs_rhp_season;
+      if (opp && vsHand >= 3) {
+        upside += 12;
+        tags.push({ kind: 'platoon', label: 'Platoon Edge', tone: 'good', detail: `${t.batter_side}HB vs ${t.pitcher_hand}HP, ${vsHand} HR vs hand` });
+      }
+    }
+
+    // --- POWER PARK ---
+    if (t.venue_l14d_rank != null && t.venue_l14d_rank <= 5) {
+      upside += 8;
+      tags.push({ kind: 'power_park', label: 'Power Park', tone: 'good', detail: `Top ${t.venue_l14d_rank} venue L14d` });
+    }
+
+    // --- IMPROVING / HOT CONTACT (low season power but heating up) ---
+    const improving = t.season_hr <= 8 && t.hrs_l7d >= 2;
+    if (improving) {
+      upside += 12;
+      tags.push({ kind: 'hot_contact', label: 'Hot Contact', tone: 'good', detail: `${t.hrs_l7d} HR L7d on ${t.season_hr} season — heating up` });
+    }
+
+    // --- VOLATILE POWER (elite power gone cold = boom/bust ceiling) ---
+    const volatile = t.is_elite_power && t.hrs_l7d === 0;
+    if (volatile) {
+      upside += 14;
+      tags.push({ kind: 'volatile_power', label: 'Volatile Power', tone: 'neutral', detail: `Elite power (${t.season_hr} HR) but 0 HR L7d — high ceiling, low floor` });
+    }
+
+    // --- LONG ODDS value (book has them +500..+900 ≈ implied 10–17%) ---
+    let isLongshot = false;
+    if (odds) {
+      const ip = odds.implied_prob;
+      if (ip >= 0.10 && ip <= 0.17) {
+        isLongshot = true;
+        upside += 10;
+        tags.push({ kind: 'long_odds', label: 'Long Odds', tone: 'good', detail: `${odds.american_odds > 0 ? '+' : ''}${odds.american_odds} (${(ip * 100).toFixed(0)}% implied)` });
+      }
+    }
+
+    if (tags.length === 0) continue; // no upside signal → not a sleeper
+
+    // ---- CATEGORIZE (single primary bucket, priority order) ----
+    let category: SleeperCategory;
+    if (volatile) {
+      category = 'boom_bust';
+      tags.push({ kind: 'boom_bust', label: 'Boom/Bust', tone: 'neutral', detail: 'High variance — feast or famine' });
+    } else if (isLongshot) {
+      category = 'longshot';
+    } else if (windOut) {
+      category = 'weather';
+    } else {
+      category = 'sleeper';
+    }
+
+    candidates.push({
+      player_id: t.player_id,
+      player_name: t.player_name,
+      team: t.team,
+      opponent: t.opponent,
+      heat_score: t.heat_score,
+      heat_rank: rank,
+      category,
+      upside_score: Math.min(100, Math.round(upside)),
+      tags: tags.slice(0, 5),
+      implied_prob: odds?.implied_prob ?? null,
+      american_odds: odds?.american_odds ?? null,
+    });
+  }
+
+  const byCat = (cat: SleeperCategory) =>
+    candidates
+      .filter((c) => c.category === cat)
+      .sort((a, b) => b.upside_score - a.upside_score)
+      .slice(0, perCategory);
+
+  return {
+    sleepers: byCat('sleeper'),
+    boomBust: byCat('boom_bust'),
+    longshots: byCat('longshot'),
+    weatherPlays: byCat('weather'),
+  };
+}

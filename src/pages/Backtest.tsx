@@ -21,11 +21,17 @@ import {
   computeBacktestPerformance,
   computeMissAnalysis,
   computeMissChips,
+  computeMissPatterns,
   type BacktestPerformance,
   type MissRow,
   type MissChip,
   type MissChipContext,
+  type MissPatternSummary,
+  type DailyMissInput,
 } from '../lib/stats';
+
+/** How many days back the Miss Pattern aggregate covers. */
+const MISS_PATTERN_WINDOW_DAYS = 7;
 
 // Pacific calendar date — see src/lib/mlbDate.ts.
 const todayISO = mlbToday;
@@ -69,6 +75,7 @@ async function fetchGamesCountOn(date: string): Promise<number> {
  *  weather / opposing pitcher / venue context per miss row. */
 interface BacktestGameRow {
   game_pk: number;
+  game_date?: string;
   home_team: string;
   away_team: string;
   venue_name: string | null;
@@ -120,6 +127,60 @@ async function fetchPriorSeasonHrs(date: string): Promise<HomeRunRow[]> {
   return all;
 }
 
+/** ---- Multi-day fetchers for the Miss Pattern aggregate (task #174) ----
+ *  Each pulls a [from, to] range in one query so the 7-day window costs a
+ *  handful of queries total, not 7×. */
+async function fetchSnapshotRange(from: string, to: string): Promise<HrTargetSnapshotRow[]> {
+  const { data, error } = await supabase
+    .from('hr_target_snapshots')
+    .select('*')
+    .gte('target_date', from)
+    .lte('target_date', to)
+    .order('rank', { ascending: true });
+  if (error) return [];
+  return (data ?? []) as HrTargetSnapshotRow[];
+}
+async function fetchHrRange(from: string, to: string): Promise<HomeRunRow[]> {
+  const PAGE = 1000;
+  const all: HomeRunRow[] = [];
+  for (let page = 0; page < 10; page++) {
+    const { data, error } = await supabase
+      .from('home_runs')
+      .select('*')
+      .gte('game_date', from)
+      .lte('game_date', to)
+      .order('game_date', { ascending: false })
+      .range(page * PAGE, page * PAGE + PAGE - 1);
+    if (error) break;
+    const rows = (data ?? []) as HomeRunRow[];
+    all.push(...rows);
+    if (rows.length < PAGE) break;
+  }
+  return all;
+}
+async function fetchGamesRange(from: string, to: string): Promise<BacktestGameRow[]> {
+  const { data, error } = await supabase
+    .from('games')
+    .select('game_pk, game_date, home_team, away_team, venue_name, ' +
+      'home_probable_pitcher_id, home_probable_pitcher_name, home_probable_pitcher_hand, ' +
+      'away_probable_pitcher_id, away_probable_pitcher_name, away_probable_pitcher_hand, ' +
+      'weather, weather_temp_f, weather_wind_mph, weather_wind_dir')
+    .gte('game_date', from)
+    .lte('game_date', to);
+  if (error) return [];
+  return (data ?? []) as unknown as BacktestGameRow[];
+}
+async function fetchOddsRange(from: string, to: string): Promise<OddsSnapshotRow[]> {
+  const { data, error } = await supabase
+    .from('odds_snapshots')
+    .select('*')
+    .gte('target_date', from)
+    .lte('target_date', to)
+    .order('snapshot_time', { ascending: true });
+  if (error) return [];
+  return (data ?? []) as OddsSnapshotRow[];
+}
+
 /** Players-catalog batter side lookup — small, single-page. Used to
  *  detect reverse-split misses. */
 async function fetchBatterSideIndex(): Promise<Map<number, string | null>> {
@@ -163,6 +224,12 @@ export default function Backtest() {
   const [gamesFull, setGamesFull] = useState<BacktestGameRow[]>([]);
   const [oddsRows, setOddsRows] = useState<OddsSnapshotRow[]>([]);
   const [batterSideIdx, setBatterSideIdx] = useState<Map<number, string | null>>(new Map());
+  // ---- Multi-day Miss Pattern aggregate (task #174) ----
+  const [rangeSnapshots, setRangeSnapshots] = useState<HrTargetSnapshotRow[]>([]);
+  const [rangeHrs, setRangeHrs] = useState<HomeRunRow[]>([]);
+  const [rangeSeasonHrs, setRangeSeasonHrs] = useState<HomeRunRow[]>([]);
+  const [rangeGames, setRangeGames] = useState<BacktestGameRow[]>([]);
+  const [rangeOdds, setRangeOdds] = useState<OddsSnapshotRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -180,6 +247,8 @@ export default function Backtest() {
     let cancelled = false;
     setLoading(true);
     setError(null);
+    const rangeFrom = addDays(date, -(MISS_PATTERN_WINDOW_DAYS - 1));
+    const seasonStart = `${date.slice(0, 4)}-01-01`;
     Promise.all([
       fetchSnapshot(date),
       fetchHrsOn(date),
@@ -189,8 +258,14 @@ export default function Backtest() {
       fetchGamesOnFull(date),
       fetchOddsSnapshots(date),
       fetchBatterSideIndex(),
+      // Multi-day window for Miss Patterns.
+      fetchSnapshotRange(rangeFrom, date),
+      fetchHrRange(rangeFrom, date),
+      fetchHrRange(seasonStart, date),     // season baseline for L7/L14 per day
+      fetchGamesRange(rangeFrom, date),
+      fetchOddsRange(rangeFrom, date),
     ])
-      .then(([s, h, lu, gc, psh, gf, odds, bsi]) => {
+      .then(([s, h, lu, gc, psh, gf, odds, bsi, rSnap, rHrs, rSeason, rGames, rOdds]) => {
         if (cancelled) return;
         setSnapshot(s);
         setHrs(h);
@@ -200,6 +275,11 @@ export default function Backtest() {
         setGamesFull(gf);
         setOddsRows(odds);
         setBatterSideIdx(bsi);
+        setRangeSnapshots(rSnap);
+        setRangeHrs(rHrs);
+        setRangeSeasonHrs(rSeason);
+        setRangeGames(rGames);
+        setRangeOdds(rOdds);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -397,6 +477,123 @@ export default function Backtest() {
     return out;
   }, [misses, priorSeasonHrs, gamesFull, oddsRows, batterSideIdx, hrs, date]);
 
+  // ---- Multi-day Miss Pattern aggregate (task #174) ----
+  // Bucket the range data by date, build one DailyMissInput per day using
+  // the same chip logic as the single-day view, then aggregate frequency.
+  const missPatterns: MissPatternSummary | null = useMemo(() => {
+    if (rangeSnapshots.length === 0 || rangeHrs.length === 0) return null;
+
+    // Bucket helpers by date.
+    const snapsByDate = new Map<string, HrTargetSnapshotRow[]>();
+    for (const s of rangeSnapshots) {
+      let a = snapsByDate.get(s.target_date); if (!a) { a = []; snapsByDate.set(s.target_date, a); } a.push(s);
+    }
+    const hrsByDate = new Map<string, HomeRunRow[]>();
+    for (const h of rangeHrs) {
+      let a = hrsByDate.get(h.game_date); if (!a) { a = []; hrsByDate.set(h.game_date, a); } a.push(h);
+    }
+    const gamesByDate = new Map<string, BacktestGameRow[]>();
+    for (const g of rangeGames) {
+      const d = g.game_date ?? '';
+      let a = gamesByDate.get(d); if (!a) { a = []; gamesByDate.set(d, a); } a.push(g);
+    }
+    const oddsByDate = new Map<string, OddsSnapshotRow[]>();
+    for (const o of rangeOdds) {
+      let a = oddsByDate.get(o.target_date); if (!a) { a = []; oddsByDate.set(o.target_date, a); } a.push(o);
+    }
+
+    // Season HRs grouped once (shared across days for L7/L14 baselines).
+    const seasonHrsByPlayer = new Map<number, { game_date: string }[]>();
+    for (const h of rangeSeasonHrs) {
+      let a = seasonHrsByPlayer.get(h.player_id); if (!a) { a = []; seasonHrsByPlayer.set(h.player_id, a); } a.push({ game_date: h.game_date });
+    }
+
+    const days: DailyMissInput[] = [];
+    for (const [d, daySnaps] of snapsByDate) {
+      const dayHrs = hrsByDate.get(d) ?? [];
+      if (dayHrs.length === 0) continue; // no results to grade against
+
+      // Identify misses for the day.
+      const teamByPlayer = new Map<number, { team: string | null; opponent: string | null }>();
+      for (const h of dayHrs) if (!teamByPlayer.has(h.player_id)) teamByPlayer.set(h.player_id, { team: h.team ?? null, opponent: h.opponent ?? null });
+      const dayMisses = computeMissAnalysis(
+        dayHrs.map((h) => ({ player_id: h.player_id, player_name: h.player_name })),
+        daySnaps.map((s) => ({ rank: s.rank, player_id: s.player_id, player_name: s.player_name })),
+        [],
+        { cutoff: 50 },
+      );
+      for (const m of dayMisses) { const tb = teamByPlayer.get(m.player_id); if (tb) { m.team = tb.team; m.opponent = tb.opponent; } }
+
+      // Build the chip context for this day.
+      const dayGames = gamesByDate.get(d) ?? [];
+      const fourteenStart = addDays(d, -14);
+      const dayBefore = addDays(d, -1);
+      const pitcherL14dAllowed = new Map<number, number>();
+      const venueL14d = new Map<string, number>();
+      for (const h of rangeSeasonHrs) {
+        if (h.game_date < fourteenStart || h.game_date > dayBefore) continue;
+        if (h.pitcher_id != null) pitcherL14dAllowed.set(h.pitcher_id, (pitcherL14dAllowed.get(h.pitcher_id) ?? 0) + 1);
+        if (h.venue_name) venueL14d.set(h.venue_name, (venueL14d.get(h.venue_name) ?? 0) + 1);
+      }
+      const venueRanking = Array.from(venueL14d.entries()).sort((a, b) => b[1] - a[1]);
+      const venueRankByName = new Map<string, number>();
+      venueRanking.forEach(([n], i) => venueRankByName.set(n, i + 1));
+      const venueTotal = venueRanking.length;
+
+      const gameByPk = new Map<number, MissChipContext['gameByPk'] extends Map<number, infer V> ? V : never>();
+      const opposingByTeam = new Map<string, { id: number | null; name: string | null; hand: string | null }>();
+      for (const g of dayGames) {
+        gameByPk.set(g.game_pk, {
+          home_team: g.home_team, away_team: g.away_team, venue_name: g.venue_name,
+          venue_l14d_rank: g.venue_name ? venueRankByName.get(g.venue_name) ?? null : null,
+          venue_total_ranked: venueTotal,
+          weather_condition: g.weather?.condition ?? null,
+          weather_temp_f: g.weather_temp_f, weather_wind_mph: g.weather_wind_mph, weather_wind_dir: g.weather_wind_dir,
+          opposing_pitcher_id: null, opposing_pitcher_name: null, opposing_pitcher_hand: null,
+        });
+        opposingByTeam.set(g.home_team, { id: g.away_probable_pitcher_id, name: g.away_probable_pitcher_name, hand: g.away_probable_pitcher_hand });
+        opposingByTeam.set(g.away_team, { id: g.home_probable_pitcher_id, name: g.home_probable_pitcher_name, hand: g.home_probable_pitcher_hand });
+      }
+
+      // Odds maps for the day.
+      const morningOdds = new Map<number, { american_odds: number; implied_prob: number }>();
+      const latestOdds = new Map<number, { american_odds: number; implied_prob: number }>();
+      const dOdds = (oddsByDate.get(d) ?? []).slice().sort((a, b) => (a.snapshot_time < b.snapshot_time ? -1 : 1));
+      for (const r of dOdds) {
+        if (r.player_id == null) continue;
+        if (r.snapshot_type === 'morning' && !morningOdds.has(r.player_id)) morningOdds.set(r.player_id, { american_odds: r.american_odds, implied_prob: r.implied_prob });
+        latestOdds.set(r.player_id, { american_odds: r.american_odds, implied_prob: r.implied_prob });
+      }
+
+      const hrsOnDateByPlayer = new Map<number, { distance: number | null; exit_velocity: number | null }[]>();
+      for (const h of dayHrs) { let a = hrsOnDateByPlayer.get(h.player_id); if (!a) { a = []; hrsOnDateByPlayer.set(h.player_id, a); } a.push({ distance: h.distance, exit_velocity: h.exit_velocity }); }
+
+      const dayMissInputs = dayMisses.map((m) => {
+        // Patch opposing pitcher for the matched game.
+        const patched = new Map(gameByPk);
+        if (m.team) {
+          let pk: number | null = null;
+          for (const [k, g] of gameByPk) if (g.home_team === m.team || g.away_team === m.team) { pk = k; break; }
+          if (pk != null) {
+            const opp = opposingByTeam.get(m.team);
+            const base = patched.get(pk);
+            if (opp && base) patched.set(pk, { ...base, opposing_pitcher_id: opp.id, opposing_pitcher_name: opp.name, opposing_pitcher_hand: opp.hand });
+          }
+        }
+        const ctx: MissChipContext = {
+          seasonHrsByPlayer, gameByPk: patched, pitcherL14dAllowed,
+          batterSideById: batterSideIdx, morningOddsByPlayer: morningOdds, latestOddsByPlayer: latestOdds,
+          hrsOnDateByPlayer, date: d,
+        };
+        return { player_id: m.player_id, player_name: m.player_name, chips: computeMissChips(m, ctx) };
+      });
+
+      days.push({ date: d, misses: dayMissInputs });
+    }
+
+    return computeMissPatterns(days);
+  }, [rangeSnapshots, rangeHrs, rangeSeasonHrs, rangeGames, rangeOdds, batterSideIdx]);
+
   const today = todayISO();
   const yesterday = addDays(today, -1);
 
@@ -473,6 +670,11 @@ export default function Backtest() {
       {/* ---- Task #166: Daily performance — lift vs random ---- */}
       {performance && (
         <PerformancePanel perf={performance} />
+      )}
+
+      {/* ---- Task #174: Miss Pattern Analysis (multi-day aggregate) ---- */}
+      {missPatterns && missPatterns.total_misses > 0 && (
+        <MissPatternsPanel summary={missPatterns} windowDays={MISS_PATTERN_WINDOW_DAYS} />
       )}
 
       {/* ---- Task #166 + #168: Miss analysis — homered outside Top 50, with diagnostic chips ---- */}
@@ -938,6 +1140,81 @@ function MissPanel({
         are the highest-signal "model snubbed real edge" markers. Hover any
         chip for the source value.
       </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Task #174: Miss Pattern Analysis (multi-day aggregate)
+// ============================================================
+function MissPatternsPanel({ summary, windowDays }: { summary: MissPatternSummary; windowDays: number }) {
+  // Highlight 'good'-toned patterns — those are "model undervalued real
+  // edge" and the actionable tuning levers.
+  const maxCount = summary.patterns.reduce((m, p) => Math.max(m, p.count), 0) || 1;
+  return (
+    <div className="panel" style={{ marginBottom: 16 }}>
+      <h2 style={{ marginTop: 0, fontSize: 16 }}>
+        Miss Pattern Analysis — last {windowDays} days
+      </h2>
+      <div className="subtle" style={{ fontSize: 12, marginBottom: 12, lineHeight: 1.5 }}>
+        Across <strong>{summary.total_misses}</strong> missed HR hitters (homered, ranked
+        outside Top 50) over <strong>{summary.days_covered}</strong> day(s), here's how often
+        each trait showed up. <strong style={{ color: 'var(--good, #4cd97a)' }}>Green</strong>{' '}
+        traits = real edge the model undervalued (the tuning levers);{' '}
+        <strong style={{ color: '#ff8d8d' }}>red</strong> = penalties the model applied with
+        justification; gray = context. High-frequency green rows are where the Heat Score is
+        systematically leaving HRs on the table.
+      </div>
+
+      {/* Frequency bars */}
+      <div style={{ display: 'grid', gap: 6 }}>
+        {summary.patterns.map((p) => {
+          const color =
+            p.tone === 'good' ? 'var(--good, #4cd97a)' :
+            p.tone === 'bad'  ? '#ff8d8d' :
+                                'var(--muted, #aaa)';
+          const barBg =
+            p.tone === 'good' ? 'rgba(64,200,120,0.25)' :
+            p.tone === 'bad'  ? 'rgba(255,110,110,0.25)' :
+                                'rgba(160,160,160,0.20)';
+          return (
+            <div key={p.kind} style={{ display: 'grid', gridTemplateColumns: '130px 1fr 90px', gap: 8, alignItems: 'center' }}>
+              <span style={{ fontSize: 12, fontWeight: 600, color }}>{p.label}</span>
+              <div style={{ height: 14, background: 'var(--panel-2)', borderRadius: 4, overflow: 'hidden', border: '1px solid var(--border)' }}>
+                <div style={{ width: `${(p.count / maxCount) * 100}%`, height: '100%', background: barBg, borderRight: `2px solid ${color}` }} />
+              </div>
+              <span className="subtle num" style={{ fontSize: 11 }}>
+                {(p.frequency * 100).toFixed(0)}% ({p.count})
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Repeat offenders */}
+      {summary.repeat_offenders.length > 0 && (
+        <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
+          <div className="subtle" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.6, marginBottom: 6 }}>
+            Repeat offenders — missed on multiple days
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {summary.repeat_offenders.map((r) => (
+              <Link
+                key={r.player_id}
+                to={`/player/${r.player_id}`}
+                className="player-link"
+                style={{ fontSize: 12, padding: '2px 8px', borderRadius: 999, background: 'var(--panel-2)', border: '1px solid var(--border)', textDecoration: 'none' }}
+              >
+                {r.player_name} <span className="subtle">×{r.miss_days}</span>
+              </Link>
+            ))}
+          </div>
+          <div className="subtle" style={{ fontSize: 11, marginTop: 6, lineHeight: 1.4 }}>
+            These players homered on multiple days while ranked outside the Top 50 — the strongest
+            signal that the model has a blind spot for their specific profile.
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -17,15 +17,17 @@
  */
 import React, { Fragment, useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { supabase, fetchPlayerIndex, fetchPitcherFormIndex, fetchDataLastUpdated, type GameRow, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
+import { supabase, fetchPlayerIndex, fetchPitcherFormIndex, fetchDataLastUpdated, fetchOddsSnapshots, type GameRow, type HomeRunRow, type HrTargetSnapshotRow } from '../lib/supabase';
 import { mlbToday } from '../lib/mlbDate';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
 import WeatherLine from '../components/WeatherLine';
 import ReasonChips, { ReasonChipDetails } from '../components/ReasonChips';
+import SleeperBoardPanel from '../components/SleeperBoard';
 import {
   addDays,
   applyCanonicalTeams,
   computeHrTargets,
+  computeSleepers,
   pitcherHrLeaderboard,
   venueLeaderboard,
   ELITE_POWER_NAMES,
@@ -34,6 +36,7 @@ import {
   type HrTargetsBoard,
   type PitcherFormLite,
   type PlayerTeamIndex,
+  type SleeperOddsLite,
 } from '../lib/stats';
 
 /** Temporary debug toggle — see Dashboard for explanation. Off after
@@ -121,6 +124,10 @@ export default function HrTargets() {
   const [savedSnapshot, setSavedSnapshot] = useState<HrTargetSnapshotRow[]>([]);
   // Most-recent home_runs.created_at — drives "Data last updated at" tile.
   const [dataLastUpdated, setDataLastUpdated] = useState<string | null>(null);
+  // Latest odds per player_id for the target date — feeds the Sleeper
+  // board's "Long Odds" / undervalued-longshot detection. Empty when no
+  // odds snapshot exists yet (sleepers still work, just no longshot tags).
+  const [oddsByPlayer, setOddsByPlayer] = useState<Map<number, SleeperOddsLite>>(new Map());
   // Wall-clock at which the most recent successful Live Preview computation
   // finished. Distinct from "Snapshot generated at" — the snapshot is a
   // persisted, immutable row in hr_target_snapshots, whereas the live
@@ -169,17 +176,26 @@ export default function HrTargets() {
 
     (async () => {
       try {
-        const [hrs, gs, snap, lu] = await Promise.all([
+        const [hrs, gs, snap, lu, odds] = await Promise.all([
           fetchSeasonHrs(asOf),
           fetchGamesOn(targetDate),
           fetchSavedSnapshot(targetDate).catch(() => [] as HrTargetSnapshotRow[]),
           fetchDataLastUpdated().catch(() => null),
+          fetchOddsSnapshots(targetDate).catch(() => []),
         ]);
         if (cancelled) return;
         setSeasonHrs(hrs);
         setGames(gs);
         setSavedSnapshot(snap);
         setDataLastUpdated(lu);
+        // Build latest-odds-per-player map for the sleeper board.
+        const oddsMap = new Map<number, SleeperOddsLite>();
+        const oddsSorted = odds.slice().sort((a, b) => (a.snapshot_time < b.snapshot_time ? -1 : 1));
+        for (const r of oddsSorted) {
+          if (r.player_id == null) continue;
+          oddsMap.set(r.player_id, { implied_prob: r.implied_prob, american_odds: r.american_odds });
+        }
+        setOddsByPlayer(oddsMap);
         // Mark the moment we finished pulling fresh inputs — the boards
         // memo recomputes immediately after, so this is effectively when
         // the live preview was rendered for the user.
@@ -327,6 +343,16 @@ export default function HrTargets() {
     return all;
   }, [boards]);
   const top10 = useMemo(() => allRanked.slice(0, 10), [allRanked]);
+
+  // ---- Sleeper / Chaos / Boom-Bust discovery layer (task #174) ----
+  // Forward-looking volatility layer, strictly separate from the core
+  // rankings above. Surfaces players ranked OUTSIDE the top 15 whose
+  // profile carries upside the Heat Score underweights. Never feeds back
+  // into heat_score — purely additive discovery.
+  const sleeperBoard = useMemo(
+    () => computeSleepers(allRanked, oddsByPlayer, { coreSize: 15, perCategory: 5 }),
+    [allRanked, oddsByPlayer],
+  );
 
   // Model-disagreement warning: surface elite-power hitters who SHOULD be
   // near the top of betting interest but our model ranked low. Threshold:
@@ -518,6 +544,13 @@ export default function HrTargets() {
           </div>
           <CompareTable savedSnapshot={savedSnapshot} liveTop={allRanked.slice(0, 20)} asOf={asOf} />
         </div>
+      )}
+
+      {/* Sleeper / Chaos discovery layer — separate from core rankings.
+          Only meaningful in live computation (needs full ranked list), so
+          we render it whenever we have live targets for the date. */}
+      {allRanked.length > 0 && (
+        <SleeperBoardPanel board={sleeperBoard} asOf={asOf} />
       )}
 
       <h3 className="section">All games — sorted within each card by Heat Score ↓</h3>
