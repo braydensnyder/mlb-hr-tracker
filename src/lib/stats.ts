@@ -3150,3 +3150,79 @@ export function certifiedMarketLabel(s: CertifiedMarketSignal): { label: string;
     case 'quiet_value': return { label: 'Quiet Value', tone: 'neutral' };
   }
 }
+
+// =====================================================================
+// Top 10 flat-bet simulation (task #178)
+// =====================================================================
+//
+// "If you blindly bet the model's saved Top 10 every day at a flat +200,
+//  would you be ahead?" Pure aggregation over saved snapshots + actual
+//  HRs. Standardized +200 (win = +$2, loss = -$1, $1 stake each) — NOT
+//  real sportsbook pricing. No bet sizing, no chase logic.
+
+export interface FlatBetPeriod {
+  /** Total Top-10 bets placed in the period (≤10 per day). */
+  bets: number;
+  wins: number;
+  losses: number;
+  /** wins×2 − losses×1, in dollars at $1 stake. */
+  net: number;
+  /** net / total_risk (total_risk = bets × $1). 0 when no bets. */
+  roi: number;
+  /** Distinct game-dates that contributed (had a snapshot + results). */
+  days: number;
+}
+
+export interface FlatBetSim {
+  today: FlatBetPeriod;
+  mtd: FlatBetPeriod;
+  ytd: FlatBetPeriod;
+}
+
+const FLAT_WIN_PROFIT = 2;  // +200 → $2 per $1
+const FLAT_LOSS = 1;
+
+function emptyPeriod(): FlatBetPeriod {
+  return { bets: 0, wins: 0, losses: 0, net: 0, roi: 0, days: 0 };
+}
+
+/**
+ * @param date            the as-of date (YYYY-MM-DD); "today" period = this date
+ * @param top10ByDate     date → player_ids ranked in the saved Top 10
+ * @param hrPlayersByDate date → set of player_ids who homered that date
+ */
+export function computeFlatBetSim(
+  date: string,
+  top10ByDate: Map<string, number[]>,
+  hrPlayersByDate: Map<string, Set<number>>,
+): FlatBetSim {
+  const monthStart = `${date.slice(0, 7)}-01`;
+  const yearStart = `${date.slice(0, 4)}-01-01`;
+
+  const today = emptyPeriod();
+  const mtd = emptyPeriod();
+  const ytd = emptyPeriod();
+
+  for (const [d, ids] of top10ByDate) {
+    // Only count dates up to and including the as-of date.
+    if (d > date) continue;
+    const hrSet = hrPlayersByDate.get(d) ?? new Set<number>();
+    let wins = 0;
+    for (const id of ids) if (hrSet.has(id)) wins++;
+    const bets = ids.length;
+    const losses = bets - wins;
+    const net = wins * FLAT_WIN_PROFIT - losses * FLAT_LOSS;
+
+    const add = (p: FlatBetPeriod) => {
+      p.bets += bets; p.wins += wins; p.losses += losses; p.net += net; p.days += 1;
+    };
+    if (d >= yearStart) add(ytd);
+    if (d >= monthStart) add(mtd);
+    if (d === date) add(today);
+  }
+
+  for (const p of [today, mtd, ytd]) {
+    p.roi = p.bets > 0 ? p.net / p.bets : 0;
+  }
+  return { today, mtd, ytd };
+}

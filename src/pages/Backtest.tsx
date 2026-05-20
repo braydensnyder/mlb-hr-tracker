@@ -22,12 +22,15 @@ import {
   computeMissAnalysis,
   computeMissChips,
   computeMissPatterns,
+  computeFlatBetSim,
   type BacktestPerformance,
   type MissRow,
   type MissChip,
   type MissChipContext,
   type MissPatternSummary,
   type DailyMissInput,
+  type FlatBetSim,
+  type FlatBetPeriod,
 } from '../lib/stats';
 
 /** How many days back the Miss Pattern aggregate covers. */
@@ -170,6 +173,30 @@ async function fetchGamesRange(from: string, to: string): Promise<BacktestGameRo
   if (error) return [];
   return (data ?? []) as unknown as BacktestGameRow[];
 }
+/** Year-to-date Top-10 snapshot rows (rank ≤ 10) for the flat-bet sim.
+ *  Filtering rank ≤ 10 in the query keeps the row count low (~10/day),
+ *  paged defensively for long seasons. */
+async function fetchTop10SnapshotsYTD(date: string): Promise<HrTargetSnapshotRow[]> {
+  const yearStart = `${date.slice(0, 4)}-01-01`;
+  const PAGE = 1000;
+  const all: HrTargetSnapshotRow[] = [];
+  for (let page = 0; page < 10; page++) {
+    const { data, error } = await supabase
+      .from('hr_target_snapshots')
+      .select('*')
+      .gte('target_date', yearStart)
+      .lte('target_date', date)
+      .lte('rank', 10)
+      .order('target_date', { ascending: true })
+      .range(page * PAGE, page * PAGE + PAGE - 1);
+    if (error) break;
+    const rows = (data ?? []) as HrTargetSnapshotRow[];
+    all.push(...rows);
+    if (rows.length < PAGE) break;
+  }
+  return all;
+}
+
 async function fetchOddsRange(from: string, to: string): Promise<OddsSnapshotRow[]> {
   const { data, error } = await supabase
     .from('odds_snapshots')
@@ -230,6 +257,8 @@ export default function Backtest() {
   const [rangeSeasonHrs, setRangeSeasonHrs] = useState<HomeRunRow[]>([]);
   const [rangeGames, setRangeGames] = useState<BacktestGameRow[]>([]);
   const [rangeOdds, setRangeOdds] = useState<OddsSnapshotRow[]>([]);
+  // YTD Top-10 snapshots for the flat-bet sim box.
+  const [top10Ytd, setTop10Ytd] = useState<HrTargetSnapshotRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -264,8 +293,9 @@ export default function Backtest() {
       fetchHrRange(seasonStart, date),     // season baseline for L7/L14 per day
       fetchGamesRange(rangeFrom, date),
       fetchOddsRange(rangeFrom, date),
+      fetchTop10SnapshotsYTD(date),
     ])
-      .then(([s, h, lu, gc, psh, gf, odds, bsi, rSnap, rHrs, rSeason, rGames, rOdds]) => {
+      .then(([s, h, lu, gc, psh, gf, odds, bsi, rSnap, rHrs, rSeason, rGames, rOdds, t10y]) => {
         if (cancelled) return;
         setSnapshot(s);
         setHrs(h);
@@ -280,6 +310,7 @@ export default function Backtest() {
         setRangeSeasonHrs(rSeason);
         setRangeGames(rGames);
         setRangeOdds(rOdds);
+        setTop10Ytd(t10y);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -480,6 +511,24 @@ export default function Backtest() {
   // ---- Multi-day Miss Pattern aggregate (task #174) ----
   // Bucket the range data by date, build one DailyMissInput per day using
   // the same chip logic as the single-day view, then aggregate frequency.
+  // ---- Top 10 flat-bet sim (task #178) ----
+  const flatBetSim: FlatBetSim | null = useMemo(() => {
+    if (top10Ytd.length === 0) return null;
+    const top10ByDate = new Map<string, number[]>();
+    for (const s of top10Ytd) {
+      let a = top10ByDate.get(s.target_date);
+      if (!a) { a = []; top10ByDate.set(s.target_date, a); }
+      a.push(s.player_id);
+    }
+    const hrByDate = new Map<string, Set<number>>();
+    for (const h of rangeSeasonHrs) {
+      let set = hrByDate.get(h.game_date);
+      if (!set) { set = new Set(); hrByDate.set(h.game_date, set); }
+      set.add(h.player_id);
+    }
+    return computeFlatBetSim(date, top10ByDate, hrByDate);
+  }, [top10Ytd, rangeSeasonHrs, date]);
+
   const missPatterns: MissPatternSummary | null = useMemo(() => {
     if (rangeSnapshots.length === 0 || rangeHrs.length === 0) return null;
 
@@ -666,6 +715,11 @@ export default function Backtest() {
         <HitRateCell label="Top 10" hits={rate10.hits} total={rate10.total} />
         <HitRateCell label="All" hits={resolved.filter((r) => r.hit).length} total={resolved.length} />
       </div>
+
+      {/* ---- Task #178: Top 10 flat-bet sim (small, under the hit-rate cards) ---- */}
+      {flatBetSim && (
+        <FlatBetSimBox sim={flatBetSim} />
+      )}
 
       {/* ---- Task #166: Daily performance — lift vs random ---- */}
       {performance && (
@@ -1139,6 +1193,47 @@ function MissPanel({
         <strong>Wind Out / HR Pitcher / Power Park / Odds Steam / Hot last 7d</strong>{' '}
         are the highest-signal "model snubbed real edge" markers. Hover any
         chip for the source value.
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Task #178: Top 10 flat-bet simulation box (compact)
+// ============================================================
+function FlatBetSimBox({ sim }: { sim: FlatBetSim }) {
+  const periods: { label: string; p: FlatBetPeriod }[] = [
+    { label: 'Today', p: sim.today },
+    { label: 'MTD', p: sim.mtd },
+    { label: 'YTD', p: sim.ytd },
+  ];
+  const money = (n: number) => `${n >= 0 ? '+' : '−'}$${Math.abs(n).toFixed(0)}`;
+  const colorOf = (n: number) => (n > 0 ? 'var(--good, #4cd97a)' : n < 0 ? '#ff8d8d' : 'var(--muted)');
+  return (
+    <div className="panel" style={{ marginBottom: 16, padding: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
+        <strong style={{ fontSize: 13 }}>Top 10 Flat Bet Sim</strong>
+        <span className="subtle" style={{ fontSize: 11 }}>
+          blindly bet the saved Top 10 daily · standardized +200 · $1 each (win +$2 / loss −$1)
+        </span>
+      </div>
+      <div style={{ display: 'grid', gap: 8, gridTemplateColumns: 'repeat(3, 1fr)' }}>
+        {periods.map(({ label, p }) => (
+          <div key={label} style={{ padding: '8px 10px', borderRadius: 8, background: 'var(--panel-2)', border: '1px solid var(--border)' }}>
+            <div className="subtle" style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6 }}>{label}</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: colorOf(p.net), lineHeight: 1.2 }}>
+              {money(p.net)}
+            </div>
+            <div className="subtle" style={{ fontSize: 11, marginTop: 2, lineHeight: 1.4 }}>
+              {p.wins}W–{p.losses}L · {p.bets} bets
+              {p.bets > 0 && <> · {(p.roi * 100).toFixed(0)}% ROI</>}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="subtle" style={{ fontSize: 10, marginTop: 6, lineHeight: 1.4 }}>
+        Simulation only — standardized +200, not real odds. Backfilled from saved Top-10 snapshots
+        × actual HRs. No bet sizing, no chasing.
       </div>
     </div>
   );
