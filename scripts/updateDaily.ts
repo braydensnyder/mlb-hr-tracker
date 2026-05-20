@@ -38,6 +38,7 @@ import { enrichVenues } from './enrichVenues.js';
 import { enrichPitcherStarts } from './enrichPitcherStarts.js';
 import { enrichPlayers } from './enrichPlayers.js';
 import { enrichWeather, type EnrichWeatherResult } from './enrichWeather.js';
+import { enrichLineups, type EnrichLineupsResult } from './enrichLineups.js';
 import { rebuildPlayerSummaries } from './rebuildPlayerSummaries.js';
 import { snapshotHrTargets, type SnapshotResult } from './snapshotHrTargets.js';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
@@ -372,6 +373,23 @@ export async function updateDaily(
     );
   } else {
     console.log(`    (weather refresh skipped — mode=${mode})`);
+  }
+
+  // Lineups — cheap, runs on EVERY tier (including light) so confirmed
+  // batting orders land as soon as MLB posts them and HR Targets can
+  // filter out non-starters. Only checks today + tomorrow (the window
+  // where lineups matter); skips final/confirmed games internally.
+  let lineupsResult: EnrichLineupsResult | null = null;
+  lineupsResult = await runStep(
+    `enrich:lineups (${today} → ${tomorrow})`,
+    () => enrichLineups({ start: today, end: tomorrow }),
+    steps,
+  );
+  if (lineupsResult) {
+    console.log(
+      `    lineups — ${lineupsResult.lineupsConfirmed} confirmed, ` +
+        `${lineupsResult.stillPending} pending, ${lineupsResult.deadGames} dead game(s)`,
+    );
   }
 
   console.log(`    live preview updated — underlying data refreshed (saved snapshot untouched)`);

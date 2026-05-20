@@ -66,6 +66,16 @@ export interface GameRow {
   /** When enrichWeather last successfully wrote weather columns. NULL ↔
    *  weather still pending (game too far out, MLB hasn't published yet). */
   weather_updated_at: string | null;
+
+  // Lineups (migration 012, populated by `npm run enrich:lineups` from the
+  // MLB feed's batting order — null until MLB posts the lineup ~2-4h pre-game).
+  /** Starter player_ids in the home batting order, or null/[] when pending. */
+  home_lineup: number[] | null;
+  /** Starter player_ids in the away batting order. */
+  away_lineup: number[] | null;
+  /** True once both sides have a 9-man order posted. */
+  lineups_confirmed: boolean | null;
+  lineups_updated_at: string | null;
 }
 
 /** Canonical players catalog. The frontend prefers `current_team_name` from

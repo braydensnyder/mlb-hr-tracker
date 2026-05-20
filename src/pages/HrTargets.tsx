@@ -319,6 +319,10 @@ export default function HrTargets() {
       weather_wind_mph: g.weather_wind_mph,
       weather_wind_dir: g.weather_wind_dir,
       weather_updated_at: g.weather_updated_at,
+      home_lineup: g.home_lineup,
+      away_lineup: g.away_lineup,
+      lineups_confirmed: g.lineups_confirmed,
+      game_status: g.status,
     })),
     [games],
   );
@@ -329,7 +333,10 @@ export default function HrTargets() {
   );
 
   // Flatten across all games + sort by Heat Score desc.
-  const allRanked: HrTarget[] = useMemo(() => {
+  // `allRankedRaw` = everyone (used for the sleeper layer + bench section).
+  // `allRanked` = the eligible pool (confirmed + pending), with not_starting
+  // and postponed players REMOVED so they can't appear in Top 10/50 (task #176).
+  const allRankedRaw: HrTarget[] = useMemo(() => {
     const all: HrTarget[] = [];
     for (const b of boards) {
       all.push(...b.away_targets, ...b.home_targets);
@@ -342,6 +349,40 @@ export default function HrTargets() {
     );
     return all;
   }, [boards]);
+
+  const allRanked: HrTarget[] = useMemo(
+    () => allRankedRaw.filter((t) => t.lineup_status === 'confirmed' || t.lineup_status === 'pending'),
+    [allRankedRaw],
+  );
+
+  // Bench / unavailable — homer-capable hitters the model liked but who
+  // are NOT starting (or whose game is postponed). Kept out of Top 10/50,
+  // shown in a small section so the user can still see "we rated them but
+  // they're not in the lineup". Sorted by heat so the most notable sit-outs
+  // surface first; capped to keep it scannable.
+  const benchPlayers: HrTarget[] = useMemo(
+    () => allRankedRaw
+      .filter((t) => t.lineup_status === 'not_starting' || t.lineup_status === 'postponed')
+      .slice(0, 12),
+    [allRankedRaw],
+  );
+
+  // Console log of removed players (task #176 requirement).
+  useEffect(() => {
+    if (allRankedRaw.length === 0) return;
+    const notStarting = allRankedRaw.filter((t) => t.lineup_status === 'not_starting');
+    const postponed = allRankedRaw.filter((t) => t.lineup_status === 'postponed');
+    const pending = allRankedRaw.filter((t) => t.lineup_status === 'pending');
+    // eslint-disable-next-line no-console
+    console.log(
+      `[lineups] HR Targets ${targetDate}: ${allRanked.length} eligible ` +
+        `(${pending.length} lineup-pending), ` +
+        `removed ${notStarting.length} not-starting, ${postponed.length} postponed. ` +
+        (notStarting.length ? `Not starting: ${notStarting.slice(0, 8).map((t) => t.player_name).join(', ')}. ` : '') +
+        (postponed.length ? `Postponed: ${postponed.slice(0, 8).map((t) => t.player_name).join(', ')}.` : ''),
+    );
+  }, [allRankedRaw, allRanked.length, targetDate]);
+
   const top10 = useMemo(() => allRanked.slice(0, 10), [allRanked]);
 
   // ---- Sleeper / Chaos / Boom-Bust discovery layer (task #174) ----
@@ -553,6 +594,12 @@ export default function HrTargets() {
         <SleeperBoardPanel board={sleeperBoard} asOf={asOf} />
       )}
 
+      {/* Bench / unavailable — model liked them but they're not in the
+          lineup (or game postponed). Kept OUT of Top 10/50 above. */}
+      {benchPlayers.length > 0 && (
+        <BenchSection players={benchPlayers} asOf={asOf} />
+      )}
+
       <h3 className="section">All games — sorted within each card by Heat Score ↓</h3>
       <div style={{ display: 'grid', gap: 12 }}>
         {boards.map((b) => (
@@ -619,6 +666,8 @@ function Top10Table({ targets, asOf }: { targets: HrTarget[]; asOf: string }) {
                         ★
                       </span>
                     )}
+                    {' '}
+                    <LineupStatusTag status={t.lineup_status} />
                   </td>
                   <td><span className="pill">{t.team}</span></td>
                   <td className="subtle" style={{ fontSize: 12 }}>vs {t.opponent}</td>
@@ -1050,6 +1099,82 @@ function Kpi({ label, value }: { label: string; value: string | number }) {
  * each row + in the expanded detail. `compact` mode renders just the
  * colored dot for the table cell; expanded mode shows the full label.
  */
+/** Bench / unavailable section — model-liked hitters not in the lineup. */
+function BenchSection({ players, asOf }: { players: HrTarget[]; asOf: string }) {
+  return (
+    <div className="panel" style={{ marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 8, marginBottom: 6 }}>
+        <h2 style={{ margin: 0, fontSize: 16 }}>Bench / unavailable</h2>
+        <span className="subtle" style={{ fontSize: 12 }}>
+          rated by the model but NOT starting — excluded from Top 10/50
+        </span>
+      </div>
+      <div className="subtle" style={{ fontSize: 12, marginBottom: 10, lineHeight: 1.5 }}>
+        These hitters scored well but their team's posted lineup doesn't include them
+        (rest day, platoon sit, injury) or their game is postponed. Shown so you can see
+        who the model would have ranked — they could still pinch-hit, but they're kept out
+        of the main rankings.
+      </div>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Player</th>
+              <th>Team</th>
+              <th>Opp</th>
+              <th className="num">Heat</th>
+              <th className="num">Season HR</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {players.map((t) => (
+              <tr key={`${t.player_id}-${t.opponent}`}>
+                <td>
+                  <Link className="player-link" to={`/player/${t.player_id}?asOf=${asOf}`}>
+                    {t.player_name}
+                  </Link>
+                </td>
+                <td><span className="pill">{t.team}</span></td>
+                <td className="subtle" style={{ fontSize: 12 }}>vs {t.opponent}</td>
+                <td className="num">{t.heat_score.toFixed(1)}</td>
+                <td className="num">{t.season_hr}</td>
+                <td><LineupStatusTag status={t.lineup_status} compact={false} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/** Small availability pill from lineup data (task #176). */
+function LineupStatusTag({ status, compact }: { status: import('../lib/stats').LineupStatus; compact?: boolean }) {
+  const cfg = {
+    confirmed:    { label: 'Confirmed',       short: '✓',  tone: 'good' as const,    tip: 'In the posted starting lineup' },
+    pending:      { label: 'Lineup pending',  short: '…',  tone: 'neutral' as const, tip: 'Lineup not posted yet — uncertainty penalty applied; reranks when it posts' },
+    not_starting: { label: 'Not starting',    short: '✗',  tone: 'bad' as const,     tip: 'Lineup posted but player is not in it (rest / platoon / injury)' },
+    postponed:    { label: 'Postponed',       short: '⊘',  tone: 'bad' as const,     tip: 'Game postponed / cancelled / suspended' },
+  }[status];
+  // Confirmed in the compact main-table context: keep it quiet (a green
+  // check) so the table isn't noisy; pending gets the full label.
+  if (status === 'confirmed' && compact !== false) {
+    return <span title={cfg.tip} style={{ color: 'var(--good, #4cd97a)', fontSize: 11 }}>✓</span>;
+  }
+  const bg = cfg.tone === 'good' ? 'rgba(64,200,120,0.14)' : cfg.tone === 'bad' ? 'rgba(255,110,110,0.14)' : 'rgba(200,160,60,0.16)';
+  const border = cfg.tone === 'good' ? '1px solid rgba(64,200,120,0.45)' : cfg.tone === 'bad' ? '1px solid rgba(255,110,110,0.45)' : '1px solid rgba(200,160,60,0.5)';
+  const color = cfg.tone === 'good' ? 'var(--good, #4cd97a)' : cfg.tone === 'bad' ? '#ff8d8d' : '#e0b84d';
+  return (
+    <span
+      title={cfg.tip}
+      style={{ display: 'inline-block', padding: '1px 6px', borderRadius: 999, fontSize: 10, fontWeight: 600, background: bg, border, color, whiteSpace: 'nowrap' }}
+    >
+      {cfg.label}
+    </span>
+  );
+}
+
 function ConfidenceBadge({
   confidence,
   compact,

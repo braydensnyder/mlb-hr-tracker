@@ -857,6 +857,11 @@ export const HEAT_SCORE_COLD_PENALTY = {
   mid: -4,
 } as const;
 
+/** Uncertainty penalty applied to a player whose lineup hasn't posted yet
+ *  ("pending"). Light + uniform so it doesn't distort morning rankings —
+ *  it only matters once SOME games confirm and others haven't. */
+export const HEAT_SCORE_LINEUP_PENDING_PENALTY = -5;
+
 export function stabilityFactor(season_hr: number, isElitePower = false): number {
   const effective = isElitePower
     ? Math.max(season_hr, HEAT_SCORE_STABILITY.elite_min_season_hr)
@@ -942,6 +947,26 @@ export interface HrTargetGame {
   /** ISO timestamp of the most recent successful enrichWeather write.
    *  Surfaced in the UI as "Updated 6:14 PM" + the temporary debug line. */
   weather_updated_at?: string | null;
+
+  // Lineups (null until enrich:lineups populates them). Drives the
+  // confirmed-starter / not-starting / pending classification.
+  home_lineup?: number[] | null;
+  away_lineup?: number[] | null;
+  lineups_confirmed?: boolean | null;
+  /** Game status string ("Scheduled", "Postponed", "In Progress", ...). */
+  game_status?: string | null;
+}
+
+/** Per-player availability classification derived from lineup data. */
+export type LineupStatus = 'confirmed' | 'pending' | 'not_starting' | 'postponed';
+
+/** Statuses that mean "no game will be played" — players from these games
+ *  are hidden from HR Targets. Mirrors scripts/extractLineups.ts (kept
+ *  inline so stats.ts has no cross-import into scripts/). */
+const DEAD_GAME_RX = /postponed|cancel|suspended|delayed: rain/i;
+export function isDeadGameStatus(status: string | null | undefined): boolean {
+  if (!status) return false;
+  return DEAD_GAME_RX.test(status);
 }
 
 /**
@@ -1283,6 +1308,14 @@ export interface HrTarget {
   /** True when weather actually moved the heat score (false = dome /
    *  missing data / net-zero swing). */
   weather_included: boolean;
+
+  /** Lineup availability (task #176):
+   *   'confirmed'    — player is in the posted batting order
+   *   'pending'      — lineup not posted yet (allowed, small uncertainty penalty)
+   *   'not_starting' — lineup posted, player NOT in it (bench/rest/injury)
+   *   'postponed'    — game postponed / cancelled / suspended
+   *  The HR Targets page hides not_starting + postponed from Top 10/50. */
+  lineup_status: LineupStatus;
 }
 
 export interface HrTargetsBoard {
@@ -1672,6 +1705,14 @@ export function computeHrTargets(
       wind_dir: string | null;
       updated_at: string | null;
     },
+    lineup: {
+      /** This team's posted batting order (player_ids), or [] when pending. */
+      order: number[];
+      /** True once the game's lineups are confirmed (both sides 9-man). */
+      confirmed: boolean;
+      /** Game postponed / cancelled / suspended. */
+      dead: boolean;
+    },
   ): HrTarget[] {
     const pool = candidatesByTeam.get(team) ?? [];
 
@@ -1949,6 +1990,32 @@ export function computeHrTargets(
         });
       }
 
+      // ---- LINEUP STATUS (task #176) ----
+      // Classify the player's availability from the posted batting order.
+      //   dead game            → 'postponed'
+      //   order posted + in it → 'confirmed'
+      //   order posted + absent→ 'not_starting'
+      //   order not posted     → 'pending' (small uncertainty penalty)
+      let lineup_status: LineupStatus;
+      if (lineup.dead) {
+        lineup_status = 'postponed';
+      } else if (lineup.order.length >= 9) {
+        lineup_status = lineup.order.includes(a.player_id) ? 'confirmed' : 'not_starting';
+      } else {
+        lineup_status = 'pending';
+      }
+      // Uncertainty penalty for pending lineups so confirmed starters edge
+      // out players whose status is unknown. Small + uniform — in the early
+      // morning when NO lineup is posted, every player gets it equally, so
+      // relative ranking is unchanged; it only bites once SOME lineups
+      // confirm. The page hides not_starting/postponed entirely, so no
+      // score penalty is needed for those.
+      if (lineup_status === 'pending') {
+        const penalty = HEAT_SCORE_LINEUP_PENDING_PENALTY;
+        heat += penalty;
+        adjustments.push({ label: 'Lineup pending (uncertainty)', delta: penalty });
+      }
+
       // Heat never goes below 0
       if (heat < 0) heat = 0;
 
@@ -2055,6 +2122,7 @@ export function computeHrTargets(
         weather_wind_dir: weather.wind_dir,
         weather_updated_at: weather.updated_at,
         weather_included: weather.adjustment.included,
+        lineup_status,
       };
       target.reason_chips = pickReasonChips(target);
       target.reasons = pickReasons(target);
@@ -2099,6 +2167,14 @@ export function computeHrTargets(
       updated_at: g.weather_updated_at ?? null,
     };
 
+    // Per-game lineup context. `dead` hides postponed/cancelled games.
+    const deadGame = isDeadGameStatus(g.game_status ?? null);
+    const homeOrder = g.home_lineup ?? [];
+    const awayOrder = g.away_lineup ?? [];
+    const lineupsConfirmed = !!g.lineups_confirmed;
+    const homeLineupCtx = { order: homeOrder, confirmed: lineupsConfirmed, dead: deadGame };
+    const awayLineupCtx = { order: awayOrder, confirmed: lineupsConfirmed, dead: deadGame };
+
     return {
       game_pk: g.game_pk,
       game_date: g.game_date,
@@ -2107,8 +2183,8 @@ export function computeHrTargets(
       venue_name: g.venue_name,
       away_facing: awayFacing,
       home_facing: homeFacing,
-      away_targets: rankForTeam(g.away_team, g.home_team, g.venue_name, awayFacing, weatherCtx),
-      home_targets: rankForTeam(g.home_team, g.away_team, g.venue_name, homeFacing, weatherCtx),
+      away_targets: rankForTeam(g.away_team, g.home_team, g.venue_name, awayFacing, weatherCtx, awayLineupCtx),
+      home_targets: rankForTeam(g.home_team, g.away_team, g.venue_name, homeFacing, weatherCtx, homeLineupCtx),
       weather_condition: weatherCtx.condition,
       weather_temp_f: weatherCtx.temp_f,
       weather_wind_mph: weatherCtx.wind_mph,
