@@ -4453,3 +4453,402 @@ export function buildActionableModelChanges(
   return { rules, simulation: full };
 }
 
+// =============================================================================
+//  Best Reconstructed Top 10 — hindsight optimization (task #194)
+// -----------------------------------------------------------------------------
+//  For each date in the window, search a small space of single-signal Δs and
+//  combo bonuses to find the rule set that would have placed the most actual
+//  HR hitters into the Top 10. Aggregate across dates to surface RECURRING
+//  rules (selected on multiple days) — those are repeatable patterns rather
+//  than one-day overfits.
+//
+//  STRICT honesty rules:
+//    • This is HINDSIGHT. Each day uses its own actual HR results to score
+//      candidate rule sets. Nothing here is appropriate as a live prediction.
+//    • The greedy search is a tractability compromise, not exhaustive. We
+//      surface the cross-window recurrence summary precisely because no
+//      single day's reconstructed rules should be trusted — only patterns
+//      that repeat.
+//    • SURFACED ONLY. The panel never mutates HEAT_SCORE_WEIGHTS or any
+//      scoring knob. The user reads the patterns and applies by hand.
+// =============================================================================
+
+/** One concrete rule selected by the per-day reconstruction. */
+export interface ReconstructedRule {
+  /** Stable id ("sig:hr_pitcher" or "combo:cold_batter+hr_pitcher"). */
+  id: string;
+  kind: 'single' | 'combo';
+  /** Signals that must ALL fire for the rule to apply. */
+  signals: SignalKey[];
+  /** Score adjustment added when the rule applies. */
+  delta: number;
+  /** Human-readable: "+4 HR Pitcher" or "+3 Cold Batter + HR Pitcher". */
+  text: string;
+}
+
+/** Side-by-side per-date reconstruction output. */
+export interface ReconstructedDay {
+  date: string;
+  /** Hit rate of the saved-snapshot Top 10. */
+  current_hits: number;
+  current_rate: number;
+  /** Hit rate after applying the best rule set found by the greedy search. */
+  reconstructed_hits: number;
+  reconstructed_rate: number;
+  /** Rule set the search converged on (≤ MAX_RULES_PER_DAY). */
+  rules: ReconstructedRule[];
+  /** Snapshot of the original Top 10 with hit flags. */
+  current_top10: SimulatedTop10Row[];
+  /** Snapshot of the reconstructed Top 10 with modified scores + matched rules. */
+  reconstructed_top10: SimulatedTop10Row[];
+  /** Players who entered the Top 10 via reconstruction. Sorted by new rank asc. */
+  added: { player_id: number; player_name: string; team: string; new_rank: number; hit: boolean }[];
+  /** Players pushed out of the Top 10 by reconstruction. Sorted by original rank asc. */
+  removed: { player_id: number; player_name: string; team: string; old_rank: number; hit: boolean }[];
+}
+
+/** Cross-window aggregator output: a rule that repeatedly improves Top 10. */
+export interface RecurringRule {
+  id: string;
+  text_template: string;            // "HR Pitcher" or "Cold Batter + HR Pitcher"
+  kind: 'single' | 'combo';
+  signals: SignalKey[];
+  /** Days the rule was selected. */
+  days_selected: number;
+  /** Total days analyzed (== ReconstructionResult.days_counted). */
+  total_days: number;
+  /** Average Δ across the days it was selected (positive or negative). */
+  avg_delta: number;
+  /** Average Top-10 hit-rate gain on those days when this rule was applied. */
+  avg_lift_pct_pts: number;
+  /** Score used to sort: days_selected × avg_lift × log scale. */
+  score: number;
+}
+
+export interface ReconstructionResult {
+  days: ReconstructedDay[];
+  /** Sum of current_hits across all days. */
+  total_current_hits: number;
+  total_reconstructed_hits: number;
+  /** Weighted hit rates across the window. */
+  current_top10_rate: number;
+  reconstructed_top10_rate: number;
+  /** Pct-pt improvement over the window. */
+  estimated_improvement: number;
+  /** Recurring rules, sorted by score desc. */
+  recurring: RecurringRule[];
+  /** Days included (== days.length). */
+  days_counted: number;
+  /** Fine print for the UI. */
+  note: string;
+}
+
+const RECONSTRUCT_MAX_RULES_PER_DAY = 5;
+
+/**
+ * Candidate rule pool searched per day. Single-signal Δs and a curated set
+ * of pair-combo bonuses. The user's example explicitly included:
+ *   +4 HR Pitcher, +3 Cold Batter + HR Pitcher, +3 Mid Power, -2 Hot L7d.
+ * The single-signal Δ set covers the first three; the combo pool covers the
+ * stack patterns surfaced by the actionable layer.
+ */
+function reconstructionCandidates(): ReconstructedRule[] {
+  const singles: SignalKey[] = [
+    'hr_pitcher', 'power_park', 'wind_out', 'warm_weather',
+    'hot_l7d', 'platoon_edge', 'elite_power', 'mid_power',
+    'cold_batter', 'pitcher_dominant',
+  ];
+  const combos: SignalKey[][] = [
+    ['cold_batter', 'hr_pitcher'],
+    ['hr_pitcher', 'power_park'],
+    ['hot_l7d', 'hr_pitcher'],
+    ['elite_power', 'warm_weather'],
+    ['wind_out', 'platoon_edge'],
+    ['hot_l7d', 'power_park'],
+    ['elite_power', 'hr_pitcher'],
+  ];
+  const deltas = [-4, -2, 2, 4];
+  const comboDeltas = [2, 3, 4];
+
+  const out: ReconstructedRule[] = [];
+  for (const sig of singles) {
+    for (const d of deltas) {
+      out.push({
+        id: `sig:${sig}@${d}`,
+        kind: 'single',
+        signals: [sig],
+        delta: d,
+        text: `${d > 0 ? '+' : ''}${d} ${SIGNAL_LABELS[sig]}`,
+      });
+    }
+  }
+  for (const c of combos) {
+    for (const d of comboDeltas) {
+      const sorted = c.slice().sort();
+      out.push({
+        id: `combo:${sorted.join('+')}@${d}`,
+        kind: 'combo',
+        signals: sorted,
+        delta: d,
+        text: `+${d} ${c.map((s) => SIGNAL_LABELS[s]).join(' + ')}`,
+      });
+    }
+  }
+  return out;
+}
+
+type ReconRow = {
+  player_id: number;
+  player_name: string;
+  team: string;
+  heat_score: number;
+  signals: Set<SignalKey>;
+  hit: boolean;
+  original_rank: number;
+};
+
+/** Re-rank rows under a rule set, return the top 10 ids and hit count. */
+function scoreUnderRules(rows: ReconRow[], rules: ReconstructedRule[]): {
+  top10: { row: ReconRow; modified: number; applied: string[] }[];
+  hits: number;
+} {
+  const scored = rows.map((r) => {
+    const applied: string[] = [];
+    let modified = r.heat_score;
+    for (const rule of rules) {
+      if (rule.signals.every((s) => r.signals.has(s))) {
+        modified += rule.delta;
+        applied.push(rule.id);
+      }
+    }
+    return { row: r, modified, applied };
+  });
+  scored.sort((a, b) => b.modified - a.modified);
+  const top10 = scored.slice(0, 10);
+  let hits = 0;
+  for (const t of top10) if (t.row.hit) hits++;
+  return { top10, hits };
+}
+
+/** Greedy beam search: at each step, try every candidate not yet in the
+ *  rule set, keep the one that improves hit-count the most. Stop when
+ *  nothing improves or MAX_RULES_PER_DAY reached. Ties broken by
+ *  smaller |Δ| (prefer subtler rules). */
+function reconstructDay(
+  date: string,
+  rows: ReconRow[],
+  candidates: ReconstructedRule[],
+): ReconstructedDay {
+  // Baseline: the saved Top 10 (by original_rank).
+  const baselineSorted = rows.slice().sort((a, b) => a.original_rank - b.original_rank);
+  const baselineTop10 = baselineSorted.slice(0, 10);
+  const baselineHits = baselineTop10.reduce((s, r) => s + (r.hit ? 1 : 0), 0);
+
+  let bestRules: ReconstructedRule[] = [];
+  let bestHits = baselineHits;
+  let improved = true;
+
+  while (improved && bestRules.length < RECONSTRUCT_MAX_RULES_PER_DAY) {
+    improved = false;
+    let bestCandidate: ReconstructedRule | null = null;
+    let bestCandidateHits = bestHits;
+    let bestCandidateDelta = Infinity;
+    const usedIds = new Set(bestRules.map((r) => r.id));
+    // Also skip candidates whose signals match an already-selected rule
+    // with the OPPOSITE sign — those just cancel out and waste rule slots.
+    const usedSignatures = new Set(bestRules.map((r) => `${r.kind}:${r.signals.slice().sort().join('+')}`));
+    for (const cand of candidates) {
+      if (usedIds.has(cand.id)) continue;
+      const sig = `${cand.kind}:${cand.signals.slice().sort().join('+')}`;
+      if (usedSignatures.has(sig)) continue; // already have a rule on this signal
+      const trial = bestRules.concat([cand]);
+      const { hits } = scoreUnderRules(rows, trial);
+      if (hits > bestCandidateHits || (hits === bestCandidateHits && Math.abs(cand.delta) < bestCandidateDelta)) {
+        bestCandidateHits = hits;
+        bestCandidate = cand;
+        bestCandidateDelta = Math.abs(cand.delta);
+      }
+    }
+    if (bestCandidate && bestCandidateHits > bestHits) {
+      bestRules.push(bestCandidate);
+      bestHits = bestCandidateHits;
+      improved = true;
+    }
+  }
+
+  // Build the side-by-side output rows.
+  const current = scoreUnderRules(rows, []);   // identity (no rules) for the snapshot view
+  const reconstructed = scoreUnderRules(rows, bestRules);
+
+  const currentTop10Rows: SimulatedTop10Row[] = baselineTop10.map((r, i) => ({
+    rank: i + 1,
+    player_id: r.player_id,
+    player_name: r.player_name,
+    team: r.team,
+    heat_score: r.heat_score,
+    modified_score: r.heat_score,
+    rules_applied: [],
+    hit: r.hit,
+    in_both: reconstructed.top10.some((s) => s.row.player_id === r.player_id),
+  }));
+  const reconstructedTop10Rows: SimulatedTop10Row[] = reconstructed.top10.map((s, i) => ({
+    rank: i + 1,
+    player_id: s.row.player_id,
+    player_name: s.row.player_name,
+    team: s.row.team,
+    heat_score: s.row.heat_score,
+    modified_score: s.modified,
+    rules_applied: s.applied,
+    hit: s.row.hit,
+    in_both: baselineTop10.some((r) => r.player_id === s.row.player_id),
+  }));
+
+  const baselineIds = new Set(baselineTop10.map((r) => r.player_id));
+  const reconIds = new Set(reconstructed.top10.map((s) => s.row.player_id));
+  const added: ReconstructedDay['added'] = [];
+  const removed: ReconstructedDay['removed'] = [];
+  reconstructed.top10.forEach((s, i) => {
+    if (!baselineIds.has(s.row.player_id)) {
+      added.push({
+        player_id: s.row.player_id,
+        player_name: s.row.player_name,
+        team: s.row.team,
+        new_rank: i + 1,
+        hit: s.row.hit,
+      });
+    }
+  });
+  baselineTop10.forEach((r, i) => {
+    if (!reconIds.has(r.player_id)) {
+      removed.push({
+        player_id: r.player_id,
+        player_name: r.player_name,
+        team: r.team,
+        old_rank: i + 1,
+        hit: r.hit,
+      });
+    }
+  });
+
+  return {
+    date,
+    current_hits: baselineHits,
+    current_rate: baselineHits / 10,
+    reconstructed_hits: bestHits,
+    reconstructed_rate: bestHits / 10,
+    rules: bestRules,
+    current_top10: currentTop10Rows,
+    reconstructed_top10: reconstructedTop10Rows,
+    added,
+    removed,
+  };
+}
+
+/**
+ * Reconstruct each day in the window, then surface RECURRING rules — those
+ * the search selected on multiple days. Recurring rules are the only ones
+ * the user should consider acting on: a rule selected on a single day is
+ * almost certainly a fit to that day's specific HR distribution.
+ *
+ * @param snapshots  all snapshot rows in the window (any rank)
+ * @param hrPlayersByDate game_date → set of player_ids who homered
+ */
+export function reconstructBestTop10(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+): ReconstructionResult {
+  const candidates = reconstructionCandidates();
+
+  // Group snapshot rows by date and pre-parse signals once per row.
+  const byDate = new Map<string, ReconRow[]>();
+  for (const snap of snapshots) {
+    const hrSet = hrPlayersByDate.get(snap.target_date) ?? new Set<number>();
+    const row: ReconRow = {
+      player_id: snap.player_id,
+      player_name: snap.player_name ?? `#${snap.player_id}`,
+      team: snap.team ?? '',
+      heat_score: snap.heat_score,
+      signals: parseSignalsFromReason(snap.reason),
+      hit: hrSet.has(snap.player_id),
+      original_rank: snap.rank,
+    };
+    const arr = byDate.get(snap.target_date);
+    if (arr) arr.push(row); else byDate.set(snap.target_date, [row]);
+  }
+
+  // Per-day reconstruction.
+  const sortedDates = Array.from(byDate.keys()).sort();
+  const days: ReconstructedDay[] = [];
+  for (const date of sortedDates) {
+    const rows = byDate.get(date)!;
+    if (rows.length < 10) continue; // not enough rows to fill a Top 10
+    days.push(reconstructDay(date, rows, candidates));
+  }
+
+  // Cross-day rule aggregation. Group by "structural id" — kind + signals,
+  // ignoring the specific Δ — so e.g. "+2 HR Pitcher" and "+4 HR Pitcher"
+  // both contribute to the "HR Pitcher" recurring entry.
+  type AccumKey = string;
+  const accum = new Map<AccumKey, {
+    id: string;
+    text_template: string;
+    kind: 'single' | 'combo';
+    signals: SignalKey[];
+    days_selected: number;
+    delta_sum: number;
+    lift_pct_pts_sum: number;
+  }>();
+  for (const day of days) {
+    const lift = day.reconstructed_rate - day.current_rate;
+    for (const rule of day.rules) {
+      const key = `${rule.kind}:${rule.signals.slice().sort().join('+')}`;
+      let entry = accum.get(key);
+      if (!entry) {
+        entry = {
+          id: key,
+          text_template: rule.signals.map((s) => SIGNAL_LABELS[s]).join(' + '),
+          kind: rule.kind,
+          signals: rule.signals.slice(),
+          days_selected: 0,
+          delta_sum: 0,
+          lift_pct_pts_sum: 0,
+        };
+        accum.set(key, entry);
+      }
+      entry.days_selected += 1;
+      entry.delta_sum += rule.delta;
+      entry.lift_pct_pts_sum += lift * 100;
+    }
+  }
+  const recurring: RecurringRule[] = Array.from(accum.values()).map((e) => {
+    const avgDelta = e.days_selected > 0 ? e.delta_sum / e.days_selected : 0;
+    const avgLift = e.days_selected > 0 ? e.lift_pct_pts_sum / e.days_selected : 0;
+    return {
+      id: e.id,
+      text_template: e.text_template,
+      kind: e.kind,
+      signals: e.signals,
+      days_selected: e.days_selected,
+      total_days: days.length,
+      avg_delta: Number(avgDelta.toFixed(2)),
+      avg_lift_pct_pts: Number(avgLift.toFixed(1)),
+      // Score: days_selected dominates, but reward magnitude too.
+      score: e.days_selected * Math.max(0.5, avgLift),
+    };
+  }).sort((a, b) => b.score - a.score);
+
+  const totalCurrent = days.reduce((s, d) => s + d.current_hits, 0);
+  const totalRecon = days.reduce((s, d) => s + d.reconstructed_hits, 0);
+  const slots = days.length * 10;
+  return {
+    days,
+    total_current_hits: totalCurrent,
+    total_reconstructed_hits: totalRecon,
+    current_top10_rate: slots > 0 ? totalCurrent / slots : 0,
+    reconstructed_top10_rate: slots > 0 ? totalRecon / slots : 0,
+    estimated_improvement: slots > 0 ? (totalRecon - totalCurrent) / slots : 0,
+    recurring,
+    days_counted: days.length,
+    note: 'Hindsight reconstruction — each day uses its own actual HR results to score rule sets. Do NOT use any single day as a live prediction. Look for RECURRING rules below.',
+  };
+}

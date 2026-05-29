@@ -37,6 +37,7 @@ import {
   computeCertifiedSleepers,
   currentReverseAnalysisWeights,
   pitcherHrLeaderboard,
+  reconstructBestTop10,
   venueLeaderboard,
   ELITE_POWER_NAMES,
   type ActionableRule,
@@ -46,6 +47,7 @@ import {
   type HrTargetsBoard,
   type PitcherFormLite,
   type PlayerTeamIndex,
+  type ReconstructionResult,
   type ReverseAnalysisResult,
   type RevAnalysisSnapshotRow,
   type SimulatedTop10Result,
@@ -206,6 +208,7 @@ export default function HrTargets() {
   const [revResult, setRevResult] = useState<ReverseAnalysisResult | null>(null);
   const [revRules, setRevRules] = useState<ActionableRule[] | null>(null);
   const [revSim, setRevSim] = useState<SimulatedTop10Result | null>(null);
+  const [revRecon, setRevRecon] = useState<ReconstructionResult | null>(null);
   const [revLoadedFor, setRevLoadedFor] = useState<string | null>(null);
 
   async function loadReverseAnalysis(anchorDate: string) {
@@ -240,9 +243,13 @@ export default function HrTargets() {
       // Top-10 over the same window (the user-visible deliverable). Done
       // inline here so a single fetch powers everything in the panel.
       const built = buildActionableModelChanges(result, minimal, hrByDate);
+      // Hindsight reconstruction — per-day greedy search + recurring rule
+      // aggregator. Strictly read-only over the same snapshots/HR window.
+      const recon = reconstructBestTop10(minimal, hrByDate);
       setRevResult(result);
       setRevRules(built.rules);
       setRevSim(built.simulation);
+      setRevRecon(recon);
       setRevLoadedFor(anchorDate);
     } catch (e) {
       // eslint-disable-next-line no-console
@@ -250,6 +257,7 @@ export default function HrTargets() {
       setRevResult(null);
       setRevRules(null);
       setRevSim(null);
+      setRevRecon(null);
     } finally {
       setRevLoading(false);
     }
@@ -764,6 +772,7 @@ export default function HrTargets() {
         analysis={revResult}
         actionable={revRules}
         simulation={revSim}
+        reconstruction={revRecon}
         loading={revLoading}
         open={revOpen}
         onToggle={toggleRev}

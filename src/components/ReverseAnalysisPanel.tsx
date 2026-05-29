@@ -23,6 +23,9 @@ import type {
   ActionableRule,
   SimulatedTop10Result,
   SimulatedTop10Day,
+  ReconstructionResult,
+  ReconstructedDay,
+  RecurringRule,
 } from '../lib/stats';
 
 interface Props {
@@ -31,6 +34,8 @@ interface Props {
   /** Actionable rules + simulation. Null while loading or empty window. */
   actionable: ActionableRule[] | null;
   simulation: SimulatedTop10Result | null;
+  /** Hindsight reconstruction across the window. */
+  reconstruction: ReconstructionResult | null;
   /** Loading indicator from the page. */
   loading: boolean;
   /** Render the toggle as expanded? Owned by parent so close-state survives. */
@@ -91,6 +96,7 @@ export default function ReverseAnalysisPanel(p: Props) {
               analysis={p.analysis}
               actionable={p.actionable ?? []}
               simulation={p.simulation}
+              reconstruction={p.reconstruction}
             />
           )}
         </>
@@ -151,16 +157,18 @@ function Header({ open, onToggle, loading, analysis, asOf, windowDays }: {
   );
 }
 
-function Body({ analysis, actionable, simulation }: {
+function Body({ analysis, actionable, simulation, reconstruction }: {
   analysis: ReverseAnalysisResult;
   actionable: ActionableRule[];
   simulation: SimulatedTop10Result | null;
+  reconstruction: ReconstructionResult | null;
 }) {
   return (
     <div style={{ display: 'grid', gap: 18, marginTop: 12 }}>
       {/* Lead with the actionable findings — that's what the user came for. */}
       <ActionableChangesSection rules={actionable} />
       {simulation && <SimulatedTop10Section sim={simulation} />}
+      {reconstruction && <BestReconstructedTop10Section recon={reconstruction} />}
 
       {/* Supporting evidence below — same as the original analysis layer. */}
       <details style={{ borderTop: '1px solid #232732', paddingTop: 12 }}>
@@ -661,6 +669,268 @@ function SimTop10Card({ title, rows, highlightKey }: {
   );
 }
 
+// =============================================================================
+//  Best Reconstructed Top 10 — hindsight optimization section
+// =============================================================================
+
+function BestReconstructedTop10Section({ recon }: { recon: ReconstructionResult }) {
+  const [selectedIdx, setSelectedIdx] = useState<number>(recon.days.length - 1);
+  const day = recon.days[Math.min(selectedIdx, recon.days.length - 1)];
+
+  return (
+    <div>
+      <h4 className="rev-h4">🎯 Best Reconstructed Top 10 — Hindsight Search</h4>
+      <p className="rev-sub">
+        Working <em>backwards</em> from actual HR results: for each day, search a small
+        rule space (single-signal Δs and combo bonuses) and pick the combination that
+        would have placed the most actual HR hitters into the Top 10.
+        <strong style={{ color: '#ffb86c' }}> Hindsight only — never a live prediction.</strong>
+        {' '}Trust the <strong>Recurring Rules</strong> summary below, not any single day.
+      </p>
+
+      <div className="rev-kpis" style={{ marginTop: 6 }}>
+        <div className="rev-kpi">
+          <div className="rev-kpi-label">Current Top-10 rate</div>
+          <div className="rev-kpi-value">{pct(recon.current_top10_rate)}</div>
+          <div className="rev-kpi-sub">{recon.total_current_hits} hits / {recon.days_counted}d × 10</div>
+        </div>
+        <div className="rev-kpi">
+          <div className="rev-kpi-label">Reconstructed rate</div>
+          <div className="rev-kpi-value rev-pos">{pct(recon.reconstructed_top10_rate)}</div>
+          <div className="rev-kpi-sub">{recon.total_reconstructed_hits} hits / {recon.days_counted}d × 10</div>
+        </div>
+        <div className="rev-kpi">
+          <div className="rev-kpi-label">Hindsight ceiling</div>
+          <div className="rev-kpi-value rev-pos">+{pct(recon.estimated_improvement)}</div>
+          <div className="rev-kpi-sub">upper bound, not actionable</div>
+        </div>
+      </div>
+
+      <RecurringRulesPanel recurring={recon.recurring} totalDays={recon.days_counted} />
+
+      {day && (
+        <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 16, flexWrap: 'wrap' }}>
+            <h5 className="rev-h5" style={{ margin: 0 }}>Per-day reconstruction</h5>
+            <select
+              value={selectedIdx}
+              onChange={(e) => setSelectedIdx(Number(e.target.value))}
+              style={{
+                background: '#0c0e14', color: '#cfe', border: '1px solid #2a2d36',
+                borderRadius: 6, padding: '4px 8px', fontSize: 13,
+              }}
+            >
+              {recon.days.map((d, i) => (
+                <option key={d.date} value={i}>
+                  {d.date} (current {d.current_hits}/10 → reconstructed {d.reconstructed_hits}/10
+                  {d.reconstructed_hits > d.current_hits ? `, +${d.reconstructed_hits - d.current_hits}` : ''})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <ReconstructionDayCard day={day} />
+        </>
+      )}
+      <p className="rev-sub" style={{ marginTop: 8, fontSize: 11 }}>{recon.note}</p>
+    </div>
+  );
+}
+
+function RecurringRulesPanel({ recurring, totalDays }: { recurring: RecurringRule[]; totalDays: number }) {
+  // Surface rules selected on at least 2 days — single-day picks are likely overfits.
+  const recurringOnly = recurring.filter((r) => r.days_selected >= 2);
+  return (
+    <div className="rev-card" style={{ marginTop: 12, borderLeft: '3px solid #ffb86c' }}>
+      <h5 className="rev-h5">📊 Recurring Rules ({totalDays}-day summary)</h5>
+      <p className="rev-sub" style={{ marginBottom: 8 }}>
+        Rules selected by the search on multiple days — these are the patterns
+        less likely to be one-day overfits and worth investigating manually.
+      </p>
+      {recurringOnly.length === 0 ? (
+        <p className="rev-sub">
+          No rule was selected on more than one day. Either the window is too
+          small to find recurring patterns, or each day's HR distribution is
+          unique enough that no single rule helps across days. Wait for more
+          data before drawing conclusions.
+        </p>
+      ) : (
+        <div className="rev-table-wrap">
+          <table className="rev-table">
+            <thead>
+              <tr>
+                <th>Rule pattern</th>
+                <th className="num">Days</th>
+                <th className="num">Avg Δ</th>
+                <th className="num">Avg lift</th>
+                <th>Signature</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recurringOnly.map((r) => (
+                <tr key={r.id}>
+                  <td><strong>{r.text_template}</strong></td>
+                  <td className="num">
+                    <span className={
+                      r.days_selected >= Math.ceil(totalDays * 0.6) ? 'rev-confchip rev-confchip--high'
+                      : r.days_selected >= Math.ceil(totalDays * 0.3) ? 'rev-confchip rev-confchip--medium'
+                      : 'rev-confchip rev-confchip--low'
+                    }>
+                      {r.days_selected}/{r.total_days}
+                    </span>
+                  </td>
+                  <td className={`num ${r.avg_delta > 0 ? 'rev-pos' : r.avg_delta < 0 ? 'rev-neg' : ''}`}>
+                    {r.avg_delta > 0 ? '+' : ''}{r.avg_delta.toFixed(1)}
+                  </td>
+                  <td className={`num ${r.avg_lift_pct_pts > 0 ? 'rev-pos' : ''}`}>
+                    +{r.avg_lift_pct_pts.toFixed(1)} pp
+                  </td>
+                  <td>
+                    <code style={{ fontSize: 10 }}>{r.kind}</code>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReconstructionDayCard({ day }: { day: ReconstructedDay }) {
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div className="rev-grid2">
+        {/* Current Top 10 */}
+        <ReconTop10Card
+          title={`Current Top 10 — ${day.date}`}
+          subtitle={`${day.current_hits}/10 hits`}
+          rows={day.current_top10}
+          highlightKey="dropped"
+        />
+        {/* Reconstructed Top 10 */}
+        <ReconTop10Card
+          title={`Reconstructed Top 10 — ${day.date}`}
+          subtitle={`${day.reconstructed_hits}/10 hits`}
+          rows={day.reconstructed_top10}
+          highlightKey="new"
+        />
+      </div>
+
+      <div className="rev-grid2" style={{ marginTop: 10 }}>
+        {/* Rules that produced this reconstruction */}
+        <div className="rev-card">
+          <h5 className="rev-h5">Rules that produced it</h5>
+          {day.rules.length === 0 ? (
+            <p className="rev-sub">No rule combination improved Top-10 hits on this day.</p>
+          ) : (
+            <div className="rev-recon-rules">
+              {day.rules.map((r) => (
+                <div key={r.id} className="rev-recon-rule">
+                  <code>{r.text}</code>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Added / removed lists */}
+        <div className="rev-card">
+          <h5 className="rev-h5">Diff</h5>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+            <div>
+              <div className="rev-sub" style={{ marginBottom: 4 }}>
+                <span className="rev-pos">Added</span> ({day.added.length})
+              </div>
+              {day.added.length === 0 ? (
+                <div className="rev-sub" style={{ fontSize: 11 }}>—</div>
+              ) : (
+                <ul className="rev-diff-list">
+                  {day.added.map((a) => (
+                    <li key={a.player_id}>
+                      <span style={{ color: a.hit ? '#6bd482' : '#aab1c0' }}>
+                        {a.hit ? '✓ ' : '· '}{a.player_name}
+                      </span>
+                      <span className="rev-sub" style={{ fontSize: 10 }}> #{a.new_rank} · {a.team}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div>
+              <div className="rev-sub" style={{ marginBottom: 4 }}>
+                <span className="rev-neg">Removed</span> ({day.removed.length})
+              </div>
+              {day.removed.length === 0 ? (
+                <div className="rev-sub" style={{ fontSize: 11 }}>—</div>
+              ) : (
+                <ul className="rev-diff-list">
+                  {day.removed.map((r) => (
+                    <li key={r.player_id}>
+                      <span style={{ color: r.hit ? '#6bd482' : '#aab1c0' }}>
+                        {r.hit ? '✓ ' : '· '}{r.player_name}
+                      </span>
+                      <span className="rev-sub" style={{ fontSize: 10 }}> #{r.old_rank} · {r.team}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ReconTop10Card({ title, subtitle, rows, highlightKey }: {
+  title: string;
+  subtitle: string;
+  rows: { rank: number; player_id: number; player_name: string; team: string; heat_score: number; modified_score: number; rules_applied: string[]; hit: boolean; in_both: boolean }[];
+  highlightKey: 'new' | 'dropped';
+}) {
+  return (
+    <div className="rev-card">
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+        <h5 className="rev-h5" style={{ margin: 0 }}>{title}</h5>
+        <span className="rev-sub" style={{ fontSize: 11 }}>{subtitle}</span>
+      </div>
+      <div className="rev-table-wrap" style={{ marginTop: 6 }}>
+        <table className="rev-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Player</th>
+              <th>Team</th>
+              <th className="num">Heat</th>
+              <th className="num">Mod</th>
+              <th>HR?</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => {
+              const cls = r.in_both ? '' : highlightKey === 'new' ? 'rev-row--new' : 'rev-row--dropped';
+              return (
+                <tr key={`${r.rank}-${r.player_id}`} className={cls}>
+                  <td>{r.rank}</td>
+                  <td>{r.player_name}</td>
+                  <td>{r.team}</td>
+                  <td className="num">{r.heat_score.toFixed(1)}</td>
+                  <td className={`num ${r.modified_score !== r.heat_score ? (r.modified_score > r.heat_score ? 'rev-pos' : 'rev-neg') : ''}`}>
+                    {r.modified_score.toFixed(1)}
+                  </td>
+                  <td>{r.hit ? '✓' : '·'}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function FinePrint() {
   return (
     <p className="rev-sub" style={{ fontSize: 11, marginTop: 8 }}>
@@ -798,6 +1068,26 @@ function Styles() {
       /* Simulated Top-10 row highlights */
       .rev-row--new td { background: rgba(50, 130, 70, 0.15); }
       .rev-row--dropped td { background: rgba(150, 60, 60, 0.12); opacity: 0.85; }
+
+      /* Reconstruction rules + diff */
+      .rev-recon-rules { display: grid; gap: 4px; margin-top: 6px; }
+      .rev-recon-rule {
+        background: #0c0e14;
+        border: 1px solid #1f2330;
+        border-radius: 6px;
+        padding: 5px 8px;
+        font-size: 12.5px;
+      }
+      .rev-recon-rule code {
+        background: transparent;
+        color: #ffd28c;
+        font-weight: 600;
+      }
+      .rev-diff-list {
+        list-style: none; padding: 0; margin: 0;
+        font-size: 12px; display: grid; gap: 3px;
+      }
+      .rev-diff-list li { line-height: 1.35; }
     `}</style>
   );
 }
