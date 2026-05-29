@@ -2920,6 +2920,217 @@ export function computeSleepers(
 }
 
 // =====================================================================
+// COLD BATTER REBOUND — discovery card for the Sleeper / Chaos area
+// =====================================================================
+//
+// Surfaces hitters whose Cold Batter penalty is firing but who ALSO carry
+// real upside signal (HR pitcher, power park, wind out, warm weather,
+// platoon edge, mid power, elite power). These are players the Heat Score
+// may be over-penalizing on recent form — the rebound score quantifies
+// "how much upside is sitting under the cold drag."
+//
+// STRICT honesty rules (same as the sleeper layer):
+//   • Read-only over the already-ranked HrTarget list. Does NOT mutate
+//     heat_score, rank, or anything that feeds back into the core board.
+//   • Filtered AFTER lineup_status filtering — postponed / not_starting
+//     players never surface here either.
+//   • Status display only — the user opens it as a discovery list. Nothing
+//     here pushes a player into the Top 10.
+
+export interface ColdReboundCandidate {
+  player_id: number;
+  player_name: string;
+  team: string;
+  opponent: string;
+  /** Current Heat Score and 1-based rank in the main board so the user
+   *  sees how buried the cold penalty has the player. */
+  heat_score: number;
+  heat_rank: number;
+  /** Cold drag the model applied (always negative). The rebound score
+   *  adds the absolute value back so over-penalization is visible. */
+  cold_penalty: number;
+  /** Sum of upside components — see computeColdBatterRebound below. */
+  upside_total: number;
+  /** Final rebound score = upside_total + |cold_penalty|. Higher = more
+   *  signal sitting under the cold drag. */
+  rebound_score: number;
+  /** Reason chips: Cold Batter (bad) + each upside signal that fires. */
+  tags: ReasonChip[];
+  /** Book implied probability + American odds if available. */
+  implied_prob: number | null;
+  american_odds: number | null;
+}
+
+/**
+ * Build the Cold Batter Rebound board.
+ *
+ * Detection criteria — player must satisfy BOTH:
+ *   1) Cold Batter penalty active: hrs_l7d === 0 AND season_hr ≥ 8
+ *      (mirrors the Cold chip threshold in pickReasonChips). The actual
+ *      cold penalty applied is -8 (elite ≥ 12 season HR) or -4 (mid ≥ 8).
+ *   2) At least ONE upside signal: HR Pitcher, Power Park, Wind Out,
+ *      Warm Weather, Platoon Edge, Mid Power, or Elite Power.
+ *
+ * Rebound score weights (kept consistent with the sleeper layer):
+ *   HR Pitcher        +20
+ *   Wind Out          +14
+ *   Platoon Edge      +10
+ *   Power Park        +10
+ *   Warm Weather      + 5
+ *   Power Rating       0–20  (elite=+20, strong=+14, mid=+8, else 0)
+ *   − Cold Penalty   +4 or +8 (the abs() of the model's cold drag,
+ *                              added back so over-penalization is visible)
+ *
+ * Returns the top N (default 5) candidates sorted by rebound score desc.
+ *
+ * IMPORTANT: this is read-only over `ranked`. It never mutates the input
+ * objects, and consumers must NOT feed this back into the core board.
+ */
+export function computeColdBatterRebound(
+  ranked: HrTarget[],
+  oddsByPlayer: Map<number, SleeperOddsLite>,
+  opts: { topN?: number } = {},
+): ColdReboundCandidate[] {
+  const topN = opts.topN ?? 5;
+
+  // Defensively sort by heat_score so the heat_rank we attach is correct
+  // even if the caller passed an unsorted list.
+  const sorted = ranked.slice().sort((a, b) => b.heat_score - a.heat_score);
+  const out: ColdReboundCandidate[] = [];
+
+  for (let i = 0; i < sorted.length; i++) {
+    const t = sorted[i];
+    const heatRank = i + 1;
+
+    // -------- 1) Cold Batter penalty must be active --------
+    const isCold = t.hrs_l7d === 0 && t.season_hr >= 8;
+    if (!isCold) continue;
+    const isEliteCold = t.season_hr >= HEAT_SCORE_STABILITY.auto_elite_hr;
+    const coldPenalty = isEliteCold ? HEAT_SCORE_COLD_PENALTY.elite : HEAT_SCORE_COLD_PENALTY.mid;
+
+    // -------- 2) Collect upside signals --------
+    const tags: ReasonChip[] = [
+      { kind: 'cold', label: 'Cold Batter', tone: 'bad', detail: `0 HR last 7d on ${t.season_hr} season HR` },
+    ];
+    let upside = 0;
+
+    // HR Pitcher
+    const havePitcherStarts = t.pitcher_starts_known >= 3;
+    const hrPitcher =
+      t.pitcher_l14d_allowed >= 3 ||
+      (havePitcherStarts && t.pitcher_l5_starts_allowed >= 4);
+    if (hrPitcher) {
+      upside += 20;
+      tags.push({
+        kind: 'hr_pitcher',
+        label: 'HR Pitcher',
+        tone: 'good',
+        detail: `Allowed ${Math.max(t.pitcher_l14d_allowed, t.pitcher_l5_starts_allowed)} HR recently`,
+      });
+    }
+
+    // Wind Out (10+ mph, "out to" direction)
+    const windMph = t.weather_wind_mph ?? 0;
+    const windDir = (t.weather_wind_dir ?? '').toLowerCase();
+    const windOut = windMph >= 10 && /out/.test(windDir);
+    if (windOut) {
+      upside += 14;
+      tags.push({
+        kind: 'wind_out',
+        label: 'Wind Out',
+        tone: 'good',
+        detail: `${windMph}mph ${t.weather_wind_dir}`,
+      });
+    }
+
+    // Warm Weather
+    const warm = (t.weather_temp_f ?? 0) >= 85;
+    if (warm) {
+      upside += 5;
+      tags.push({
+        kind: 'warm',
+        label: 'Warm',
+        tone: 'good',
+        detail: `${t.weather_temp_f}°F`,
+      });
+    }
+
+    // Platoon Edge (opposite-hand with a real season sample)
+    let platoonEdge = false;
+    if (t.pitcher_hand === 'L' || t.pitcher_hand === 'R') {
+      const oppHand = t.batter_side && t.batter_side !== t.pitcher_hand;
+      const vsHand = t.pitcher_hand === 'L' ? t.vs_lhp_season : t.vs_rhp_season;
+      if (oppHand && vsHand >= 3) {
+        platoonEdge = true;
+        upside += 10;
+        tags.push({
+          kind: 'platoon',
+          label: 'Platoon Edge',
+          tone: 'good',
+          detail: `${t.batter_side}HB vs ${t.pitcher_hand}HP, ${vsHand} HR vs hand`,
+        });
+      }
+    }
+
+    // Power Park
+    const powerPark = t.venue_l14d_rank != null && t.venue_l14d_rank <= 5;
+    if (powerPark) {
+      upside += 10;
+      tags.push({
+        kind: 'power_park',
+        label: 'Power Park',
+        tone: 'good',
+        detail: `Top ${t.venue_l14d_rank} venue L14d`,
+      });
+    }
+
+    // Power Rating — Elite / Strong / Mid (gradient on season_hr / elite list)
+    let powerTag: ReasonChip | null = null;
+    if (t.is_elite_power || t.season_hr >= 25) {
+      upside += 20;
+      powerTag = { kind: 'power', label: 'Elite Power', tone: 'good', detail: `${t.season_hr} season HR` };
+    } else if (t.season_hr >= 15) {
+      upside += 14;
+      powerTag = { kind: 'power', label: 'Strong Power', tone: 'good', detail: `${t.season_hr} season HR` };
+    } else if (t.season_hr >= 8) {
+      upside += 8;
+      powerTag = { kind: 'power', label: 'Mid Power', tone: 'good', detail: `${t.season_hr} season HR` };
+    }
+    if (powerTag) tags.push(powerTag);
+
+    // -------- 3) Require ≥ 1 upside signal --------
+    // tags[0] is always the Cold Batter chip, so we need at least 2.
+    if (tags.length < 2) continue;
+    if (upside === 0) continue;
+
+    // -------- 4) Rebound score: upside + |cold drag| --------
+    const reboundScore = upside - coldPenalty; // coldPenalty is negative → adds magnitude
+
+    const odds = oddsByPlayer.get(t.player_id) ?? null;
+    out.push({
+      player_id: t.player_id,
+      player_name: t.player_name,
+      team: t.team,
+      opponent: t.opponent,
+      heat_score: t.heat_score,
+      heat_rank: heatRank,
+      cold_penalty: coldPenalty,
+      upside_total: upside,
+      rebound_score: Number(reboundScore.toFixed(1)),
+      // Cap at 7 chips — Cold (always first) + all 6 possible upside
+      // signals (HR Pitcher, Wind Out, Warm, Platoon, Power Park, Power).
+      tags: tags.slice(0, 7),
+      implied_prob: odds?.implied_prob ?? null,
+      american_odds: odds?.american_odds ?? null,
+    });
+  }
+
+  return out
+    .sort((a, b) => b.rebound_score - a.rebound_score)
+    .slice(0, topN);
+}
+
+// =====================================================================
 // Consensus Picks + Market Disagreement (controlled-tuning request)
 // =====================================================================
 //

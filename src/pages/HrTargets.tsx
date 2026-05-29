@@ -24,11 +24,13 @@ import WeatherLine from '../components/WeatherLine';
 import ReasonChips, { ReasonChipDetails } from '../components/ReasonChips';
 import SleeperBoardPanel from '../components/SleeperBoard';
 import CertifiedSleeperBoard from '../components/CertifiedSleeperBoard';
+import ColdBatterReboundCard from '../components/ColdBatterReboundCard';
 import ReverseAnalysisPanel from '../components/ReverseAnalysisPanel';
 import {
   addDays,
   applyCanonicalTeams,
   buildActionableModelChanges,
+  computeColdBatterRebound,
   computeHrTargets,
   computeReverseAnalysis,
   computeSleepers,
@@ -38,6 +40,7 @@ import {
   venueLeaderboard,
   ELITE_POWER_NAMES,
   type ActionableRule,
+  type ColdReboundCandidate,
   type HrTarget,
   type HrTargetGame,
   type HrTargetsBoard,
@@ -525,6 +528,14 @@ export default function HrTargets() {
     [allRanked, oddsByPlayer],
   );
 
+  // COLD BATTER REBOUND — surfaces hitters the cold penalty is hitting
+  // but who still carry real HR upside. Read-only over allRanked; does
+  // NOT affect main rankings or the Top 10. See computeColdBatterRebound.
+  const coldRebound: ColdReboundCandidate[] = useMemo(
+    () => computeColdBatterRebound(allRanked, oddsByPlayer, { topN: 5 }),
+    [allRanked, oddsByPlayer],
+  );
+
   // Model-disagreement warning: surface elite-power hitters who SHOULD be
   // near the top of betting interest but our model ranked low. Threshold:
   // any elite player whose final rank is worse than 30 across all boards.
@@ -729,6 +740,13 @@ export default function HrTargets() {
           we render it whenever we have live targets for the date. */}
       {allRanked.length > 0 && (
         <SleeperBoardPanel board={sleeperBoard} asOf={asOf} />
+      )}
+
+      {/* Cold Batter Rebound — sits in the Sleeper / Chaos area as a
+          *separate* discovery card. Strictly read-only over allRanked;
+          NEVER feeds back into main rankings or the Top 10. */}
+      {allRanked.length > 0 && (
+        <ColdBatterReboundCard picks={coldRebound} asOf={asOf} />
       )}
 
       {/* Bench / unavailable — model liked them but they're not in the
