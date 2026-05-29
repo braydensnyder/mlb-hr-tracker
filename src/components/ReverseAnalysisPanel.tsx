@@ -26,6 +26,10 @@ import type {
   ReconstructionResult,
   ReconstructedDay,
   RecurringRule,
+  AdaptiveTop10Result,
+  AdaptiveTop10Day,
+  ConfidenceTiersResult,
+  ConfidenceTier,
 } from '../lib/stats';
 
 interface Props {
@@ -36,6 +40,10 @@ interface Props {
   simulation: SimulatedTop10Result | null;
   /** Hindsight reconstruction across the window. */
   reconstruction: ReconstructionResult | null;
+  /** Adaptive Top 10 — recurring rules applied across the window. */
+  adaptive: AdaptiveTop10Result | null;
+  /** Confidence tier bucketing + diagnosis. */
+  tiers: ConfidenceTiersResult | null;
   /** Loading indicator from the page. */
   loading: boolean;
   /** Render the toggle as expanded? Owned by parent so close-state survives. */
@@ -97,6 +105,8 @@ export default function ReverseAnalysisPanel(p: Props) {
               actionable={p.actionable ?? []}
               simulation={p.simulation}
               reconstruction={p.reconstruction}
+              adaptive={p.adaptive}
+              tiers={p.tiers}
             />
           )}
         </>
@@ -157,11 +167,13 @@ function Header({ open, onToggle, loading, analysis, asOf, windowDays }: {
   );
 }
 
-function Body({ analysis, actionable, simulation, reconstruction }: {
+function Body({ analysis, actionable, simulation, reconstruction, adaptive, tiers }: {
   analysis: ReverseAnalysisResult;
   actionable: ActionableRule[];
   simulation: SimulatedTop10Result | null;
   reconstruction: ReconstructionResult | null;
+  adaptive: AdaptiveTop10Result | null;
+  tiers: ConfidenceTiersResult | null;
 }) {
   return (
     <div style={{ display: 'grid', gap: 18, marginTop: 12 }}>
@@ -169,6 +181,8 @@ function Body({ analysis, actionable, simulation, reconstruction }: {
       <ActionableChangesSection rules={actionable} />
       {simulation && <SimulatedTop10Section sim={simulation} />}
       {reconstruction && <BestReconstructedTop10Section recon={reconstruction} />}
+      {adaptive && <AdaptiveTop10Section adaptive={adaptive} />}
+      {tiers && <ConfidenceTiersSection tiers={tiers} />}
 
       {/* Supporting evidence below — same as the original analysis layer. */}
       <details style={{ borderTop: '1px solid #232732', paddingTop: 12 }}>
@@ -928,6 +942,281 @@ function ReconTop10Card({ title, subtitle, rows, highlightKey }: {
         </table>
       </div>
     </div>
+  );
+}
+
+// =============================================================================
+//  Adaptive Top 10 — recurring rules only, applied across the window
+// =============================================================================
+
+function AdaptiveTop10Section({ adaptive }: { adaptive: AdaptiveTop10Result }) {
+  const [selectedIdx, setSelectedIdx] = useState<number>(adaptive.days.length - 1);
+  const day = adaptive.days[Math.min(selectedIdx, adaptive.days.length - 1)];
+
+  return (
+    <div>
+      <h4 className="rev-h4">🧭 Adaptive Top 10 — Recurring Rules Applied</h4>
+      <p className="rev-sub">
+        Same window as above, but applies <strong>only the recurring rules</strong>
+        (selected on ≥ 2 days of reconstruction) with their averaged Δ. This is the
+        closest the system gets to a forward-applicable rule set: single-day overfits
+        are excluded.
+      </p>
+
+      <div className="rev-kpis" style={{ marginTop: 6 }}>
+        <div className="rev-kpi">
+          <div className="rev-kpi-label">Core Top-10 rate</div>
+          <div className="rev-kpi-value">{pct(adaptive.core_rate)}</div>
+          <div className="rev-kpi-sub">{adaptive.total_core_hits} hits / {adaptive.days_counted}d × 10</div>
+        </div>
+        <div className="rev-kpi">
+          <div className="rev-kpi-label">Adaptive Top-10 rate</div>
+          <div className={`rev-kpi-value ${adaptive.net_gain > 0 ? 'rev-pos' : adaptive.net_gain < 0 ? 'rev-neg' : ''}`}>
+            {pct(adaptive.adaptive_rate)}
+          </div>
+          <div className="rev-kpi-sub">{adaptive.total_adaptive_hits} hits / {adaptive.days_counted}d × 10</div>
+        </div>
+        <div className="rev-kpi">
+          <div className="rev-kpi-label">Net gain/loss</div>
+          <div className={`rev-kpi-value ${adaptive.net_gain > 0 ? 'rev-pos' : adaptive.net_gain < 0 ? 'rev-neg' : ''}`}>
+            {adaptive.net_gain > 0 ? '+' : ''}{pct(adaptive.net_gain)}
+          </div>
+          <div className="rev-kpi-sub">{adaptive.rules_used.length} rules applied</div>
+        </div>
+      </div>
+
+      {/* Rules used + rules dropped (full transparency) */}
+      <div className="rev-grid2" style={{ marginTop: 10 }}>
+        <div className="rev-card">
+          <h5 className="rev-h5">Rules used ({adaptive.rules_used.length})</h5>
+          {adaptive.rules_used.length === 0 ? (
+            <p className="rev-sub">
+              No recurring rules met the ≥ 2-day threshold. Adaptive Top 10 equals Core
+              Top 10 — wait for more data.
+            </p>
+          ) : (
+            <div className="rev-recon-rules">
+              {adaptive.rules_used.map((r) => (
+                <div key={r.id} className="rev-recon-rule">
+                  <code>
+                    {r.avg_delta > 0 ? '+' : ''}{r.avg_delta.toFixed(1)} {r.text_template}
+                  </code>
+                  <span className="rev-sub" style={{ marginLeft: 8, fontSize: 11 }}>
+                    {r.days_selected}/{r.total_days}d · avg lift +{r.avg_lift_pct_pts.toFixed(1)} pp
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="rev-card">
+          <h5 className="rev-h5">Rules dropped ({adaptive.rules_dropped.length})</h5>
+          {adaptive.rules_dropped.length === 0 ? (
+            <p className="rev-sub">None — every recurring rule met the recurrence threshold.</p>
+          ) : (
+            <>
+              <p className="rev-sub" style={{ marginBottom: 6 }}>
+                Selected on only 1 day — likely overfits. Not applied to the adaptive Top 10.
+              </p>
+              <div className="rev-recon-rules">
+                {adaptive.rules_dropped.map((r) => (
+                  <div key={r.id} className="rev-recon-rule" style={{ opacity: 0.6 }}>
+                    <code>{r.text_template}</code>
+                    <span className="rev-sub" style={{ marginLeft: 8, fontSize: 11 }}>
+                      {r.days_selected}/{r.total_days}d
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {day && (
+        <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 16, flexWrap: 'wrap' }}>
+            <h5 className="rev-h5" style={{ margin: 0 }}>Per-day comparison</h5>
+            <select
+              value={selectedIdx}
+              onChange={(e) => setSelectedIdx(Number(e.target.value))}
+              style={{
+                background: '#0c0e14', color: '#cfe', border: '1px solid #2a2d36',
+                borderRadius: 6, padding: '4px 8px', fontSize: 13,
+              }}
+            >
+              {adaptive.days.map((d, i) => (
+                <option key={d.date} value={i}>
+                  {d.date} (core {d.core_hits}/10 → adaptive {d.adaptive_hits}/10
+                  {d.net_delta !== 0 ? `, ${d.net_delta > 0 ? '+' : ''}${d.net_delta}` : ''})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <AdaptiveDayCard day={day} />
+        </>
+      )}
+      <p className="rev-sub" style={{ marginTop: 8, fontSize: 11 }}>{adaptive.note}</p>
+    </div>
+  );
+}
+
+function AdaptiveDayCard({ day }: { day: AdaptiveTop10Day }) {
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div className="rev-grid2">
+        <ReconTop10Card
+          title={`Core Top 10 — ${day.date}`}
+          subtitle={`${day.core_hits}/10 hits`}
+          rows={day.core_top10}
+          highlightKey="dropped"
+        />
+        <ReconTop10Card
+          title={`Adaptive Top 10 — ${day.date}`}
+          subtitle={`${day.adaptive_hits}/10 hits`}
+          rows={day.adaptive_top10}
+          highlightKey="new"
+        />
+      </div>
+      <div className="rev-card" style={{ marginTop: 10 }}>
+        <h5 className="rev-h5">
+          Diff — net {day.net_delta > 0 ? '+' : ''}{day.net_delta}
+        </h5>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          <div>
+            <div className="rev-sub" style={{ marginBottom: 4 }}>
+              <span className="rev-pos">Added</span> ({day.added.length})
+            </div>
+            {day.added.length === 0 ? (
+              <div className="rev-sub" style={{ fontSize: 11 }}>—</div>
+            ) : (
+              <ul className="rev-diff-list">
+                {day.added.map((a) => (
+                  <li key={a.player_id}>
+                    <span style={{ color: a.hit ? '#6bd482' : '#aab1c0' }}>
+                      {a.hit ? '✓ ' : '· '}{a.player_name}
+                    </span>
+                    <span className="rev-sub" style={{ fontSize: 10 }}> #{a.new_rank} · {a.team}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <div>
+            <div className="rev-sub" style={{ marginBottom: 4 }}>
+              <span className="rev-neg">Removed</span> ({day.removed.length})
+            </div>
+            {day.removed.length === 0 ? (
+              <div className="rev-sub" style={{ fontSize: 11 }}>—</div>
+            ) : (
+              <ul className="rev-diff-list">
+                {day.removed.map((r) => (
+                  <li key={r.player_id}>
+                    <span style={{ color: r.hit ? '#6bd482' : '#aab1c0' }}>
+                      {r.hit ? '✓ ' : '· '}{r.player_name}
+                    </span>
+                    <span className="rev-sub" style={{ fontSize: 10 }}> #{r.old_rank} · {r.team}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =============================================================================
+//  Confidence Tiers — A/B/C bucketing + monotonicity diagnosis
+// =============================================================================
+
+function ConfidenceTiersSection({ tiers }: { tiers: ConfidenceTiersResult }) {
+  const diagClass =
+    tiers.diagnosis === 'ranking_edge'   ? 'rev-confchip--high' :
+    tiers.diagnosis === 'bucketing_edge' ? 'rev-confchip--medium' :
+    tiers.diagnosis === 'mixed'          ? 'rev-confchip--medium' :
+                                            'rev-confchip--low';
+  const diagLabel =
+    tiers.diagnosis === 'ranking_edge'      ? 'Ranking edge' :
+    tiers.diagnosis === 'bucketing_edge'    ? 'Bucketing edge' :
+    tiers.diagnosis === 'mixed'             ? 'Mixed signal' :
+                                               'Insufficient data';
+
+  return (
+    <div>
+      <h4 className="rev-h4">📐 Confidence Tiers — A / B / C Calibration</h4>
+      <p className="rev-sub">
+        Buckets every player-day in the window by Heat Score band and tracks HR hit rate
+        per tier over rolling 7d and 14d windows. The diagnosis answers: does the model's
+        edge come from <strong>ranking</strong> players correctly within the pool, or from
+        <strong> bucketing</strong> them into profitable probability bands?
+      </p>
+
+      <div className="rev-card" style={{ marginTop: 8, borderLeft: '3px solid #ffb86c' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <h5 className="rev-h5" style={{ margin: 0 }}>Diagnosis</h5>
+          <span className={`rev-confchip ${diagClass}`}>{diagLabel}</span>
+        </div>
+        <p className="rev-sub" style={{ marginTop: 6 }}>{tiers.rationale}</p>
+      </div>
+
+      <div className="rev-table-wrap" style={{ marginTop: 10 }}>
+        <table className="rev-table">
+          <thead>
+            <tr>
+              <th>Tier</th>
+              <th>Band</th>
+              <th className="num">7d player-days</th>
+              <th className="num">7d hits</th>
+              <th className="num">7d rate</th>
+              <th className="num">14d player-days</th>
+              <th className="num">14d hits</th>
+              <th className="num">14d rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {tiers.tiers.map((t) => <TierRow key={t.tier} tier={t} />)}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="rev-sub" style={{ marginTop: 8, fontSize: 11 }}>
+        <strong>Reading the diagnosis.</strong>{' '}
+        <em>Ranking edge</em> = clean A &gt; B &gt; C decline → the Heat Score is doing real work inside the pool, individual ranks matter.{' '}
+        <em>Bucketing edge</em> = tier rates are flat → players are roughly fungible within a tier; the model's edge is the tier definition itself.{' '}
+        Anchor {tiers.anchor} · 7d from {tiers.l7d_from} · 14d from {tiers.l14d_from}.
+      </p>
+    </div>
+  );
+}
+
+function TierRow({ tier }: { tier: ConfidenceTier }) {
+  const tierColor: Record<'A' | 'B' | 'C', string> = {
+    A: '#6bd482', B: '#ffd28c', C: '#aab1c0',
+  };
+  return (
+    <tr>
+      <td>
+        <span
+          style={{
+            display: 'inline-block', width: 20, height: 20, lineHeight: '20px',
+            textAlign: 'center', borderRadius: 4, color: '#0a0c12',
+            background: tierColor[tier.tier], fontWeight: 700, fontSize: 12,
+          }}
+        >
+          {tier.tier}
+        </span>
+      </td>
+      <td>{tier.label}</td>
+      <td className="num">{tier.player_days_l7d}</td>
+      <td className="num">{tier.hits_l7d}</td>
+      <td className="num">{pct(tier.rate_l7d)}</td>
+      <td className="num">{tier.player_days_l14d}</td>
+      <td className="num">{tier.hits_l14d}</td>
+      <td className="num">{pct(tier.rate_l14d)}</td>
+    </tr>
   );
 }
 

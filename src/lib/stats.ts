@@ -4852,3 +4852,364 @@ export function reconstructBestTop10(
     note: 'Hindsight reconstruction — each day uses its own actual HR results to score rule sets. Do NOT use any single day as a live prediction. Look for RECURRING rules below.',
   };
 }
+
+// =============================================================================
+//  Adaptive Top 10 + Confidence Tiers (task #200)
+// -----------------------------------------------------------------------------
+//  Two separate but complementary views:
+//
+//  ADAPTIVE TOP 10 — apply ONLY the rules the reconstruction picked on
+//  multiple days (≥ MIN_RECURRENCE_DAYS) using their averaged Δ. This is
+//  the closest thing to a forward-applicable rule set the system can
+//  produce: a single rule selected on one day is overfit; rules that
+//  repeated across 2+ days have at least some cross-day validation.
+//  Re-ranks every day in the window under those rules, side-by-side with
+//  the saved-snapshot Top 10.
+//
+//  CONFIDENCE TIERS — bucket every player-day in the window by heat_score
+//  band (A ≥ 60, B 45-60, C 30-45) and compute hit rates per tier over
+//  rolling 7d and 14d windows. The diagnosis answers the user's real
+//  question: does the model's edge come from RANKING players correctly
+//  (rates monotonically decline A → B → C) or from BUCKETING them into
+//  profitable probability bands (rates compressed or non-monotone)?
+//
+//  STRICT honesty rules:
+//    • SURFACED ONLY. The panel never mutates HEAT_SCORE_WEIGHTS.
+//    • The "adaptive" name is precise: it adapts to recurring historical
+//      patterns. It is NOT a live prediction tool — it's a backtest of
+//      "would applying patterns that repeated over the last 14 days have
+//      improved our Top 10?"
+// =============================================================================
+
+/** Minimum number of days a rule must have been selected by the
+ *  reconstruction to be eligible for the Adaptive Top 10. Selected on
+ *  one day = overfit; ≥2 days = at least one cross-validation. */
+const ADAPTIVE_MIN_RECURRENCE_DAYS = 2;
+
+/** Heat-score band edges. Calibrated for the typical 30-80 model output
+ *  range (most player-days land between 35 and 65). Tier A is the model's
+ *  "confident" picks; Tier C is the bottom of the ranked pool. */
+const TIER_BANDS: { tier: 'A' | 'B' | 'C'; min: number; max: number }[] = [
+  { tier: 'A', min: 60, max: Infinity },
+  { tier: 'B', min: 45, max: 60 },
+  { tier: 'C', min: 30, max: 45 },
+];
+
+/** Per-day side-by-side core vs adaptive Top 10. */
+export interface AdaptiveTop10Day {
+  date: string;
+  core_top10: SimulatedTop10Row[];
+  adaptive_top10: SimulatedTop10Row[];
+  core_hits: number;
+  adaptive_hits: number;
+  /** adaptive − core. Positive = adaptive improved. */
+  net_delta: number;
+  added: { player_id: number; player_name: string; team: string; new_rank: number; hit: boolean }[];
+  removed: { player_id: number; player_name: string; team: string; old_rank: number; hit: boolean }[];
+}
+
+export interface AdaptiveTop10Result {
+  days: AdaptiveTop10Day[];
+  /** Recurring rules that were applied (≥ ADAPTIVE_MIN_RECURRENCE_DAYS). */
+  rules_used: RecurringRule[];
+  /** All recurring rules that DIDN'T qualify — surfaced as "monitor" only. */
+  rules_dropped: RecurringRule[];
+  total_core_hits: number;
+  total_adaptive_hits: number;
+  core_rate: number;
+  adaptive_rate: number;
+  /** adaptive − core, in absolute pct-pt. */
+  net_gain: number;
+  days_counted: number;
+  note: string;
+}
+
+/** Heat-score bucket with rolling-window hit rates. */
+export interface ConfidenceTier {
+  tier: 'A' | 'B' | 'C';
+  label: string;        // "Heat ≥ 60" etc., for the UI
+  min_heat: number;
+  max_heat: number;
+  /** Rolling 7-day stats: how many player-days fell in this tier, how many homered. */
+  player_days_l7d: number;
+  hits_l7d: number;
+  rate_l7d: number;
+  /** Rolling 14-day stats. */
+  player_days_l14d: number;
+  hits_l14d: number;
+  rate_l14d: number;
+}
+
+export interface ConfidenceTiersResult {
+  tiers: ConfidenceTier[];
+  /** True iff Tier A rate > Tier B rate > Tier C rate over the 14d window. */
+  monotone_14d: boolean;
+  monotone_7d: boolean;
+  /**
+   *   'ranking_edge'   — A clearly > B > C (model ranks players well).
+   *   'bucketing_edge' — Rates are flat or non-monotone (edge is in the
+   *                      tier definition more than the specific rank).
+   *   'mixed'          — Some monotonicity but not clean.
+   *   'insufficient_data' — Sample size too small.
+   */
+  diagnosis: 'ranking_edge' | 'bucketing_edge' | 'mixed' | 'insufficient_data';
+  /** Plain-English explanation of the diagnosis. */
+  rationale: string;
+  /** Effective window anchor (the "as-of" date), and the rolling-window endpoints. */
+  anchor: string;
+  l7d_from: string;
+  l14d_from: string;
+}
+
+/**
+ * Apply only the rules that the reconstruction picked on multiple days
+ * (≥ ADAPTIVE_MIN_RECURRENCE_DAYS), using each rule's averaged Δ. Re-rank
+ * every day in the window and compare to the saved-snapshot Top 10.
+ *
+ * NOTE: this is a sensitivity sim — Δ is added directly to heat_score,
+ * the full pipeline isn't re-applied. See the existing simulate / grid
+ * notes elsewhere in this module.
+ */
+export function applyRecurringRules(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+  reconRecurring: RecurringRule[],
+): AdaptiveTop10Result {
+  const rulesUsed = reconRecurring.filter((r) => r.days_selected >= ADAPTIVE_MIN_RECURRENCE_DAYS);
+  const rulesDropped = reconRecurring.filter((r) => r.days_selected < ADAPTIVE_MIN_RECURRENCE_DAYS);
+
+  // Group snapshot rows by date and pre-parse signals once.
+  type Row = {
+    player_id: number;
+    player_name: string;
+    team: string;
+    heat_score: number;
+    signals: Set<SignalKey>;
+    hit: boolean;
+    rank: number;
+  };
+  const byDate = new Map<string, Row[]>();
+  for (const snap of snapshots) {
+    const hrSet = hrPlayersByDate.get(snap.target_date) ?? new Set<number>();
+    const r: Row = {
+      player_id: snap.player_id,
+      player_name: snap.player_name ?? `#${snap.player_id}`,
+      team: snap.team ?? '',
+      heat_score: snap.heat_score,
+      signals: parseSignalsFromReason(snap.reason),
+      hit: hrSet.has(snap.player_id),
+      rank: snap.rank,
+    };
+    const arr = byDate.get(snap.target_date);
+    if (arr) arr.push(r); else byDate.set(snap.target_date, [r]);
+  }
+
+  const days: AdaptiveTop10Day[] = [];
+  let totalCore = 0;
+  let totalAdaptive = 0;
+
+  const sortedDates = Array.from(byDate.keys()).sort();
+  for (const date of sortedDates) {
+    const rows = byDate.get(date)!;
+    if (rows.length < 10) continue;
+
+    // Core: saved Top 10 (by original rank).
+    const coreSorted = rows.slice().sort((a, b) => a.rank - b.rank);
+    const coreTop10 = coreSorted.slice(0, 10);
+    const coreHits = coreTop10.reduce((s, r) => s + (r.hit ? 1 : 0), 0);
+
+    // Adaptive: apply recurring rules with their averaged Δ.
+    const adapted = rows.map((r) => {
+      let modified = r.heat_score;
+      const applied: string[] = [];
+      for (const rule of rulesUsed) {
+        if (rule.signals.every((s) => r.signals.has(s))) {
+          modified += rule.avg_delta;
+          applied.push(rule.id);
+        }
+      }
+      return { row: r, modified, applied };
+    });
+    adapted.sort((a, b) => b.modified - a.modified);
+    const adaptiveTop10 = adapted.slice(0, 10);
+    const adaptiveHits = adaptiveTop10.reduce((s, a) => s + (a.row.hit ? 1 : 0), 0);
+
+    const coreIds = new Set(coreTop10.map((r) => r.player_id));
+    const adaptIds = new Set(adaptiveTop10.map((a) => a.row.player_id));
+
+    const coreRows: SimulatedTop10Row[] = coreTop10.map((r, i) => ({
+      rank: i + 1,
+      player_id: r.player_id,
+      player_name: r.player_name,
+      team: r.team,
+      heat_score: r.heat_score,
+      modified_score: r.heat_score,
+      rules_applied: [],
+      hit: r.hit,
+      in_both: adaptIds.has(r.player_id),
+    }));
+    const adaptiveRows: SimulatedTop10Row[] = adaptiveTop10.map((a, i) => ({
+      rank: i + 1,
+      player_id: a.row.player_id,
+      player_name: a.row.player_name,
+      team: a.row.team,
+      heat_score: a.row.heat_score,
+      modified_score: a.modified,
+      rules_applied: a.applied,
+      hit: a.row.hit,
+      in_both: coreIds.has(a.row.player_id),
+    }));
+
+    const added: AdaptiveTop10Day['added'] = [];
+    const removed: AdaptiveTop10Day['removed'] = [];
+    adaptiveTop10.forEach((a, i) => {
+      if (!coreIds.has(a.row.player_id)) {
+        added.push({
+          player_id: a.row.player_id,
+          player_name: a.row.player_name,
+          team: a.row.team,
+          new_rank: i + 1,
+          hit: a.row.hit,
+        });
+      }
+    });
+    coreTop10.forEach((r, i) => {
+      if (!adaptIds.has(r.player_id)) {
+        removed.push({
+          player_id: r.player_id,
+          player_name: r.player_name,
+          team: r.team,
+          old_rank: i + 1,
+          hit: r.hit,
+        });
+      }
+    });
+
+    days.push({
+      date,
+      core_top10: coreRows,
+      adaptive_top10: adaptiveRows,
+      core_hits: coreHits,
+      adaptive_hits: adaptiveHits,
+      net_delta: adaptiveHits - coreHits,
+      added,
+      removed,
+    });
+    totalCore += coreHits;
+    totalAdaptive += adaptiveHits;
+  }
+
+  const slots = days.length * 10;
+  return {
+    days,
+    rules_used: rulesUsed,
+    rules_dropped: rulesDropped,
+    total_core_hits: totalCore,
+    total_adaptive_hits: totalAdaptive,
+    core_rate: slots > 0 ? totalCore / slots : 0,
+    adaptive_rate: slots > 0 ? totalAdaptive / slots : 0,
+    net_gain: slots > 0 ? (totalAdaptive - totalCore) / slots : 0,
+    days_counted: days.length,
+    note: rulesUsed.length === 0
+      ? 'No rules met the recurrence threshold (≥ 2 days). Adaptive Top 10 equals Core Top 10. Wait for more data before drawing conclusions.'
+      : `Applied ${rulesUsed.length} recurring rule(s) with averaged Δ. Sensitivity sim — Δ added to saved heat_score, full pipeline not re-applied.`,
+  };
+}
+
+/**
+ * Bucket every player-day in the window by heat_score band, compute hit
+ * rates over rolling 7d and 14d windows ending at `anchor`. Diagnose
+ * whether the model's edge comes from ranking accuracy (clear A → B → C
+ * decline) or from the bucket definition itself (flat / inverted rates).
+ *
+ * @param snapshots       all snapshot rows in the window (14d)
+ * @param hrPlayersByDate game_date → set of player_ids who homered
+ * @param anchor          right-edge date of the rolling windows (YYYY-MM-DD)
+ */
+export function computeConfidenceTiers(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+  anchor: string,
+): ConfidenceTiersResult {
+  // Rolling windows are inclusive of anchor.
+  const l7dFrom = addDays(anchor, -6);
+  const l14dFrom = addDays(anchor, -13);
+
+  // Per-tier counters across the two windows.
+  const tierStats = TIER_BANDS.map((b) => ({
+    ...b,
+    label: b.max === Infinity ? `Heat ≥ ${b.min}` : `${b.min} ≤ Heat < ${b.max}`,
+    player_days_l7d: 0, hits_l7d: 0,
+    player_days_l14d: 0, hits_l14d: 0,
+  }));
+
+  for (const snap of snapshots) {
+    const date = snap.target_date;
+    if (date > anchor) continue;          // never use future data
+    if (date < l14dFrom) continue;        // outside the largest window
+
+    const tier = tierStats.find((t) => snap.heat_score >= t.min && snap.heat_score < t.max);
+    if (!tier) continue;                  // below band C (heat < 30) — irrelevant
+
+    const hrSet = hrPlayersByDate.get(date) ?? new Set<number>();
+    const homered = hrSet.has(snap.player_id);
+
+    tier.player_days_l14d += 1;
+    if (homered) tier.hits_l14d += 1;
+    if (date >= l7dFrom) {
+      tier.player_days_l7d += 1;
+      if (homered) tier.hits_l7d += 1;
+    }
+  }
+
+  const tiers: ConfidenceTier[] = tierStats.map((t) => ({
+    tier: t.tier,
+    label: t.label,
+    min_heat: t.min,
+    max_heat: t.max,
+    player_days_l7d: t.player_days_l7d,
+    hits_l7d: t.hits_l7d,
+    rate_l7d: t.player_days_l7d > 0 ? t.hits_l7d / t.player_days_l7d : 0,
+    player_days_l14d: t.player_days_l14d,
+    hits_l14d: t.hits_l14d,
+    rate_l14d: t.player_days_l14d > 0 ? t.hits_l14d / t.player_days_l14d : 0,
+  }));
+
+  // Monotonicity checks (sort by tier — A first, then B, then C).
+  const byTier = (t: 'A' | 'B' | 'C') => tiers.find((x) => x.tier === t)!;
+  const A = byTier('A'), B = byTier('B'), C = byTier('C');
+  const monotone14 = A.rate_l14d > B.rate_l14d && B.rate_l14d > C.rate_l14d;
+  const monotone7 = A.rate_l7d > B.rate_l7d && B.rate_l7d > C.rate_l7d;
+
+  // Diagnosis. Use the larger 14d window for stability.
+  const totalDays14 = A.player_days_l14d + B.player_days_l14d + C.player_days_l14d;
+  let diagnosis: ConfidenceTiersResult['diagnosis'];
+  let rationale: string;
+  if (totalDays14 < 50) {
+    diagnosis = 'insufficient_data';
+    rationale = `Only ${totalDays14} player-days in the 14d window. Need ≥ 50 to make a meaningful call.`;
+  } else if (A.rate_l14d >= B.rate_l14d * 1.3 && B.rate_l14d >= C.rate_l14d * 1.15) {
+    diagnosis = 'ranking_edge';
+    rationale = `Tier A homers at ${(A.rate_l14d * 100).toFixed(1)}% vs B's ${(B.rate_l14d * 100).toFixed(1)}% vs C's ${(C.rate_l14d * 100).toFixed(1)}% — clean monotone decline. Heat Score is meaningfully ranking players within the pool.`;
+  } else if (Math.abs(A.rate_l14d - B.rate_l14d) < 0.02 && Math.abs(B.rate_l14d - C.rate_l14d) < 0.02) {
+    diagnosis = 'bucketing_edge';
+    rationale = `Tier rates are nearly flat (A: ${(A.rate_l14d * 100).toFixed(1)}%, B: ${(B.rate_l14d * 100).toFixed(1)}%, C: ${(C.rate_l14d * 100).toFixed(1)}%). Heat Score is not discriminating well between buckets — the model's edge is the bucket DEFINITION, not the ranking inside it.`;
+  } else if (monotone14) {
+    diagnosis = 'mixed';
+    rationale = `Rates decline A → B → C but only modestly. Some ranking signal exists but the gap between tiers is small; treat individual ranks within a tier as roughly fungible.`;
+  } else {
+    diagnosis = 'mixed';
+    rationale = `Rates are non-monotone (A: ${(A.rate_l14d * 100).toFixed(1)}%, B: ${(B.rate_l14d * 100).toFixed(1)}%, C: ${(C.rate_l14d * 100).toFixed(1)}%). Either small-sample noise or a real calibration issue — check the 7d window for consistency.`;
+  }
+
+  return {
+    tiers,
+    monotone_14d: monotone14,
+    monotone_7d: monotone7,
+    diagnosis,
+    rationale,
+    anchor,
+    l7d_from: l7dFrom,
+    l14d_from: l14dFrom,
+  };
+}

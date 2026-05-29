@@ -29,8 +29,10 @@ import ReverseAnalysisPanel from '../components/ReverseAnalysisPanel';
 import {
   addDays,
   applyCanonicalTeams,
+  applyRecurringRules,
   buildActionableModelChanges,
   computeColdBatterRebound,
+  computeConfidenceTiers,
   computeHrTargets,
   computeReverseAnalysis,
   computeSleepers,
@@ -41,7 +43,9 @@ import {
   venueLeaderboard,
   ELITE_POWER_NAMES,
   type ActionableRule,
+  type AdaptiveTop10Result,
   type ColdReboundCandidate,
+  type ConfidenceTiersResult,
   type HrTarget,
   type HrTargetGame,
   type HrTargetsBoard,
@@ -209,6 +213,8 @@ export default function HrTargets() {
   const [revRules, setRevRules] = useState<ActionableRule[] | null>(null);
   const [revSim, setRevSim] = useState<SimulatedTop10Result | null>(null);
   const [revRecon, setRevRecon] = useState<ReconstructionResult | null>(null);
+  const [revAdaptive, setRevAdaptive] = useState<AdaptiveTop10Result | null>(null);
+  const [revTiers, setRevTiers] = useState<ConfidenceTiersResult | null>(null);
   const [revLoadedFor, setRevLoadedFor] = useState<string | null>(null);
 
   async function loadReverseAnalysis(anchorDate: string) {
@@ -246,10 +252,18 @@ export default function HrTargets() {
       // Hindsight reconstruction — per-day greedy search + recurring rule
       // aggregator. Strictly read-only over the same snapshots/HR window.
       const recon = reconstructBestTop10(minimal, hrByDate);
+      // Adaptive Top 10 — apply only the rules the reconstruction picked
+      // on multiple days (≥ 2). Strictly backtested over the same window.
+      const adaptive = applyRecurringRules(minimal, hrByDate, recon.recurring);
+      // Confidence Tiers — A/B/C bucketing + monotonicity diagnosis over
+      // rolling 7d and 14d windows ending at the anchor date.
+      const confTiers = computeConfidenceTiers(minimal, hrByDate, anchorDate);
       setRevResult(result);
       setRevRules(built.rules);
       setRevSim(built.simulation);
       setRevRecon(recon);
+      setRevAdaptive(adaptive);
+      setRevTiers(confTiers);
       setRevLoadedFor(anchorDate);
     } catch (e) {
       // eslint-disable-next-line no-console
@@ -258,6 +272,8 @@ export default function HrTargets() {
       setRevRules(null);
       setRevSim(null);
       setRevRecon(null);
+      setRevAdaptive(null);
+      setRevTiers(null);
     } finally {
       setRevLoading(false);
     }
@@ -773,6 +789,8 @@ export default function HrTargets() {
         actionable={revRules}
         simulation={revSim}
         reconstruction={revRecon}
+        adaptive={revAdaptive}
+        tiers={revTiers}
         loading={revLoading}
         open={revOpen}
         onToggle={toggleRev}
