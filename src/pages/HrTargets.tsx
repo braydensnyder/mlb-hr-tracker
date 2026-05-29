@@ -24,12 +24,15 @@ import WeatherLine from '../components/WeatherLine';
 import ReasonChips, { ReasonChipDetails } from '../components/ReasonChips';
 import SleeperBoardPanel from '../components/SleeperBoard';
 import CertifiedSleeperBoard from '../components/CertifiedSleeperBoard';
+import ReverseAnalysisPanel from '../components/ReverseAnalysisPanel';
 import {
   addDays,
   applyCanonicalTeams,
   computeHrTargets,
+  computeReverseAnalysis,
   computeSleepers,
   computeCertifiedSleepers,
+  currentReverseAnalysisWeights,
   pitcherHrLeaderboard,
   venueLeaderboard,
   ELITE_POWER_NAMES,
@@ -38,6 +41,8 @@ import {
   type HrTargetsBoard,
   type PitcherFormLite,
   type PlayerTeamIndex,
+  type ReverseAnalysisResult,
+  type RevAnalysisSnapshotRow,
   type SleeperOddsLite,
 } from '../lib/stats';
 
@@ -88,6 +93,49 @@ async function fetchGamesOn(date: string): Promise<GameRow[]> {
       `${withTemp} with temp, ${withUpdatedAt} with weather_updated_at`,
   );
   return rows;
+}
+
+/** Last N days of snapshots — paged because ~150 rows/day × 14d > 1k.
+ *  Used only by the Reverse-Engineering panel; lazy-fetched on first toggle. */
+async function fetchSnapshotsForReverseAnalysis(from: string, to: string): Promise<HrTargetSnapshotRow[]> {
+  const PAGE_SIZE = 1000;
+  const all: HrTargetSnapshotRow[] = [];
+  for (let page = 0; page < 20; page++) {
+    const { data, error } = await supabase
+      .from('hr_target_snapshots')
+      .select('*')
+      .gte('target_date', from)
+      .lte('target_date', to)
+      .order('target_date', { ascending: true })
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) break;
+    const rows = (data ?? []) as HrTargetSnapshotRow[];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+  return all;
+}
+
+/** Home runs for the same window, paged. */
+async function fetchHrsForReverseAnalysis(from: string, to: string): Promise<HomeRunRow[]> {
+  const PAGE_SIZE = 1000;
+  const all: HomeRunRow[] = [];
+  for (let page = 0; page < 20; page++) {
+    const { data, error } = await supabase
+      .from('home_runs')
+      .select('id, game_pk, game_date, player_id, player_name, team, opponent, ' +
+        'inning, pitcher_id, pitcher_name, exit_velocity, launch_angle, distance, ' +
+        'batter_side, pitcher_throws, venue_id, venue_name, created_at')
+      .gte('game_date', from)
+      .lte('game_date', to)
+      .order('game_date', { ascending: false })
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) break;
+    const rows = (data ?? []) as unknown as HomeRunRow[];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+  return all;
 }
 
 /** Persisted Top-N for the date, if a snapshot exists. Drives the
@@ -143,6 +191,61 @@ export default function HrTargets() {
   const [viewMode, setViewModeState] = useState<ViewMode>(initialView ?? 'live');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Reverse-engineering analysis panel — 14-day lookback, lazy-fetched on
+  // first toggle so the page's main render path stays fast.
+  const REVERSE_WINDOW_DAYS = 14;
+  const [revOpen, setRevOpen] = useState(false);
+  const [revLoading, setRevLoading] = useState(false);
+  const [revResult, setRevResult] = useState<ReverseAnalysisResult | null>(null);
+  const [revLoadedFor, setRevLoadedFor] = useState<string | null>(null);
+
+  async function loadReverseAnalysis(anchorDate: string) {
+    setRevLoading(true);
+    try {
+      const to = anchorDate;
+      const from = addDays(anchorDate, -(REVERSE_WINDOW_DAYS - 1));
+      const [snaps, hrs] = await Promise.all([
+        fetchSnapshotsForReverseAnalysis(from, to),
+        fetchHrsForReverseAnalysis(from, to),
+      ]);
+      // Build date -> set(player_id) HR index.
+      const hrByDate = new Map<string, Set<number>>();
+      for (const r of hrs) {
+        let s = hrByDate.get(r.game_date);
+        if (!s) { s = new Set<number>(); hrByDate.set(r.game_date, s); }
+        s.add(r.player_id);
+      }
+      const minimal: RevAnalysisSnapshotRow[] = snaps.map((r) => ({
+        target_date: r.target_date,
+        player_id: r.player_id,
+        rank: r.rank,
+        heat_score: r.heat_score,
+        reason: r.reason,
+      }));
+      const w = currentReverseAnalysisWeights();
+      const result = computeReverseAnalysis(minimal, hrByDate, w);
+      setRevResult(result);
+      setRevLoadedFor(anchorDate);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('[reverse-analysis] load failed:', e);
+      setRevResult(null);
+    } finally {
+      setRevLoading(false);
+    }
+  }
+
+  function toggleRev() {
+    const next = !revOpen;
+    setRevOpen(next);
+    // Lazy-load on first open OR when the asOf date changed since last load.
+    if (next && (revLoadedFor !== targetDate)) {
+      // Use the targetDate as the analysis anchor so the window includes
+      // games we just predicted (yesterday-and-back).
+      loadReverseAnalysis(targetDate);
+    }
+  }
 
   function setViewMode(m: ViewMode) {
     setViewModeState(m);
@@ -617,6 +720,20 @@ export default function HrTargets() {
       {benchPlayers.length > 0 && (
         <BenchSection players={benchPlayers} asOf={asOf} />
       )}
+
+      {/* Reverse-Engineering Analysis (task #179) — collapsible. Looks at
+          last 14 days of saved snapshots + actual HR results, surfaces
+          per-signal lift, combos, and weight-tuning recommendations. Lazy
+          loaded on first open. Recommendations are surfaced ONLY — nothing
+          here mutates HEAT_SCORE_WEIGHTS or any other scoring knob. */}
+      <ReverseAnalysisPanel
+        analysis={revResult}
+        loading={revLoading}
+        open={revOpen}
+        onToggle={toggleRev}
+        asOf={targetDate}
+        windowDays={REVERSE_WINDOW_DAYS}
+      />
 
       <h3 className="section">All games — sorted within each card by Heat Score ↓</h3>
       <div style={{ display: 'grid', gap: 12 }}>

@@ -3226,3 +3226,599 @@ export function computeFlatBetSim(
   }
   return { today, mtd, ytd };
 }
+
+// =============================================================================
+//  Reverse-Engineering Analysis (task #179)
+// -----------------------------------------------------------------------------
+//  Take the last 14 days of saved snapshots + actual HR results and back out:
+//    1) per-signal hit rate (present vs absent), lift vs baseline, sample size
+//    2) most predictive positive / negative signals
+//    3) pair + selected triple combinations that outperform individuals
+//    4) "Top 10 Optimizer" — directional + grid-searched weight nudges
+//
+//  STRICT honesty rules:
+//    • Signals are detected from the saved snapshot.reason text (the same
+//      chip labels the user already sees). No re-derivation from raw fields —
+//      that risks drift from what the model actually told the user that day.
+//    • The grid optimizer perturbs the SAVED heat_score by Δ_signal × signal
+//      and re-ranks. It is a sensitivity approximation, NOT a full re-run of
+//      computeHrTargets — the panel UI must say so. Useful for direction +
+//      magnitude, not for replacing weights blindly.
+//    • Recommendations are SURFACED ONLY. Nothing in this module mutates
+//      HEAT_SCORE_WEIGHTS or any other knob.
+// =============================================================================
+
+/** Stable identifiers for every signal we analyze. */
+export type SignalKey =
+  | 'hr_pitcher'        // Weak HR pitcher
+  | 'power_park'        // Park boost
+  | 'wind_out'          // Wind boost (favorable)
+  | 'wind_in'           // Wind in (unfavorable)
+  | 'warm_weather'      // Warm (≥85°F)
+  | 'hot_l7d'           // Hot last 7d
+  | 'hr_streak'         // back-to-back days OR multi-day streak
+  | 'platoon_edge'      // Good vs LHP/RHP
+  | 'elite_power'       // Elite power (≥25 season HR)
+  | 'mid_power'         // Mid-tier power (≥8 season HR)
+  | 'low_season_power'  // derived: no power chip present at all
+  | 'cold_batter'       // Cold last 7d
+  | 'pitcher_dominant'; // Dominant pitcher (negative)
+
+const SIGNAL_LABELS: Record<SignalKey, string> = {
+  hr_pitcher: 'HR Pitcher',
+  power_park: 'Power Park',
+  wind_out: 'Wind Out',
+  wind_in: 'Wind In',
+  warm_weather: 'Warm Weather',
+  hot_l7d: 'Hot Last 7d',
+  hr_streak: 'HR Streak',
+  platoon_edge: 'Platoon Edge',
+  elite_power: 'Elite Power',
+  mid_power: 'Mid Power',
+  low_season_power: 'Low Season Power',
+  cold_batter: 'Cold Batter',
+  pitcher_dominant: 'Dominant Pitcher',
+};
+
+/** Conventional polarity used for ranking/sorting. */
+const SIGNAL_POLARITY: Record<SignalKey, 'positive' | 'negative'> = {
+  hr_pitcher: 'positive',
+  power_park: 'positive',
+  wind_out: 'positive',
+  wind_in: 'negative',
+  warm_weather: 'positive',
+  hot_l7d: 'positive',
+  hr_streak: 'positive',
+  platoon_edge: 'positive',
+  elite_power: 'positive',
+  mid_power: 'positive',
+  low_season_power: 'negative',
+  cold_batter: 'negative',
+  pitcher_dominant: 'negative',
+};
+
+/**
+ * Decode the set of signals present for a snapshot row from its `reason`
+ * text. The snapshotter joins reason chips with ' · ' and each chip is
+ * "Label — detail". We substring-match by chip label, identical to what
+ * pickReasonChips() emits in src/lib/stats.ts.
+ *
+ * `low_season_power` is *derived* — it fires when no power chip is present
+ * at all (the player is in the snapshot but had no Elite/Strong/Mid power
+ * signal that day).
+ */
+export function parseSignalsFromReason(reason: string | null): Set<SignalKey> {
+  const set = new Set<SignalKey>();
+  if (!reason) {
+    set.add('low_season_power');
+    return set;
+  }
+  if (/Weak HR pitcher/i.test(reason)) set.add('hr_pitcher');
+  if (/Park boost/i.test(reason)) set.add('power_park');
+  if (/Wind boost/i.test(reason)) set.add('wind_out');
+  if (/Wind in/i.test(reason)) set.add('wind_in');
+  // "Warm" needs anchoring so it doesn't catch e.g. "Warming" in future chips.
+  if (/(^|\s|·)Warm( |—|·|$)/i.test(reason)) set.add('warm_weather');
+  if (/Hot last 7d/i.test(reason)) set.add('hot_l7d');
+  if (/HR streak|Back-to-back days/i.test(reason)) set.add('hr_streak');
+  if (/Good vs [LR]HP/i.test(reason)) set.add('platoon_edge');
+  if (/Elite power/i.test(reason)) set.add('elite_power');
+  if (/Mid-tier power/i.test(reason)) set.add('mid_power');
+  if (/Cold last 7d/i.test(reason)) set.add('cold_batter');
+  if (/Dominant pitcher/i.test(reason)) set.add('pitcher_dominant');
+  // Derived: no power chip → low season power
+  const hasAnyPower =
+    /Elite power|Strong power|Mid-tier power/i.test(reason);
+  if (!hasAnyPower) set.add('low_season_power');
+  return set;
+}
+
+/** Minimal snapshot row shape for reverse analysis — keeps the function
+ *  importable into both the browser bundle and any tsx test script. */
+export interface RevAnalysisSnapshotRow {
+  target_date: string;
+  player_id: number;
+  rank: number;
+  heat_score: number;
+  reason: string | null;
+}
+
+/** Per-signal hit rate + lift. */
+export interface RevSignalRow {
+  key: SignalKey;
+  label: string;
+  polarity: 'positive' | 'negative';
+  /** Players the signal was present on, across the window. */
+  present_n: number;
+  present_hits: number;
+  present_rate: number;
+  absent_n: number;
+  absent_hits: number;
+  absent_rate: number;
+  /** present_rate / baseline_rate. 1.0 = neutral, >1 predictive +, <1 predictive −. */
+  lift: number;
+  /** present_rate − absent_rate, in absolute terms. */
+  delta: number;
+  sample_quality: 'high' | 'medium' | 'low';
+}
+
+/** Combination of 2+ signals analyzed jointly. */
+export interface RevComboRow {
+  keys: SignalKey[];
+  labels: string[];
+  present_n: number;
+  present_hits: number;
+  present_rate: number;
+  lift: number;
+  /** Lift of each individual signal in this combo for comparison. */
+  individual_lifts: number[];
+  /** True iff combo lift exceeds the max individual lift by ≥ 10%. */
+  outperforms_individual: boolean;
+  sample_quality: 'high' | 'medium' | 'low';
+}
+
+/** Tunable knob the directional optimizer can suggest moving. Always read
+ *  in the panel as a hint — the code never auto-applies. */
+export type OptimizerKnob =
+  | 'WEIGHTS.pitcher'
+  | 'WEIGHTS.park'
+  | 'WEIGHTS.l7d'
+  | 'WEIGHTS.hand'
+  | 'COLD_PENALTY.elite'
+  | 'COLD_PENALTY.mid'
+  | 'LOW_POWER_CAP.cap';
+
+export interface RevDirectional {
+  knob: OptimizerKnob;
+  /** The signal whose performance drives this recommendation. */
+  driver_signal: SignalKey;
+  current_value: number;
+  suggested_value: number;
+  direction: 'increase' | 'decrease' | 'hold';
+  /** "Magnitude" of the change as a percentage of the current value. */
+  magnitude_pct: number;
+  confidence: 'high' | 'medium' | 'low';
+  rationale: string;
+}
+
+export interface RevGridChange {
+  knob: OptimizerKnob;
+  signal: SignalKey;
+  delta: number;
+}
+
+export interface RevGridResult {
+  baseline_top10_hit_rate: number;
+  best_top10_hit_rate: number;
+  estimated_lift: number;
+  /** Empty when no perturbation beats baseline by ≥ 1 percentage point. */
+  changes: RevGridChange[];
+  /** Number of dated buckets contributing to the grid search. */
+  days: number;
+  note: string;
+}
+
+export interface ReverseAnalysisResult {
+  window_days: number;
+  total_player_days: number;
+  total_hr_player_days: number;
+  baseline_rate: number;
+  signals: RevSignalRow[];
+  top_positive: RevSignalRow[];
+  top_negative: RevSignalRow[];
+  pair_combos: RevComboRow[];
+  triple_combos: RevComboRow[];
+  directional: RevDirectional[];
+  grid: RevGridResult;
+}
+
+function sampleQuality(n: number): 'high' | 'medium' | 'low' {
+  if (n >= 100) return 'high';
+  if (n >= 30) return 'medium';
+  return 'low';
+}
+
+function signalRow(
+  key: SignalKey,
+  present_n: number,
+  present_hits: number,
+  absent_n: number,
+  absent_hits: number,
+  baseline: number,
+): RevSignalRow {
+  const present_rate = present_n > 0 ? present_hits / present_n : 0;
+  const absent_rate = absent_n > 0 ? absent_hits / absent_n : 0;
+  const lift = baseline > 0 ? present_rate / baseline : 0;
+  return {
+    key,
+    label: SIGNAL_LABELS[key],
+    polarity: SIGNAL_POLARITY[key],
+    present_n,
+    present_hits,
+    present_rate,
+    absent_n,
+    absent_hits,
+    absent_rate,
+    lift,
+    delta: present_rate - absent_rate,
+    sample_quality: sampleQuality(present_n),
+  };
+}
+
+function comboRow(
+  keys: SignalKey[],
+  presentRows: { hit: boolean }[],
+  baseline: number,
+  signalLiftByKey: Map<SignalKey, number>,
+): RevComboRow {
+  const present_n = presentRows.length;
+  const present_hits = presentRows.reduce((s, r) => s + (r.hit ? 1 : 0), 0);
+  const present_rate = present_n > 0 ? present_hits / present_n : 0;
+  const lift = baseline > 0 ? present_rate / baseline : 0;
+  const individual_lifts = keys.map((k) => signalLiftByKey.get(k) ?? 0);
+  const maxIndividual = individual_lifts.length > 0 ? Math.max(...individual_lifts) : 0;
+  return {
+    keys,
+    labels: keys.map((k) => SIGNAL_LABELS[k]),
+    present_n,
+    present_hits,
+    present_rate,
+    lift,
+    individual_lifts,
+    outperforms_individual: lift >= maxIndividual * 1.1 && lift > 1,
+    sample_quality: sampleQuality(present_n),
+  };
+}
+
+/** Build a per-knob directional recommendation from one signal's lift. */
+function directionalFor(opts: {
+  knob: OptimizerKnob;
+  driver: SignalKey;
+  current: number;
+  signalRow: RevSignalRow | undefined;
+  /** Inverted means "this knob is a PENALTY; lift<1 should INCREASE penalty
+   *  magnitude". For positive-weight knobs, lift>1 means INCREASE weight. */
+  inverted?: boolean;
+  capPct?: number; // cap suggested change at ±capPct% of |current|
+}): RevDirectional {
+  const sig = opts.signalRow;
+  const capPct = opts.capPct ?? 0.5;
+  const fallback: RevDirectional = {
+    knob: opts.knob,
+    driver_signal: opts.driver,
+    current_value: opts.current,
+    suggested_value: opts.current,
+    direction: 'hold',
+    magnitude_pct: 0,
+    confidence: 'low',
+    rationale: 'Insufficient signal sample to recommend a change.',
+  };
+  if (!sig || sig.present_n < 20) return fallback;
+  const lift = sig.lift;
+  // Map lift → magnitude scale. Neutral band 0.85–1.15 → no change.
+  const NEUTRAL_LO = 0.85;
+  const NEUTRAL_HI = 1.15;
+  if (lift >= NEUTRAL_LO && lift <= NEUTRAL_HI) {
+    return {
+      ...fallback,
+      confidence: sig.sample_quality,
+      rationale: `Lift ${lift.toFixed(2)} is within the neutral band [${NEUTRAL_LO}, ${NEUTRAL_HI}] — current weight looks well-calibrated.`,
+    };
+  }
+  // Suggested fractional change scales with log-lift, clamped.
+  const rawPct = Math.max(-capPct, Math.min(capPct, Math.log(Math.max(0.2, lift))));
+  let direction: 'increase' | 'decrease' = lift > 1 ? 'increase' : 'decrease';
+  if (opts.inverted) direction = lift > 1 ? 'decrease' : 'increase';
+  const abs = Math.abs(opts.current);
+  // "increase" always means "increase MAGNITUDE of this knob's effect" —
+  // so for negative penalty knobs we move further negative, not toward 0.
+  const magnitudeSign = Math.sign(opts.current) || 1;
+  const moveDir = direction === 'increase' ? 1 : -1;
+  // Always move at least ±10% of magnitude when outside the neutral band.
+  const stepPct = Math.max(0.1, Math.abs(rawPct));
+  const suggested = opts.current + moveDir * magnitudeSign * stepPct * abs;
+  return {
+    knob: opts.knob,
+    driver_signal: opts.driver,
+    current_value: opts.current,
+    suggested_value: Number(suggested.toFixed(2)),
+    direction,
+    magnitude_pct: Number((stepPct * 100).toFixed(0)),
+    confidence: sig.sample_quality,
+    rationale: `Signal lift = ${lift.toFixed(2)} on n=${sig.present_n}. ` +
+      `Players with "${SIGNAL_LABELS[opts.driver]}" homered ${(sig.present_rate * 100).toFixed(1)}% ` +
+      `vs ${(sig.absent_rate * 100).toFixed(1)}% without (baseline ${(opts.signalRow?.lift && (sig.present_rate / sig.lift)) ? '' : ''}).`,
+  };
+}
+
+/**
+ * Grid-search a small set of per-signal heat-score perturbations and pick
+ * the combination that maximizes Top-10 hit rate over the window.
+ *
+ * NOTE: this is a sensitivity approximation. We add Δ_signal directly to
+ * the saved heat_score whenever the signal is present, then re-rank per
+ * date. We do NOT recompute the full scoring pipeline (saturation, ceiling
+ * compression, completeness multiplier). Use this for direction only —
+ * not as a finished proposal.
+ */
+function gridSearch(
+  byDate: Map<string, { player_id: number; heat_score: number; signals: Set<SignalKey>; hit: boolean }[]>,
+): RevGridResult {
+  // Knobs we perturb. (knob, signal, sign).
+  // sign=+1 means "Δ raises score when signal present" (reward signal).
+  // sign=−1 means "Δ lowers score when signal present" (penalty signal).
+  const perturbations: { knob: OptimizerKnob; signal: SignalKey; sign: 1 | -1 }[] = [
+    { knob: 'WEIGHTS.pitcher', signal: 'hr_pitcher', sign: 1 },
+    { knob: 'WEIGHTS.park', signal: 'power_park', sign: 1 },
+    { knob: 'WEIGHTS.l7d', signal: 'hot_l7d', sign: 1 },
+    { knob: 'COLD_PENALTY.elite', signal: 'cold_batter', sign: -1 },
+  ];
+  const STEPS = [0, 2, 4]; // small steps keep the search honest
+
+  const days = byDate.size;
+  if (days === 0) {
+    return {
+      baseline_top10_hit_rate: 0,
+      best_top10_hit_rate: 0,
+      estimated_lift: 0,
+      changes: [],
+      days: 0,
+      note: 'No snapshot/HR data in window — grid skipped.',
+    };
+  }
+
+  const score = (deltas: number[]): { hits: number; bets: number } => {
+    let hits = 0;
+    let bets = 0;
+    for (const rows of byDate.values()) {
+      // Modify each player's score, re-rank, take top 10.
+      const modified = rows.map((r) => {
+        let s = r.heat_score;
+        for (let i = 0; i < perturbations.length; i++) {
+          const p = perturbations[i];
+          if (r.signals.has(p.signal)) s += p.sign * deltas[i];
+        }
+        return { id: r.player_id, score: s, hit: r.hit };
+      });
+      modified.sort((a, b) => b.score - a.score);
+      const top10 = modified.slice(0, 10);
+      for (const t of top10) {
+        bets++;
+        if (t.hit) hits++;
+      }
+    }
+    return { hits, bets };
+  };
+
+  const baseline = score([0, 0, 0, 0]);
+  const baselineRate = baseline.bets > 0 ? baseline.hits / baseline.bets : 0;
+
+  let best = baselineRate;
+  let bestDeltas = [0, 0, 0, 0];
+  // 3^4 = 81 evals.
+  for (const a of STEPS) for (const b of STEPS) for (const c of STEPS) for (const d of STEPS) {
+    if (a === 0 && b === 0 && c === 0 && d === 0) continue;
+    const { hits, bets } = score([a, b, c, d]);
+    const rate = bets > 0 ? hits / bets : 0;
+    if (rate > best) {
+      best = rate;
+      bestDeltas = [a, b, c, d];
+    }
+  }
+
+  const changes: RevGridChange[] = [];
+  // Only surface changes when best beats baseline by ≥ 1 pct point.
+  const beatsBaseline = best - baselineRate >= 0.01;
+  if (beatsBaseline) {
+    for (let i = 0; i < perturbations.length; i++) {
+      if (bestDeltas[i] !== 0) {
+        // Show the sign as it applies to the KNOB, not the score.
+        const knobDelta = perturbations[i].sign * bestDeltas[i];
+        changes.push({
+          knob: perturbations[i].knob,
+          signal: perturbations[i].signal,
+          delta: knobDelta,
+        });
+      }
+    }
+  }
+
+  return {
+    baseline_top10_hit_rate: baselineRate,
+    best_top10_hit_rate: best,
+    estimated_lift: best - baselineRate,
+    changes,
+    days,
+    note: beatsBaseline
+      ? 'Sensitivity grid — Δ added directly to saved heat_score, then re-ranked. Not a full re-score.'
+      : 'No perturbation in the search beat baseline by ≥1 pct pt. Current weights look well-calibrated for this window.',
+  };
+}
+
+/**
+ * @param snapshots     all snapshot rows in the window (any rank)
+ * @param hrPlayersByDate game_date → set of player_ids who homered that date
+ * @param weights       current HEAT_SCORE_WEIGHTS (passed so the panel can
+ *                      surface "current value" honestly without re-importing)
+ */
+export function computeReverseAnalysis(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+  weights: {
+    pitcher: number;
+    park: number;
+    l7d: number;
+    hand: number;
+    coldElite: number;
+    coldMid: number;
+    lowPowerCap: number;
+  },
+): ReverseAnalysisResult {
+  // ----- 1) Build the per-player-day signal/hit dataset.
+  type Row = { date: string; player_id: number; heat_score: number; signals: Set<SignalKey>; hit: boolean };
+  const rows: Row[] = [];
+  const byDate = new Map<string, Row[]>();
+  let totalHits = 0;
+
+  for (const snap of snapshots) {
+    const hrSet = hrPlayersByDate.get(snap.target_date) ?? new Set<number>();
+    const hit = hrSet.has(snap.player_id);
+    const signals = parseSignalsFromReason(snap.reason);
+    const row: Row = {
+      date: snap.target_date,
+      player_id: snap.player_id,
+      heat_score: snap.heat_score,
+      signals,
+      hit,
+    };
+    rows.push(row);
+    if (hit) totalHits++;
+    const arr = byDate.get(snap.target_date);
+    if (arr) arr.push(row); else byDate.set(snap.target_date, [row]);
+  }
+
+  const totalN = rows.length;
+  const baseline = totalN > 0 ? totalHits / totalN : 0;
+
+  // ----- 2) Per-signal stats.
+  const allSignals: SignalKey[] = [
+    'hr_pitcher', 'power_park', 'wind_out', 'wind_in', 'warm_weather',
+    'hot_l7d', 'hr_streak', 'platoon_edge', 'elite_power', 'mid_power',
+    'low_season_power', 'cold_batter', 'pitcher_dominant',
+  ];
+  const signalRows: RevSignalRow[] = [];
+  const signalLiftByKey = new Map<SignalKey, number>();
+  for (const k of allSignals) {
+    let pn = 0, ph = 0, an = 0, ah = 0;
+    for (const r of rows) {
+      if (r.signals.has(k)) { pn++; if (r.hit) ph++; }
+      else { an++; if (r.hit) ah++; }
+    }
+    const sr = signalRow(k, pn, ph, an, ah, baseline);
+    signalRows.push(sr);
+    signalLiftByKey.set(k, sr.lift);
+  }
+
+  // Rank by lift, ignoring signals with present_n < 20.
+  const ranked = signalRows.filter((s) => s.present_n >= 20).slice().sort((a, b) => b.lift - a.lift);
+  const top_positive = ranked.filter((s) => s.lift > 1).slice(0, 5);
+  const top_negative = ranked.filter((s) => s.lift < 1).slice().reverse().slice(0, 5);
+
+  // ----- 3) Pair + triple combos.
+  // Pairs: user-explicit + top combinations from highest-lift signals.
+  const explicitPairs: SignalKey[][] = [
+    ['hr_pitcher', 'power_park'],
+    ['wind_out', 'platoon_edge'],
+    ['hot_l7d', 'hr_pitcher'],
+    ['elite_power', 'warm_weather'],
+  ];
+  const explicitTriples: SignalKey[][] = [
+    ['hr_pitcher', 'power_park', 'hot_l7d'],
+    ['elite_power', 'hr_pitcher', 'wind_out'],
+    ['hot_l7d', 'platoon_edge', 'power_park'],
+    ['elite_power', 'warm_weather', 'power_park'],
+  ];
+
+  // Auto-generated pairs from top 6 by lift (positive only, n≥20).
+  const topPosKeys = ranked.filter((s) => s.lift > 1).slice(0, 6).map((s) => s.key);
+  const autoPairs: SignalKey[][] = [];
+  for (let i = 0; i < topPosKeys.length; i++) {
+    for (let j = i + 1; j < topPosKeys.length; j++) {
+      autoPairs.push([topPosKeys[i], topPosKeys[j]]);
+    }
+  }
+  // Dedup pairs (treating order-agnostic).
+  const seenPair = new Set<string>();
+  const pairKey = (ks: SignalKey[]) => [...ks].sort().join('|');
+  const pairsToTry: SignalKey[][] = [];
+  for (const p of [...explicitPairs, ...autoPairs]) {
+    const k = pairKey(p);
+    if (seenPair.has(k)) continue;
+    seenPair.add(k);
+    pairsToTry.push(p);
+  }
+
+  const evalCombo = (keys: SignalKey[]): RevComboRow => {
+    const matching = rows.filter((r) => keys.every((k) => r.signals.has(k)));
+    return comboRow(keys, matching.map((r) => ({ hit: r.hit })), baseline, signalLiftByKey);
+  };
+
+  const pair_combos = pairsToTry
+    .map(evalCombo)
+    .filter((c) => c.present_n >= 10)            // require minimum support
+    .sort((a, b) => b.lift - a.lift)
+    .slice(0, 8);
+
+  const triple_combos = explicitTriples
+    .map(evalCombo)
+    .filter((c) => c.present_n >= 5)
+    .sort((a, b) => b.lift - a.lift);
+
+  // ----- 4) Directional optimizer.
+  const findSig = (k: SignalKey) => signalRows.find((s) => s.key === k);
+  const directional: RevDirectional[] = [
+    directionalFor({ knob: 'WEIGHTS.pitcher', driver: 'hr_pitcher', current: weights.pitcher, signalRow: findSig('hr_pitcher') }),
+    directionalFor({ knob: 'WEIGHTS.park', driver: 'power_park', current: weights.park, signalRow: findSig('power_park') }),
+    directionalFor({ knob: 'WEIGHTS.l7d', driver: 'hot_l7d', current: weights.l7d, signalRow: findSig('hot_l7d') }),
+    directionalFor({ knob: 'WEIGHTS.hand', driver: 'platoon_edge', current: weights.hand, signalRow: findSig('platoon_edge') }),
+    // Penalty knobs are inverted — lift < 1 on cold means the penalty is
+    // EARNED (i.e., increase magnitude, i.e., MORE NEGATIVE value).
+    directionalFor({ knob: 'COLD_PENALTY.elite', driver: 'cold_batter', current: weights.coldElite, signalRow: findSig('cold_batter'), inverted: true, capPct: 0.5 }),
+    directionalFor({ knob: 'COLD_PENALTY.mid', driver: 'cold_batter', current: weights.coldMid, signalRow: findSig('cold_batter'), inverted: true, capPct: 0.5 }),
+    directionalFor({ knob: 'LOW_POWER_CAP.cap', driver: 'low_season_power', current: weights.lowPowerCap, signalRow: findSig('low_season_power'), inverted: true, capPct: 0.3 }),
+  ];
+
+  // ----- 5) Grid optimizer (sensitivity).
+  const grid = gridSearch(byDate);
+
+  return {
+    window_days: byDate.size,
+    total_player_days: totalN,
+    total_hr_player_days: totalHits,
+    baseline_rate: baseline,
+    signals: signalRows,
+    top_positive,
+    top_negative,
+    pair_combos,
+    triple_combos,
+    directional,
+    grid,
+  };
+}
+
+/** Convenience getter so the UI can pass current knobs without duplicating
+ *  literal constants. Kept here so the analysis call site is one-liner. */
+export function currentReverseAnalysisWeights(): {
+  pitcher: number; park: number; l7d: number; hand: number;
+  coldElite: number; coldMid: number; lowPowerCap: number;
+} {
+  return {
+    pitcher: HEAT_SCORE_WEIGHTS.pitcher,
+    park: HEAT_SCORE_WEIGHTS.park,
+    l7d: HEAT_SCORE_WEIGHTS.l7d,
+    hand: HEAT_SCORE_WEIGHTS.hand,
+    coldElite: HEAT_SCORE_COLD_PENALTY.elite,
+    coldMid: HEAT_SCORE_COLD_PENALTY.mid,
+    lowPowerCap: HEAT_SCORE_LOW_POWER_CAP.cap,
+  };
+}
