@@ -20,11 +20,17 @@ import type {
   RevSignalRow,
   RevComboRow,
   RevDirectional,
+  ActionableRule,
+  SimulatedTop10Result,
+  SimulatedTop10Day,
 } from '../lib/stats';
 
 interface Props {
   /** When null, panel renders empty state. */
   analysis: ReverseAnalysisResult | null;
+  /** Actionable rules + simulation. Null while loading or empty window. */
+  actionable: ActionableRule[] | null;
+  simulation: SimulatedTop10Result | null;
   /** Loading indicator from the page. */
   loading: boolean;
   /** Render the toggle as expanded? Owned by parent so close-state survives. */
@@ -80,7 +86,13 @@ export default function ReverseAnalysisPanel(p: Props) {
               No data yet — open this once a snapshot + HR window exists.
             </p>
           )}
-          {!p.loading && p.analysis && <Body analysis={p.analysis} />}
+          {!p.loading && p.analysis && (
+            <Body
+              analysis={p.analysis}
+              actionable={p.actionable ?? []}
+              simulation={p.simulation}
+            />
+          )}
         </>
       )}
       <Styles />
@@ -139,22 +151,38 @@ function Header({ open, onToggle, loading, analysis, asOf, windowDays }: {
   );
 }
 
-function Body({ analysis }: { analysis: ReverseAnalysisResult }) {
+function Body({ analysis, actionable, simulation }: {
+  analysis: ReverseAnalysisResult;
+  actionable: ActionableRule[];
+  simulation: SimulatedTop10Result | null;
+}) {
   return (
     <div style={{ display: 'grid', gap: 18, marginTop: 12 }}>
-      <SignalTable rows={analysis.signals} baselineRate={analysis.baseline_rate} />
-      <TopPredictors result={analysis} />
-      <ComboTable
-        title="Pair Combinations"
-        rows={analysis.pair_combos}
-        sub="Hand-picked + auto-generated from top positive signals. Requires ≥10 player-days of co-occurrence."
-      />
-      <ComboTable
-        title="Triple Combinations"
-        rows={analysis.triple_combos}
-        sub="A few hand-picked 3-signal stacks. Sample size shrinks fast — treat as directional."
-      />
-      <Top10Optimizer result={analysis} />
+      {/* Lead with the actionable findings — that's what the user came for. */}
+      <ActionableChangesSection rules={actionable} />
+      {simulation && <SimulatedTop10Section sim={simulation} />}
+
+      {/* Supporting evidence below — same as the original analysis layer. */}
+      <details style={{ borderTop: '1px solid #232732', paddingTop: 12 }}>
+        <summary style={{ cursor: 'pointer', fontSize: 13, opacity: 0.8 }}>
+          Show full supporting evidence (signal table, predictors, combos, optimizer)
+        </summary>
+        <div style={{ display: 'grid', gap: 18, marginTop: 12 }}>
+          <SignalTable rows={analysis.signals} baselineRate={analysis.baseline_rate} />
+          <TopPredictors result={analysis} />
+          <ComboTable
+            title="Pair Combinations"
+            rows={analysis.pair_combos}
+            sub="Hand-picked + auto-generated from top positive signals. Requires ≥10 player-days of co-occurrence."
+          />
+          <ComboTable
+            title="Triple Combinations"
+            rows={analysis.triple_combos}
+            sub="A few hand-picked 3-signal stacks. Sample size shrinks fast — treat as directional."
+          />
+          <Top10Optimizer result={analysis} />
+        </div>
+      </details>
       <FinePrint />
     </div>
   );
@@ -418,6 +446,221 @@ function GridCard({ result }: { result: ReverseAnalysisResult }) {
   );
 }
 
+// =============================================================================
+//  Actionable Model Changes section
+// =============================================================================
+
+const STATUS_LABEL: Record<ActionableRule['status'], string> = {
+  apply_now: 'Apply now',
+  test_candidate: 'Test candidate',
+  monitor: 'Monitor',
+};
+const STATUS_CLASS: Record<ActionableRule['status'], string> = {
+  apply_now: 'rev-status--apply',
+  test_candidate: 'rev-status--test',
+  monitor: 'rev-status--monitor',
+};
+const RISK_CLASS: Record<ActionableRule['overfitting_risk'], string> = {
+  low: 'rev-risk--low',
+  medium: 'rev-risk--med',
+  high: 'rev-risk--high',
+};
+
+function ActionableChangesSection({ rules }: { rules: ActionableRule[] }) {
+  // Surface combos first (already sorted by priority in stats.ts), capped at
+  // a reasonable number so the page stays scannable. The full set lives in
+  // the supporting-evidence drawer below.
+  const display = rules.slice(0, 8);
+
+  return (
+    <div>
+      <h4 className="rev-h4">⚡ Actionable Model Changes</h4>
+      <p className="rev-sub">
+        Concrete rule + weight test candidates ranked by evidence. Combo rules surface above raw weight tweaks.
+        Nothing here is auto-applied — apply by hand in <code>src/lib/stats.ts</code>.
+      </p>
+      {display.length === 0 ? (
+        <p className="rev-sub" style={{ marginTop: 8 }}>
+          No qualifying rules in this window. Open the supporting evidence below to inspect signal lifts.
+        </p>
+      ) : (
+        <div className="rev-rule-grid">
+          {display.map((r) => <RuleCard key={r.id} rule={r} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RuleCard({ rule }: { rule: ActionableRule }) {
+  return (
+    <div className="rev-rule">
+      <div className="rev-rule-head">
+        <div className="rev-rule-title">{rule.rule_text}</div>
+        <span className={`rev-status ${STATUS_CLASS[rule.status]}`}>{STATUS_LABEL[rule.status]}</span>
+      </div>
+      <dl className="rev-rule-list">
+        <div>
+          <dt>Finding</dt>
+          <dd>{rule.finding}</dd>
+        </div>
+        <div>
+          <dt>Suggested test</dt>
+          <dd>
+            <code>{rule.kind === 'combo_bonus'
+              ? `Add ${rule.delta >= 0 ? '+' : ''}${rule.delta} combo bonus when ${rule.signals.length === 1 ? '' : 'all '}${rule.signals.join(' + ')} fire`
+              : rule.kind === 'penalty_change'
+                ? `Adjust ${rule.id.replace('knob:', '')} by ${rule.delta >= 0 ? '+' : ''}${rule.delta.toFixed(1)}`
+                : `Adjust ${rule.id.replace('knob:', '')} by ${rule.delta >= 0 ? '+' : ''}${rule.delta.toFixed(1)}`}</code>
+          </dd>
+        </div>
+        <div>
+          <dt>Why</dt>
+          <dd>{rule.why}</dd>
+        </div>
+        <div>
+          <dt>Expected impact</dt>
+          <dd>{rule.expected_impact || '—'}</dd>
+        </div>
+        <div>
+          <dt>Overfitting risk</dt>
+          <dd>
+            <span className={`rev-risk ${RISK_CLASS[rule.overfitting_risk]}`}>
+              {rule.overfitting_risk}
+            </span>
+            <span style={{ marginLeft: 8, opacity: 0.6, fontSize: 11 }}>
+              {rule.overfitting_risk === 'high' ? '(small sample — easy to fool yourself)'
+                : rule.overfitting_risk === 'medium' ? '(moderate sample — directional only)'
+                : '(large sample — safer to act on)'}
+            </span>
+          </dd>
+        </div>
+      </dl>
+    </div>
+  );
+}
+
+// =============================================================================
+//  Simulated Top-10 section
+// =============================================================================
+
+function SimulatedTop10Section({ sim }: { sim: SimulatedTop10Result }) {
+  // Day picker — defaults to the most recent day in the window.
+  const [selectedIdx, setSelectedIdx] = useState<number>(sim.days.length - 1);
+  const day = sim.days[Math.min(selectedIdx, sim.days.length - 1)];
+
+  return (
+    <div>
+      <h4 className="rev-h4">🔄 Simulated Top 10 — Actual vs Rules Applied</h4>
+      <p className="rev-sub">
+        What the Top 10 would have looked like if the candidate rules above had been applied across the {sim.days_counted}-day window.
+        Rules with status <strong>Apply now</strong> or <strong>Test candidate</strong> contribute.
+        <strong> Monitor</strong> rules are surfaced but excluded from the sim.
+      </p>
+
+      <div className="rev-kpis" style={{ marginTop: 6 }}>
+        <div className="rev-kpi">
+          <div className="rev-kpi-label">Actual hit rate</div>
+          <div className="rev-kpi-value">{pct(sim.actual_top10_rate)}</div>
+          <div className="rev-kpi-sub">{sim.actual_total_hits} hits / {sim.days_counted}d × 10</div>
+        </div>
+        <div className="rev-kpi">
+          <div className="rev-kpi-label">Simulated hit rate</div>
+          <div className="rev-kpi-value">{pct(sim.simulated_top10_rate)}</div>
+          <div className="rev-kpi-sub">{sim.simulated_total_hits} hits / {sim.days_counted}d × 10</div>
+        </div>
+        <div className="rev-kpi">
+          <div className="rev-kpi-label">Delta</div>
+          <div className={`rev-kpi-value ${sim.delta > 0 ? 'rev-pos' : sim.delta < 0 ? 'rev-neg' : ''}`}>
+            {sim.delta > 0 ? '+' : ''}{pct(sim.delta)}
+          </div>
+          <div className="rev-kpi-sub">{sim.rules_applied.length} rules applied</div>
+        </div>
+      </div>
+
+      {day && (
+        <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 13, opacity: 0.8 }}>Compare day:</span>
+            <select
+              value={selectedIdx}
+              onChange={(e) => setSelectedIdx(Number(e.target.value))}
+              style={{
+                background: '#0c0e14', color: '#cfe', border: '1px solid #2a2d36',
+                borderRadius: 6, padding: '4px 8px', fontSize: 13,
+              }}
+            >
+              {sim.days.map((d, i) => (
+                <option key={d.date} value={i}>
+                  {d.date} (actual {d.actual_hits} · sim {d.simulated_hits} · {d.delta_hits >= 0 ? '+' : ''}{d.delta_hits})
+                </option>
+              ))}
+            </select>
+            <span style={{ fontSize: 11, opacity: 0.6 }}>
+              Highlight color: <span className="rev-row--new">new entry</span> ·
+              <span className="rev-row--dropped" style={{ marginLeft: 6 }}>dropped from sim</span>
+            </span>
+          </div>
+
+          <div className="rev-grid2" style={{ marginTop: 10 }}>
+            <SimTop10Card title={`Actual Top 10 — ${day.date}`} rows={day.actual} highlightKey="dropped" />
+            <SimTop10Card title={`Simulated Top 10 — ${day.date}`} rows={day.simulated} highlightKey="new" />
+          </div>
+        </>
+      )}
+      <p className="rev-sub" style={{ marginTop: 8, fontSize: 11 }}>{sim.note}</p>
+    </div>
+  );
+}
+
+function SimTop10Card({ title, rows, highlightKey }: {
+  title: string;
+  rows: { rank: number; player_id: number; player_name: string; team: string; heat_score: number; modified_score: number; rules_applied: string[]; hit: boolean; in_both: boolean }[];
+  highlightKey: 'new' | 'dropped';
+}) {
+  return (
+    <div className="rev-card">
+      <h5 className="rev-h5">{title}</h5>
+      <div className="rev-table-wrap">
+        <table className="rev-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Player</th>
+              <th>Team</th>
+              <th className="num">Heat</th>
+              <th className="num">Mod</th>
+              <th>HR?</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => {
+              const cls = r.in_both ? '' : highlightKey === 'new' ? 'rev-row--new' : 'rev-row--dropped';
+              return (
+                <tr key={`${r.rank}-${r.player_id}`} className={cls}>
+                  <td>{r.rank}</td>
+                  <td>{r.player_name}</td>
+                  <td>{r.team}</td>
+                  <td className="num">{r.heat_score.toFixed(1)}</td>
+                  <td className={`num ${r.modified_score !== r.heat_score ? (r.modified_score > r.heat_score ? 'rev-pos' : 'rev-neg') : ''}`}>
+                    {r.modified_score.toFixed(1)}
+                    {r.modified_score !== r.heat_score && (
+                      <span style={{ fontSize: 10, opacity: 0.7, marginLeft: 4 }}>
+                        ({r.modified_score - r.heat_score > 0 ? '+' : ''}{(r.modified_score - r.heat_score).toFixed(1)})
+                      </span>
+                    )}
+                  </td>
+                  <td>{r.hit ? '✓' : '·'}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function FinePrint() {
   return (
     <p className="rev-sub" style={{ fontSize: 11, marginTop: 8 }}>
@@ -499,6 +742,62 @@ function Styles() {
       }
       .rev-kpi-label { font-size: 11px; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.06em; }
       .rev-kpi-value { font-size: 16px; font-weight: 600; color: #cfe; margin-top: 2px; }
+      .rev-kpi-sub { font-size: 10px; opacity: 0.6; margin-top: 2px; }
+
+      /* Actionable rule cards */
+      .rev-rule-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+        gap: 10px;
+        margin-top: 8px;
+      }
+      .rev-rule {
+        background: #14171f;
+        border: 1px solid #232732;
+        border-radius: 8px;
+        padding: 10px 12px;
+      }
+      .rev-rule-head {
+        display: flex; justify-content: space-between; align-items: flex-start;
+        gap: 8px; margin-bottom: 8px;
+      }
+      .rev-rule-title {
+        font-weight: 600; font-size: 14px; color: #e2e6ee;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .rev-rule-list {
+        margin: 0; display: grid; gap: 6px;
+      }
+      .rev-rule-list > div {
+        display: grid; grid-template-columns: 90px 1fr; gap: 6px; align-items: start;
+      }
+      .rev-rule-list dt {
+        font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+        opacity: 0.55; padding-top: 2px;
+      }
+      .rev-rule-list dd {
+        margin: 0; font-size: 12.5px; color: #d9e0eb; line-height: 1.4;
+      }
+      .rev-rule-list code { font-size: 11.5px; background: #0c0e14; padding: 1px 5px; border-radius: 3px; }
+      .rev-status {
+        display: inline-block; padding: 2px 8px; border-radius: 999px;
+        font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em;
+        font-weight: 600; white-space: nowrap;
+      }
+      .rev-status--apply { background: #1f3e29; color: #b6f0c1; }
+      .rev-status--test { background: #2d3a52; color: #b8d2ff; }
+      .rev-status--monitor { background: #2a2d36; color: #aab1c0; }
+      .rev-risk {
+        display: inline-block; padding: 1px 7px; border-radius: 999px;
+        font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em;
+      }
+      .rev-risk--low { background: #1f3e29; color: #b6f0c1; }
+      .rev-risk--med { background: #3a3623; color: #f0e3a2; }
+      .rev-risk--high { background: #4a2730; color: #f3b6b6; }
+
+      /* Simulated Top-10 row highlights */
+      .rev-row--new td { background: rgba(50, 130, 70, 0.15); }
+      .rev-row--dropped td { background: rgba(150, 60, 60, 0.12); opacity: 0.85; }
     `}</style>
   );
 }

@@ -28,6 +28,7 @@ import ReverseAnalysisPanel from '../components/ReverseAnalysisPanel';
 import {
   addDays,
   applyCanonicalTeams,
+  buildActionableModelChanges,
   computeHrTargets,
   computeReverseAnalysis,
   computeSleepers,
@@ -36,6 +37,7 @@ import {
   pitcherHrLeaderboard,
   venueLeaderboard,
   ELITE_POWER_NAMES,
+  type ActionableRule,
   type HrTarget,
   type HrTargetGame,
   type HrTargetsBoard,
@@ -43,6 +45,7 @@ import {
   type PlayerTeamIndex,
   type ReverseAnalysisResult,
   type RevAnalysisSnapshotRow,
+  type SimulatedTop10Result,
   type SleeperOddsLite,
 } from '../lib/stats';
 
@@ -198,6 +201,8 @@ export default function HrTargets() {
   const [revOpen, setRevOpen] = useState(false);
   const [revLoading, setRevLoading] = useState(false);
   const [revResult, setRevResult] = useState<ReverseAnalysisResult | null>(null);
+  const [revRules, setRevRules] = useState<ActionableRule[] | null>(null);
+  const [revSim, setRevSim] = useState<SimulatedTop10Result | null>(null);
   const [revLoadedFor, setRevLoadedFor] = useState<string | null>(null);
 
   async function loadReverseAnalysis(anchorDate: string) {
@@ -216,21 +221,32 @@ export default function HrTargets() {
         if (!s) { s = new Set<number>(); hrByDate.set(r.game_date, s); }
         s.add(r.player_id);
       }
+      // Keep player_name + team so the Simulated Top-10 can render names.
       const minimal: RevAnalysisSnapshotRow[] = snaps.map((r) => ({
         target_date: r.target_date,
         player_id: r.player_id,
+        player_name: r.player_name,
+        team: r.team,
         rank: r.rank,
         heat_score: r.heat_score,
         reason: r.reason,
       }));
       const w = currentReverseAnalysisWeights();
       const result = computeReverseAnalysis(minimal, hrByDate, w);
+      // Promote raw analysis into Actionable Model Changes + a simulated
+      // Top-10 over the same window (the user-visible deliverable). Done
+      // inline here so a single fetch powers everything in the panel.
+      const built = buildActionableModelChanges(result, minimal, hrByDate);
       setRevResult(result);
+      setRevRules(built.rules);
+      setRevSim(built.simulation);
       setRevLoadedFor(anchorDate);
     } catch (e) {
       // eslint-disable-next-line no-console
       console.warn('[reverse-analysis] load failed:', e);
       setRevResult(null);
+      setRevRules(null);
+      setRevSim(null);
     } finally {
       setRevLoading(false);
     }
@@ -728,6 +744,8 @@ export default function HrTargets() {
           here mutates HEAT_SCORE_WEIGHTS or any other scoring knob. */}
       <ReverseAnalysisPanel
         analysis={revResult}
+        actionable={revRules}
+        simulation={revSim}
         loading={revLoading}
         open={revOpen}
         onToggle={toggleRev}

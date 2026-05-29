@@ -3338,6 +3338,10 @@ export function parseSignalsFromReason(reason: string | null): Set<SignalKey> {
 export interface RevAnalysisSnapshotRow {
   target_date: string;
   player_id: number;
+  /** Display name — optional so analysis-only callers can omit. Required
+   *  for the Simulated Top-10 section to render names instead of IDs. */
+  player_name?: string;
+  team?: string;
   rank: number;
   heat_score: number;
   reason: string | null;
@@ -3822,3 +3826,419 @@ export function currentReverseAnalysisWeights(): {
     lowPowerCap: HEAT_SCORE_LOW_POWER_CAP.cap,
   };
 }
+
+// =============================================================================
+//  Actionable Model Changes + Simulated Top-10 (follow-up to task #179)
+// -----------------------------------------------------------------------------
+//  The reverse-analysis tab surfaces correlations — these helpers promote
+//  the strongest patterns into concrete *test candidates* with a
+//  before/after simulation, so the user can decide whether to apply them.
+//
+//  STRICT honesty rules (same as the analysis layer):
+//    • Rules are SURFACED ONLY. Nothing here mutates HEAT_SCORE_WEIGHTS,
+//      HEAT_SCORE_COLD_PENALTY, or any other scoring knob.
+//    • Status defaults to "Test candidate" unless the sample and lift are
+//      both strong. Small-sample combos are surfaced as "Monitor" only.
+//    • The simulated Top-10 is a sensitivity sim: each candidate rule adds
+//      a fixed Δ to heat_score when its signals match, then re-ranks per
+//      date. Saturation / ceiling compression / completeness multipliers
+//      are NOT re-applied (same caveat as the grid optimizer).
+// =============================================================================
+
+/** A concrete, surfaced change the model could try — each rule maps to a
+ *  delta that gets added to heat_score whenever its signals all fire. */
+export interface ActionableRule {
+  /** Stable id ("combo:hr_pitcher+power_park"). Used as React key + sim ref. */
+  id: string;
+  kind: 'combo_bonus' | 'weight_change' | 'penalty_change';
+  /** Human-readable rule, e.g., "Cold Batter + HR Pitcher → +4". */
+  rule_text: string;
+  /** Signals that must all be present to apply the delta. */
+  signals: SignalKey[];
+  /** Score adjustment applied when all signals match. Positive = boost,
+   *  negative = penalty. Always small (≤ ±8) to limit overfitting risk. */
+  delta: number;
+  /** Tight numeric finding string — "21.9% hit rate, 1.49x lift, n=32". */
+  finding: string;
+  /** Plain-English why ("Cold penalty may be too harsh when pitcher allows HR damage"). */
+  why: string;
+  /** "+X% Top-10 hit rate over the window" — only filled after simulation. */
+  expected_impact: string;
+  overfitting_risk: 'low' | 'medium' | 'high';
+  status: 'apply_now' | 'test_candidate' | 'monitor';
+  /** Priority used for sorting in the UI. Higher = more important. */
+  priority: number;
+}
+
+/** Per-day side-by-side actual vs simulated Top-10. */
+export interface SimulatedTop10Day {
+  date: string;
+  actual: SimulatedTop10Row[];
+  simulated: SimulatedTop10Row[];
+  actual_hits: number;
+  simulated_hits: number;
+  /** simulated_hits − actual_hits; +/−. */
+  delta_hits: number;
+}
+
+export interface SimulatedTop10Row {
+  rank: number;
+  player_id: number;
+  player_name: string;
+  team: string;
+  heat_score: number;
+  /** heat_score + Σ(rule.delta where rule matched). Equal to heat_score in actual. */
+  modified_score: number;
+  /** Rule ids that fired on this row. */
+  rules_applied: string[];
+  hit: boolean;
+  /** True iff this player was in BOTH the actual and simulated Top-10
+   *  for the date (helps the UI highlight the diff). */
+  in_both: boolean;
+}
+
+export interface SimulatedTop10Result {
+  /** Subset of the rules actually used to build the simulation (filtered
+   *  to "apply_now" + "test_candidate" by default). */
+  rules_applied: ActionableRule[];
+  days: SimulatedTop10Day[];
+  /** Totals across the window. */
+  actual_total_hits: number;
+  simulated_total_hits: number;
+  actual_top10_rate: number;
+  simulated_top10_rate: number;
+  /** simulated − actual, in absolute terms. */
+  delta: number;
+  /** Days included (== days.length). */
+  days_counted: number;
+  note: string;
+}
+
+/**
+ * Plain-English rationale for a combo. Hand-crafted for a few patterns the
+ * user is most likely to see; falls back to a generic polarity-aware string.
+ */
+function comboRationale(keys: SignalKey[]): string {
+  const k = keys.slice().sort().join('|');
+  // Hand-crafted entries — easy to extend as patterns emerge.
+  const map: Record<string, string> = {
+    'cold_batter|hr_pitcher':
+      'Cold penalty may be too harsh when the pitcher allows HR damage — the matchup edge appears to claw back what the cold-streak penalty over-corrects.',
+    'hr_pitcher|power_park':
+      'Park-induced HR ceiling and weak pitching context are largely independent — when they stack, both factors amplify.',
+    'hot_l7d|hr_pitcher':
+      'Hot streak hitters punish weak pitching at an outsized rate. Current model rewards each separately but does not credit the stack.',
+    'elite_power|warm_weather':
+      'Elite power profile + warm weather is a classic stacking pattern — the model treats them additively but the joint lift exceeds that.',
+    'platoon_edge|wind_out':
+      'Platoon edge plus a wind-out park boost is a multiplicative HR-environment combo not currently captured by either knob.',
+    'hot_l7d|power_park':
+      'Recent form + park boost — current weights treat them independently, but they appear to stack meaningfully.',
+    'elite_power|hr_pitcher':
+      'Top-of-card sluggers vs weak pitching — already a strong signal individually, but joint cases over-perform the sum.',
+    'cold_batter|low_season_power':
+      'When cold AND low-season-power both fire, the model already heavily discounts — verify this is not over-counting before increasing the penalty.',
+  };
+  if (map[k]) return map[k];
+  // Generic fallback by polarity composition.
+  const polarities = keys.map((s) => SIGNAL_POLARITY[s]);
+  const allPositive = polarities.every((p) => p === 'positive');
+  const allNegative = polarities.every((p) => p === 'negative');
+  const labels = keys.map((s) => SIGNAL_LABELS[s]).join(' + ');
+  if (allPositive) return `Joint occurrence of ${labels} outperforms the sum of individual lifts — model currently treats these factors independently.`;
+  if (allNegative) return `${labels} co-occurring suggests the current penalty stack may be insufficient — confirm before increasing magnitudes.`;
+  return `Mixed-polarity combo (${labels}) — joint lift suggests one signal is moderating the other in a way the current model misses.`;
+}
+
+/** Score a combo's "promotability" so we can sort actionable rules by
+ *  practical importance (lift weighted by log(sample size)). */
+function comboPriority(lift: number, n: number): number {
+  return (lift - 1) * Math.log(Math.max(2, n));
+}
+
+function riskFor(n: number): 'low' | 'medium' | 'high' {
+  if (n >= 100) return 'low';
+  if (n >= 30) return 'medium';
+  return 'high';
+}
+
+function statusFor(lift: number, n: number, outperforms: boolean): 'apply_now' | 'test_candidate' | 'monitor' {
+  if (lift >= 1.5 && n >= 50 && outperforms) return 'apply_now';
+  if (lift >= 1.3 && n >= 15) return 'test_candidate';
+  return 'monitor';
+}
+
+/** Map lift magnitude to a small bounded delta. Capped so a single rule
+ *  cannot dominate the score — the UI also displays the delta plainly. */
+function deltaForCombo(lift: number, polarities: ('positive' | 'negative')[]): number {
+  const allNegative = polarities.every((p) => p === 'negative');
+  // Positive (or mixed) combos get bonuses. Pure-negative combos get penalty deltas.
+  if (allNegative) {
+    if (lift <= 0.5) return -7;
+    if (lift <= 0.7) return -5;
+    if (lift <= 0.85) return -3;
+    return 0;
+  }
+  if (lift >= 2.0) return 7;
+  if (lift >= 1.7) return 5;
+  if (lift >= 1.5) return 4;
+  if (lift >= 1.3) return 3;
+  return 2;
+}
+
+/**
+ * Promote the strongest combos + directional recs into actionable rule
+ * cards. Combos rank above raw individual weight changes — the user
+ * explicitly asked for that ordering.
+ *
+ * Combos are filtered to lift ≥ 1.15 AND n ≥ 10 before promotion. Below
+ * that they remain in the combo table but aren't surfaced as rules.
+ */
+export function computeActionableChanges(
+  analysis: ReverseAnalysisResult,
+): ActionableRule[] {
+  const rules: ActionableRule[] = [];
+
+  // ----- 1) Combo rules (priority).
+  const allCombos = [...analysis.pair_combos, ...analysis.triple_combos];
+  for (const c of allCombos) {
+    if (c.present_n < 10) continue;
+    if (c.lift < 1.15 && c.lift > 0.85) continue; // skip neutral combos
+
+    const polarities = c.keys.map((k) => SIGNAL_POLARITY[k]);
+    const delta = deltaForCombo(c.lift, polarities);
+    if (delta === 0) continue;
+
+    const id = `combo:${c.keys.slice().sort().join('+')}`;
+    const ruleText = `${c.labels.join(' + ')} → ${delta >= 0 ? '+' : ''}${delta}`;
+    const finding = `${(c.present_rate * 100).toFixed(1)}% hit rate, ${c.lift.toFixed(2)}× lift, n=${c.present_n}`;
+    const why = comboRationale(c.keys);
+    const status = statusFor(c.lift, c.present_n, c.outperforms_individual);
+    const risk = riskFor(c.present_n);
+
+    rules.push({
+      id,
+      kind: 'combo_bonus',
+      rule_text: ruleText,
+      signals: c.keys.slice(),
+      delta,
+      finding,
+      why,
+      expected_impact: '', // filled by simulation
+      overfitting_risk: risk,
+      status,
+      priority: comboPriority(c.lift, c.present_n) + 100, // combos rank above weights
+    });
+  }
+
+  // ----- 2) Individual weight/penalty changes (lower priority).
+  for (const d of analysis.directional) {
+    if (d.direction === 'hold') continue;
+    const sig = analysis.signals.find((s) => s.key === d.driver_signal);
+    if (!sig || sig.present_n < 20) continue;
+
+    const id = `knob:${d.knob}`;
+    const ruleText = `${d.knob}: ${d.current_value} → ${d.suggested_value}`;
+    const finding = `Driver "${SIGNAL_LABELS[d.driver_signal]}" lift=${sig.lift.toFixed(2)}× on n=${sig.present_n}`;
+    const kind = d.knob.startsWith('COLD_PENALTY') || d.knob.startsWith('LOW_POWER_CAP')
+      ? 'penalty_change'
+      : 'weight_change';
+    const status: ActionableRule['status'] =
+      d.confidence === 'high' ? 'test_candidate'
+      : d.confidence === 'medium' ? 'monitor'
+      : 'monitor';
+
+    rules.push({
+      id,
+      kind,
+      rule_text: ruleText,
+      signals: [d.driver_signal],
+      delta: d.suggested_value - d.current_value,
+      finding,
+      why: d.rationale,
+      expected_impact: '',
+      overfitting_risk: sig.present_n >= 100 ? 'low' : sig.present_n >= 30 ? 'medium' : 'high',
+      status,
+      priority: Math.abs(d.suggested_value - d.current_value),
+    });
+  }
+
+  return rules.sort((a, b) => b.priority - a.priority);
+}
+
+/**
+ * Simulate Top-10 under a set of candidate rules.
+ *
+ * For each date in the window:
+ *   1. Take all snapshot rows (heat_score, signals).
+ *   2. The "actual" Top-10 is the original rank ≤ 10 set.
+ *   3. The "simulated" Top-10 re-ranks by heat_score + Σ(rule.delta) for
+ *      every rule whose signals all match.
+ *   4. Counts how many of each Top-10 actually homered.
+ *
+ * Returns side-by-side rows + totals so the UI can highlight the diff.
+ */
+export function simulateTop10WithRules(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+  rules: ActionableRule[],
+): SimulatedTop10Result {
+  // Filter to rules that should be tested. "monitor" rules are surfaced in
+  // the UI but excluded from the sim so we don't bias the simulated curve
+  // by under-evidence noise.
+  const sim_rules = rules.filter((r) => r.status === 'apply_now' || r.status === 'test_candidate');
+
+  // Group snapshot rows by date.
+  type Row = {
+    player_id: number;
+    player_name: string;
+    team: string;
+    heat_score: number;
+    signals: Set<SignalKey>;
+    rank: number;
+    hit: boolean;
+  };
+  const byDate = new Map<string, Row[]>();
+  for (const snap of snapshots) {
+    const hrSet = hrPlayersByDate.get(snap.target_date) ?? new Set<number>();
+    const r: Row = {
+      player_id: snap.player_id,
+      player_name: snap.player_name ?? `#${snap.player_id}`,
+      team: snap.team ?? '',
+      heat_score: snap.heat_score,
+      signals: parseSignalsFromReason(snap.reason),
+      rank: snap.rank,
+      hit: hrSet.has(snap.player_id),
+    };
+    const arr = byDate.get(snap.target_date);
+    if (arr) arr.push(r); else byDate.set(snap.target_date, [r]);
+  }
+
+  const days: SimulatedTop10Day[] = [];
+  let actual_total = 0;
+  let sim_total = 0;
+  let actual_top_slots = 0;
+  let sim_top_slots = 0;
+
+  // Date-sorted, ascending — useful for chart/timeline rendering.
+  const sortedDates = Array.from(byDate.keys()).sort();
+  for (const date of sortedDates) {
+    const rows = byDate.get(date)!;
+    // Actual top-10 from saved rank.
+    const actualSorted = rows.slice().sort((a, b) => a.rank - b.rank);
+    const actualTop10 = actualSorted.slice(0, 10);
+
+    // Simulated: compute modified score per row, then re-rank.
+    const simulated = rows.map((r) => {
+      const applied: string[] = [];
+      let modified = r.heat_score;
+      for (const rule of sim_rules) {
+        if (rule.signals.every((s) => r.signals.has(s))) {
+          modified += rule.delta;
+          applied.push(rule.id);
+        }
+      }
+      return { row: r, modified, applied };
+    });
+    simulated.sort((a, b) => b.modified - a.modified);
+    const simulatedTop10 = simulated.slice(0, 10);
+
+    const actualIds = new Set(actualTop10.map((r) => r.player_id));
+    const simIds = new Set(simulatedTop10.map((s) => s.row.player_id));
+
+    const actualRows: SimulatedTop10Row[] = actualTop10.map((r, i) => ({
+      rank: i + 1,
+      player_id: r.player_id,
+      player_name: r.player_name,
+      team: r.team,
+      heat_score: r.heat_score,
+      modified_score: r.heat_score,
+      rules_applied: [],
+      hit: r.hit,
+      in_both: simIds.has(r.player_id),
+    }));
+    const simRows: SimulatedTop10Row[] = simulatedTop10.map((s, i) => ({
+      rank: i + 1,
+      player_id: s.row.player_id,
+      player_name: s.row.player_name,
+      team: s.row.team,
+      heat_score: s.row.heat_score,
+      modified_score: s.modified,
+      rules_applied: s.applied,
+      hit: s.row.hit,
+      in_both: actualIds.has(s.row.player_id),
+    }));
+
+    const actualHits = actualRows.reduce((sum, r) => sum + (r.hit ? 1 : 0), 0);
+    const simHits = simRows.reduce((sum, r) => sum + (r.hit ? 1 : 0), 0);
+
+    days.push({
+      date,
+      actual: actualRows,
+      simulated: simRows,
+      actual_hits: actualHits,
+      simulated_hits: simHits,
+      delta_hits: simHits - actualHits,
+    });
+    actual_total += actualHits;
+    sim_total += simHits;
+    actual_top_slots += actualRows.length;
+    sim_top_slots += simRows.length;
+  }
+
+  const actualRate = actual_top_slots > 0 ? actual_total / actual_top_slots : 0;
+  const simRate = sim_top_slots > 0 ? sim_total / sim_top_slots : 0;
+
+  return {
+    rules_applied: sim_rules,
+    days,
+    actual_total_hits: actual_total,
+    simulated_total_hits: sim_total,
+    actual_top10_rate: actualRate,
+    simulated_top10_rate: simRate,
+    delta: simRate - actualRate,
+    days_counted: days.length,
+    note: sim_rules.length === 0
+      ? 'No rules qualified for testing — simulated curve matches actual.'
+      : `Sensitivity sim: Δ added directly to saved heat_score on rule matches, then re-ranked. Full pipeline not re-applied.`,
+  };
+}
+
+/**
+ * Convenience wrapper — promote rules + back-fill expected_impact from the
+ * simulation, in one pass. This is the function the UI calls.
+ *
+ * After computing the sim, we estimate each rule's individual contribution
+ * to the Top-10 hit-rate lift by running a leave-one-out sim (each rule
+ * removed, observe Top-10 hit-rate drop). For small rule sets this is
+ * cheap (n_rules × days × snapshots/day re-rank).
+ */
+export function buildActionableModelChanges(
+  analysis: ReverseAnalysisResult,
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+): { rules: ActionableRule[]; simulation: SimulatedTop10Result } {
+  const rules = computeActionableChanges(analysis);
+  const full = simulateTop10WithRules(snapshots, hrPlayersByDate, rules);
+
+  // Leave-one-out attribution for expected_impact.
+  for (const r of rules) {
+    if (r.status === 'monitor') {
+      r.expected_impact = 'Not tested — sample too small.';
+      continue;
+    }
+    const subset = rules.filter((other) => other.id !== r.id);
+    const minus = simulateTop10WithRules(snapshots, hrPlayersByDate, subset);
+    const contribution = full.simulated_top10_rate - minus.simulated_top10_rate;
+    if (contribution >= 0.005) {
+      r.expected_impact = `+${(contribution * 100).toFixed(1)} pct pt Top-10 hit rate`;
+    } else if (contribution <= -0.005) {
+      r.expected_impact = `${(contribution * 100).toFixed(1)} pct pt Top-10 hit rate (HURTS — revisit)`;
+    } else {
+      r.expected_impact = 'Negligible (<0.5 pct pt) — keep as monitor.';
+    }
+  }
+
+  return { rules, simulation: full };
+}
+
