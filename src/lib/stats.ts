@@ -5213,3 +5213,568 @@ export function computeConfidenceTiers(
     l14d_from: l14dFrom,
   };
 }
+
+// =============================================================================
+//  Pool Coverage / Near Misses / Exclusion Reasons / Best Historical Pool
+// -----------------------------------------------------------------------------
+//  These four helpers power the redesigned HR Targets main page (task #206+).
+//
+//  The user's diagnostic question is: "is the model's edge a pool-construction
+//  problem or a ranking problem?" Each helper isolates one axis of that:
+//
+//    Pool Coverage     — what fraction of actual HR hitters did the model
+//                        even consider? (denominator = HR hitters that day)
+//    Near Misses       — of the HR hitters in the pool, where did the model
+//                        rank them? (51-100, 101+, or unranked)
+//    Exclusion Reasons — for HR hitters outside the top 50, WHY were they
+//                        excluded? (cold penalty / low power cap / not in
+//                        pool / low heat / missing data)
+//    Best Historical
+//    Pool              — search for criteria that would have included more
+//                        unranked HR hitters in the pool. Recurring profiles
+//                        across the window are the actionable patterns.
+//
+//  STRICT honesty rules: surfacing only. No mutation of HEAT_SCORE_WEIGHTS.
+//  Treat all output as evidence — apply weight changes by hand.
+// =============================================================================
+
+const TOP_POOL_SIZE = 50;
+
+/** Per-day pool-coverage snapshot. */
+export interface CoverageDayRow {
+  date: string;
+  total_hr_hitters: number;
+  inside_pool: number;
+  outside_pool: number;
+  coverage_rate: number;
+}
+
+/** Rolling-window aggregate. */
+export interface CoverageWindow {
+  /** Window label: "7d", "14d", "30d". */
+  label: string;
+  days_in_window: number;
+  total_hr_hitters: number;
+  inside_pool: number;
+  outside_pool: number;
+  coverage_rate: number;
+}
+
+export interface PoolCoverageResult {
+  /** Anchor date the windows are computed against. */
+  anchor: string;
+  days: CoverageDayRow[];
+  l7d: CoverageWindow;
+  l14d: CoverageWindow;
+  l30d: CoverageWindow;
+  note: string;
+}
+
+function coverageWindow(
+  label: string,
+  rangeStart: string,
+  anchor: string,
+  perDay: CoverageDayRow[],
+): CoverageWindow {
+  let total = 0, inside = 0, outside = 0, days = 0;
+  for (const d of perDay) {
+    if (d.date < rangeStart || d.date > anchor) continue;
+    total += d.total_hr_hitters;
+    inside += d.inside_pool;
+    outside += d.outside_pool;
+    days += 1;
+  }
+  return {
+    label,
+    days_in_window: days,
+    total_hr_hitters: total,
+    inside_pool: inside,
+    outside_pool: outside,
+    coverage_rate: total > 0 ? inside / total : 0,
+  };
+}
+
+/**
+ * For each day in the window, compare the saved snapshot's player_id set
+ * against the actual HR-hitter set, then roll up over 7d/14d/30d.
+ *
+ * "Inside pool" = player has ANY snapshot row that day (any rank), so this
+ * measures POOL CONSTRUCTION, not ranking depth.
+ */
+export function computePoolCoverage(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+  anchor: string,
+): PoolCoverageResult {
+  // Build per-day pool sets (player_ids in the snapshot).
+  const poolByDate = new Map<string, Set<number>>();
+  for (const snap of snapshots) {
+    if (snap.target_date > anchor) continue;
+    let s = poolByDate.get(snap.target_date);
+    if (!s) { s = new Set<number>(); poolByDate.set(snap.target_date, s); }
+    s.add(snap.player_id);
+  }
+
+  // Every date that has actual HR data + a snapshot for that date.
+  const allDates = new Set<string>();
+  for (const d of hrPlayersByDate.keys()) if (d <= anchor) allDates.add(d);
+  for (const d of poolByDate.keys()) if (d <= anchor) allDates.add(d);
+  const sortedDates = Array.from(allDates).sort();
+
+  const days: CoverageDayRow[] = [];
+  for (const date of sortedDates) {
+    const hr = hrPlayersByDate.get(date);
+    if (!hr || hr.size === 0) continue; // skip days with no actual HRs
+    const pool = poolByDate.get(date) ?? new Set<number>();
+    let inside = 0;
+    for (const id of hr) if (pool.has(id)) inside++;
+    const outside = hr.size - inside;
+    days.push({
+      date,
+      total_hr_hitters: hr.size,
+      inside_pool: inside,
+      outside_pool: outside,
+      coverage_rate: hr.size > 0 ? inside / hr.size : 0,
+    });
+  }
+
+  const l7d = coverageWindow('7d', addDays(anchor, -6), anchor, days);
+  const l14d = coverageWindow('14d', addDays(anchor, -13), anchor, days);
+  const l30d = coverageWindow('30d', addDays(anchor, -29), anchor, days);
+
+  return {
+    anchor,
+    days,
+    l7d, l14d, l30d,
+    note: 'Pool = any player_id that received a snapshot row that day. Measures pool construction (did we even consider them?), not ranking depth.',
+  };
+}
+
+// -----------------------------------------------------------------------------
+//  Near Misses
+// -----------------------------------------------------------------------------
+
+export interface NearMissPlayer {
+  date: string;
+  player_id: number;
+  player_name: string;
+  team: string;
+  /** null = completely unranked (no snapshot row). */
+  rank: number | null;
+  heat_score: number | null;
+  reason: string | null;
+}
+
+export interface NearMissBucket {
+  label: string;          // "51-100", "101+", "Unranked"
+  players: NearMissPlayer[];
+  count: number;
+}
+
+export interface NearMissResult {
+  /** Anchor date — most recent date covered. */
+  anchor: string;
+  window_days: number;
+  ranked_51_100: NearMissBucket;
+  ranked_101_plus: NearMissBucket;
+  unranked: NearMissBucket;
+  /** Aggregate across the window. */
+  total_hr_hitters: number;
+  total_near_misses: number;
+}
+
+/**
+ * For every HR hitter in the window, classify how far the model was from
+ * including them in the actionable Top 50:
+ *   - 51-100  → close, ranking issue
+ *   - 101+    → in pool but deeply buried
+ *   - unranked → not in pool at all (construction issue)
+ */
+export function computeNearMisses(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+  hrPlayerInfo: Map<number, { player_name: string; team: string }>,
+  anchor: string,
+  windowDays = 14,
+): NearMissResult {
+  const rangeStart = addDays(anchor, -(windowDays - 1));
+
+  // Build (date, player_id) → snapshot row index.
+  const snapByDayPlayer = new Map<string, RevAnalysisSnapshotRow>();
+  for (const snap of snapshots) {
+    if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
+    snapByDayPlayer.set(`${snap.target_date}:${snap.player_id}`, snap);
+  }
+
+  const bucket_51_100: NearMissPlayer[] = [];
+  const bucket_101_plus: NearMissPlayer[] = [];
+  const bucket_unranked: NearMissPlayer[] = [];
+  let total_hr = 0;
+  let total_near = 0;
+
+  for (const [date, hrSet] of hrPlayersByDate) {
+    if (date < rangeStart || date > anchor) continue;
+    for (const pid of hrSet) {
+      total_hr += 1;
+      const key = `${date}:${pid}`;
+      const snap = snapByDayPlayer.get(key);
+      const info = hrPlayerInfo.get(pid) ?? { player_name: `#${pid}`, team: '' };
+      const player: NearMissPlayer = {
+        date,
+        player_id: pid,
+        player_name: snap?.player_name ?? info.player_name,
+        team: snap?.team ?? info.team,
+        rank: snap?.rank ?? null,
+        heat_score: snap?.heat_score ?? null,
+        reason: snap?.reason ?? null,
+      };
+      if (!snap) {
+        bucket_unranked.push(player); total_near++;
+      } else if (snap.rank <= TOP_POOL_SIZE) {
+        // Inside Top 50 — not a near miss.
+        continue;
+      } else if (snap.rank <= 100) {
+        bucket_51_100.push(player); total_near++;
+      } else {
+        bucket_101_plus.push(player); total_near++;
+      }
+    }
+  }
+
+  const byRank = (a: NearMissPlayer, b: NearMissPlayer) => (a.rank ?? 9999) - (b.rank ?? 9999);
+  const byDateThenRank = (a: NearMissPlayer, b: NearMissPlayer) => a.date < b.date ? 1 : a.date > b.date ? -1 : byRank(a, b);
+  bucket_51_100.sort(byDateThenRank);
+  bucket_101_plus.sort(byDateThenRank);
+  bucket_unranked.sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : a.player_name.localeCompare(b.player_name));
+
+  return {
+    anchor,
+    window_days: windowDays,
+    ranked_51_100: { label: '51–100', players: bucket_51_100, count: bucket_51_100.length },
+    ranked_101_plus: { label: '101+', players: bucket_101_plus, count: bucket_101_plus.length },
+    unranked: { label: 'Unranked', players: bucket_unranked, count: bucket_unranked.length },
+    total_hr_hitters: total_hr,
+    total_near_misses: total_near,
+  };
+}
+
+// -----------------------------------------------------------------------------
+//  Exclusion Reasons
+// -----------------------------------------------------------------------------
+
+export type ExclusionReason =
+  | 'not_in_pool'
+  | 'cold_batter_penalty'
+  | 'low_season_power_cap'
+  | 'low_heat_score'
+  | 'lineup_issue'
+  | 'missing_data'
+  | 'weak_season_profile'
+  | 'bad_recent_form'
+  | 'odds_missing';
+
+const EXCLUSION_REASON_LABEL: Record<ExclusionReason, string> = {
+  not_in_pool: 'Not in model pool',
+  cold_batter_penalty: 'Cold Batter penalty',
+  low_season_power_cap: 'Low season power cap',
+  low_heat_score: 'Low Heat Score',
+  lineup_issue: 'Lineup not posted',
+  missing_data: 'Missing data',
+  weak_season_profile: 'Weak season profile',
+  bad_recent_form: 'Bad recent form',
+  odds_missing: 'Odds missing',
+};
+
+/** Threshold below which Heat Score alone explains exclusion. */
+const LOW_HEAT_THRESHOLD = 40;
+
+export interface ExcludedHrHitter {
+  date: string;
+  player_id: number;
+  player_name: string;
+  team: string;
+  rank: number | null;
+  heat_score: number | null;
+  reasons: ExclusionReason[];
+}
+
+export interface ExclusionReasonAggregate {
+  reason: ExclusionReason;
+  label: string;
+  /** Number of excluded HR hitters that triggered this reason in the window. */
+  count: number;
+  /** Share of all exclusions (multi-cause sums >100% — same player can have multiple). */
+  share: number;
+}
+
+export interface ExclusionReasonsResult {
+  anchor: string;
+  window_days: number;
+  /** Every HR hitter outside Top 50 in the window, with their reason chips. */
+  excluded: ExcludedHrHitter[];
+  /** Aggregate counts per reason. */
+  aggregates: ExclusionReasonAggregate[];
+  /** Total HR hitters in the window. */
+  total_hr_hitters: number;
+  /** How many of those were OUTSIDE the actionable Top 50. */
+  total_excluded: number;
+}
+
+/**
+ * For every HR hitter NOT in the saved Top 50, build the list of reasons
+ * the model excluded them. Multiple reasons can fire per player (a cold
+ * batter with low season power gets both chips).
+ *
+ * Categories:
+ *   not_in_pool       — no snapshot row at all
+ *   cold_batter_penalty — "Cold last 7d" chip present
+ *   low_season_power_cap — "low_season_power" derived signal (no power chip)
+ *   low_heat_score    — heat_score < LOW_HEAT_THRESHOLD and no specific penalty
+ *   lineup_issue      — reason mentions "Lineup pending" or absent (only some snapshots carry this)
+ *   missing_data      — reason is null/empty or "Data limited"
+ */
+export function computeExclusionReasons(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+  hrPlayerInfo: Map<number, { player_name: string; team: string }>,
+  anchor: string,
+  windowDays = 14,
+): ExclusionReasonsResult {
+  const rangeStart = addDays(anchor, -(windowDays - 1));
+  const snapByDayPlayer = new Map<string, RevAnalysisSnapshotRow>();
+  for (const snap of snapshots) {
+    if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
+    snapByDayPlayer.set(`${snap.target_date}:${snap.player_id}`, snap);
+  }
+
+  const excluded: ExcludedHrHitter[] = [];
+  const reasonCounts = new Map<ExclusionReason, number>();
+  let total_hr = 0;
+  let total_excluded = 0;
+
+  for (const [date, hrSet] of hrPlayersByDate) {
+    if (date < rangeStart || date > anchor) continue;
+    for (const pid of hrSet) {
+      total_hr += 1;
+      const snap = snapByDayPlayer.get(`${date}:${pid}`);
+      // Inside Top 50 → not excluded
+      if (snap && snap.rank <= TOP_POOL_SIZE) continue;
+      total_excluded += 1;
+      const info = hrPlayerInfo.get(pid) ?? { player_name: `#${pid}`, team: '' };
+      const reasons: ExclusionReason[] = [];
+      if (!snap) {
+        reasons.push('not_in_pool');
+      } else {
+        const reasonText = snap.reason ?? '';
+        const signals = parseSignalsFromReason(snap.reason);
+        if (signals.has('cold_batter')) reasons.push('cold_batter_penalty');
+        if (signals.has('low_season_power')) reasons.push('low_season_power_cap');
+        if (/Lineup pending|Lineup unconfirmed/i.test(reasonText)) reasons.push('lineup_issue');
+        if (/Data limited/i.test(reasonText) || !reasonText) reasons.push('missing_data');
+        // Heat score gate — only if no specific reason already caught it.
+        if (reasons.length === 0 && (snap.heat_score < LOW_HEAT_THRESHOLD)) reasons.push('low_heat_score');
+        // Fallback when nothing specific fired.
+        if (reasons.length === 0) reasons.push('weak_season_profile');
+      }
+      const row: ExcludedHrHitter = {
+        date,
+        player_id: pid,
+        player_name: snap?.player_name ?? info.player_name,
+        team: snap?.team ?? info.team,
+        rank: snap?.rank ?? null,
+        heat_score: snap?.heat_score ?? null,
+        reasons,
+      };
+      excluded.push(row);
+      for (const r of reasons) {
+        reasonCounts.set(r, (reasonCounts.get(r) ?? 0) + 1);
+      }
+    }
+  }
+
+  const aggregates: ExclusionReasonAggregate[] = Array.from(reasonCounts.entries())
+    .map(([reason, count]) => ({
+      reason,
+      label: EXCLUSION_REASON_LABEL[reason],
+      count,
+      share: total_excluded > 0 ? count / total_excluded : 0,
+    }))
+    .sort((a, b) => b.count - a.count);
+
+  excluded.sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (a.rank ?? 9999) - (b.rank ?? 9999));
+
+  return {
+    anchor,
+    window_days: windowDays,
+    excluded,
+    aggregates,
+    total_hr_hitters: total_hr,
+    total_excluded,
+  };
+}
+
+// -----------------------------------------------------------------------------
+//  Best Historical Pool
+// -----------------------------------------------------------------------------
+
+export interface BestPoolDay {
+  date: string;
+  current_pool_size: number;
+  current_hr_hits_in_pool: number;
+  current_coverage: number;
+  reconstructed_pool_size: number;
+  reconstructed_hr_hits_in_pool: number;
+  reconstructed_coverage: number;
+  /** Players gained = HR hitters newly INCLUDED in the pool. */
+  gained: { player_id: number; player_name: string; team: string; signals: SignalKey[] }[];
+  /** Signals (criteria) on the gained players, used to derive recurring patterns. */
+  criteria_used: SignalKey[];
+}
+
+export interface RecurringPoolCriterion {
+  signal: SignalKey;
+  label: string;
+  /** Days this signal appeared on gained players. */
+  days_present: number;
+  total_days: number;
+  /** Total players gained across the window who had this signal. */
+  player_count: number;
+}
+
+export interface BestPoolResult {
+  anchor: string;
+  window_days: number;
+  days: BestPoolDay[];
+  current_pool_coverage: number;
+  reconstructed_pool_coverage: number;
+  total_gained: number;
+  recurring: RecurringPoolCriterion[];
+  note: string;
+}
+
+/**
+ * Best Historical Pool — for each past day, identify what criteria the
+ * UNRANKED HR hitters had in common (the snapshot rows DON'T exist for them
+ * since they were excluded, so we can't read reason text for unranked
+ * players). For this v1 we surface a simpler diagnostic: how many HR
+ * hitters would the pool have caught if we extended snapshots to rank 100
+ * vs rank 50? And of HR hitters AT THE EDGE (rank 51-100), what signal
+ * profiles repeated across days?
+ *
+ * This is hindsight research — NOT a live prediction.
+ */
+export function computeBestHistoricalPool(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+  hrPlayerInfo: Map<number, { player_name: string; team: string }>,
+  anchor: string,
+  windowDays = 14,
+): BestPoolResult {
+  const rangeStart = addDays(anchor, -(windowDays - 1));
+
+  // Per-day index: full snapshot pool, edge snapshot pool (rank 51-100).
+  type DayIdx = {
+    poolIds: Set<number>;
+    edgeRows: RevAnalysisSnapshotRow[];
+  };
+  const byDate = new Map<string, DayIdx>();
+  for (const snap of snapshots) {
+    if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
+    let idx = byDate.get(snap.target_date);
+    if (!idx) { idx = { poolIds: new Set(), edgeRows: [] }; byDate.set(snap.target_date, idx); }
+    idx.poolIds.add(snap.player_id);
+    if (snap.rank > TOP_POOL_SIZE && snap.rank <= 100) idx.edgeRows.push(snap);
+  }
+
+  const days: BestPoolDay[] = [];
+  const signalDayCounts = new Map<SignalKey, Set<string>>();
+  const signalPlayerCounts = new Map<SignalKey, number>();
+  let totalCurrentInPool = 0;
+  let totalReconstructedInPool = 0;
+  let totalHr = 0;
+  let totalGained = 0;
+
+  // Build actionable-pool index (rank ≤ TOP_POOL_SIZE) per date — separate
+  // from the full pool. The reconstruction promotes rank 51–100 HR hitters
+  // INTO the actionable pool.
+  const actionableByDate = new Map<string, Set<number>>();
+  for (const snap of snapshots) {
+    if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
+    if (snap.rank > TOP_POOL_SIZE) continue;
+    let s = actionableByDate.get(snap.target_date);
+    if (!s) { s = new Set<number>(); actionableByDate.set(snap.target_date, s); }
+    s.add(snap.player_id);
+  }
+
+  const sortedDates = Array.from(byDate.keys()).sort();
+  for (const date of sortedDates) {
+    const idx = byDate.get(date)!;
+    const actionable = actionableByDate.get(date) ?? new Set<number>();
+    const hrSet = hrPlayersByDate.get(date) ?? new Set<number>();
+    totalHr += hrSet.size;
+
+    // Current actionable-pool coverage = HR hitters in rank ≤ TOP_POOL_SIZE.
+    let currentIn = 0;
+    for (const pid of hrSet) if (actionable.has(pid)) currentIn++;
+    totalCurrentInPool += currentIn;
+
+    // Reconstructed: promote rank 51–100 HR hitters into the actionable pool.
+    const gained: BestPoolDay['gained'] = [];
+    const dayCriteria = new Set<SignalKey>();
+    for (const snap of idx.edgeRows) {
+      if (!hrSet.has(snap.player_id)) continue;
+      const signals = Array.from(parseSignalsFromReason(snap.reason));
+      const info = hrPlayerInfo.get(snap.player_id) ?? { player_name: snap.player_name ?? `#${snap.player_id}`, team: snap.team ?? '' };
+      gained.push({
+        player_id: snap.player_id,
+        player_name: snap.player_name ?? info.player_name,
+        team: snap.team ?? info.team,
+        signals,
+      });
+      for (const s of signals) {
+        dayCriteria.add(s);
+        let ds = signalDayCounts.get(s);
+        if (!ds) { ds = new Set<string>(); signalDayCounts.set(s, ds); }
+        ds.add(date);
+        signalPlayerCounts.set(s, (signalPlayerCounts.get(s) ?? 0) + 1);
+      }
+    }
+    const reconstructedIn = currentIn + gained.length;
+    totalReconstructedInPool += reconstructedIn;
+    totalGained += gained.length;
+
+    days.push({
+      date,
+      current_pool_size: actionable.size,
+      current_hr_hits_in_pool: currentIn,
+      current_coverage: hrSet.size > 0 ? currentIn / hrSet.size : 0,
+      reconstructed_pool_size: actionable.size + gained.length,
+      reconstructed_hr_hits_in_pool: reconstructedIn,
+      reconstructed_coverage: hrSet.size > 0 ? reconstructedIn / hrSet.size : 0,
+      gained,
+      criteria_used: Array.from(dayCriteria),
+    });
+  }
+
+  const recurring: RecurringPoolCriterion[] = Array.from(signalDayCounts.entries())
+    .map(([signal, dateSet]) => ({
+      signal,
+      label: SIGNAL_LABELS[signal],
+      days_present: dateSet.size,
+      total_days: days.length,
+      player_count: signalPlayerCounts.get(signal) ?? 0,
+    }))
+    .filter((r) => r.days_present >= 2)
+    .sort((a, b) => b.days_present - a.days_present || b.player_count - a.player_count);
+
+  return {
+    anchor,
+    window_days: windowDays,
+    days,
+    current_pool_coverage: totalHr > 0 ? totalCurrentInPool / totalHr : 0,
+    reconstructed_pool_coverage: totalHr > 0 ? totalReconstructedInPool / totalHr : 0,
+    total_gained: totalGained,
+    recurring,
+    note: 'Hindsight pool reconstruction — looks at HR hitters ranked 51–100 who would be promoted into a "actionable Top 100" pool. Surfaces signal profiles that repeat across days. NOT a live prediction tool.',
+  };
+}

@@ -26,14 +26,25 @@ import SleeperBoardPanel from '../components/SleeperBoard';
 import CertifiedSleeperBoard from '../components/CertifiedSleeperBoard';
 import ColdBatterReboundCard from '../components/ColdBatterReboundCard';
 import ReverseAnalysisPanel from '../components/ReverseAnalysisPanel';
+import ResearchDrawer from '../components/ResearchDrawer';
+import {
+  PoolCoveragePanel,
+  NearMissesPanel,
+  ExclusionReasonsPanel,
+  BestHistoricalPoolPanel,
+} from '../components/DiagnosticsPanels';
 import {
   addDays,
   applyCanonicalTeams,
   applyRecurringRules,
   buildActionableModelChanges,
+  computeBestHistoricalPool,
   computeColdBatterRebound,
   computeConfidenceTiers,
+  computeExclusionReasons,
   computeHrTargets,
+  computeNearMisses,
+  computePoolCoverage,
   computeReverseAnalysis,
   computeSleepers,
   computeCertifiedSleepers,
@@ -44,13 +55,17 @@ import {
   ELITE_POWER_NAMES,
   type ActionableRule,
   type AdaptiveTop10Result,
+  type BestPoolResult,
   type ColdReboundCandidate,
   type ConfidenceTiersResult,
+  type ExclusionReasonsResult,
   type HrTarget,
   type HrTargetGame,
   type HrTargetsBoard,
+  type NearMissResult,
   type PitcherFormLite,
   type PlayerTeamIndex,
+  type PoolCoverageResult,
   type ReconstructionResult,
   type ReverseAnalysisResult,
   type RevAnalysisSnapshotRow,
@@ -105,6 +120,49 @@ async function fetchGamesOn(date: string): Promise<GameRow[]> {
       `${withTemp} with temp, ${withUpdatedAt} with weather_updated_at`,
   );
   return rows;
+}
+
+/** Last N days of snapshots — paged because ~150 rows/day × 30d ≫ 1k.
+ *  Used by the main-page diagnostics panels AND the reverse-engineering
+ *  panel (lazy). Same query shape, just different date range. */
+async function fetchSnapshotsForHistoricalRange(from: string, to: string): Promise<HrTargetSnapshotRow[]> {
+  const PAGE_SIZE = 1000;
+  const all: HrTargetSnapshotRow[] = [];
+  for (let page = 0; page < 30; page++) {
+    const { data, error } = await supabase
+      .from('hr_target_snapshots')
+      .select('*')
+      .gte('target_date', from)
+      .lte('target_date', to)
+      .order('target_date', { ascending: true })
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) break;
+    const rows = (data ?? []) as HrTargetSnapshotRow[];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+  return all;
+}
+
+async function fetchHrsForHistoricalRange(from: string, to: string): Promise<HomeRunRow[]> {
+  const PAGE_SIZE = 1000;
+  const all: HomeRunRow[] = [];
+  for (let page = 0; page < 30; page++) {
+    const { data, error } = await supabase
+      .from('home_runs')
+      .select('id, game_pk, game_date, player_id, player_name, team, opponent, ' +
+        'inning, pitcher_id, pitcher_name, exit_velocity, launch_angle, distance, ' +
+        'batter_side, pitcher_throws, venue_id, venue_name, created_at')
+      .gte('game_date', from)
+      .lte('game_date', to)
+      .order('game_date', { ascending: false })
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) break;
+    const rows = (data ?? []) as unknown as HomeRunRow[];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+  return all;
 }
 
 /** Last N days of snapshots — paged because ~150 rows/day × 14d > 1k.
@@ -216,6 +274,23 @@ export default function HrTargets() {
   const [revAdaptive, setRevAdaptive] = useState<AdaptiveTop10Result | null>(null);
   const [revTiers, setRevTiers] = useState<ConfidenceTiersResult | null>(null);
   const [revLoadedFor, setRevLoadedFor] = useState<string | null>(null);
+
+  // Main-page diagnostics (task #206+). Loaded eagerly on page mount so
+  // the new sections render alongside Today's Picks. Same data also feeds
+  // the lazy reverse-analysis panel — we cache the 30d window here.
+  const DIAG_WINDOW_DAYS = 30;
+  const [poolCoverage, setPoolCoverage] = useState<PoolCoverageResult | null>(null);
+  const [nearMisses, setNearMisses] = useState<NearMissResult | null>(null);
+  const [exclusionReasons, setExclusionReasons] = useState<ExclusionReasonsResult | null>(null);
+  const [bestPool, setBestPool] = useState<BestPoolResult | null>(null);
+  const [diagLoading, setDiagLoading] = useState<boolean>(true);
+  // Cached historical snapshots/HRs so the reverse-analysis panel can
+  // reuse them without re-fetching when the user opens the drawer.
+  const [historicalSnaps, setHistoricalSnaps] = useState<HrTargetSnapshotRow[]>([]);
+  const [historicalHrs, setHistoricalHrs] = useState<HomeRunRow[]>([]);
+  // Top-50 tier tab on the main picks board: 5 / 10 / 25 / 50.
+  type TopTier = 5 | 10 | 25 | 50;
+  const [picksTier, setPicksTier] = useState<TopTier>(10);
 
   async function loadReverseAnalysis(anchorDate: string) {
     setRevLoading(true);
@@ -399,6 +474,61 @@ export default function HrTargets() {
     })();
     return () => { cancelled = true; };
   }, [asOf, targetDate, refreshKey]);
+
+  // Diagnostics fetch — pulls 30 days of snapshots + HRs in parallel with
+  // the main page render. Powers Pool Coverage, Near Misses, Exclusion
+  // Reasons, and the Best Historical Pool sections. Also caches the rows
+  // so the Research drawer's reverse-analysis panel can reuse them.
+  useEffect(() => {
+    if (!targetDate) return;
+    let cancelled = false;
+    setDiagLoading(true);
+    (async () => {
+      try {
+        const anchor = addDays(targetDate, -1); // yesterday-and-back — never use the target day's HRs
+        const from30 = addDays(anchor, -(DIAG_WINDOW_DAYS - 1));
+        const [snaps, hrs] = await Promise.all([
+          fetchSnapshotsForHistoricalRange(from30, anchor),
+          fetchHrsForHistoricalRange(from30, anchor),
+        ]);
+        if (cancelled) return;
+        setHistoricalSnaps(snaps);
+        setHistoricalHrs(hrs);
+        // Build the date → HR-player-id set index.
+        const hrByDate = new Map<string, Set<number>>();
+        const hrInfo = new Map<number, { player_name: string; team: string }>();
+        for (const r of hrs) {
+          let s = hrByDate.get(r.game_date);
+          if (!s) { s = new Set<number>(); hrByDate.set(r.game_date, s); }
+          s.add(r.player_id);
+          if (!hrInfo.has(r.player_id)) {
+            hrInfo.set(r.player_id, { player_name: r.player_name, team: r.team });
+          }
+        }
+        const minimal: RevAnalysisSnapshotRow[] = snaps.map((r) => ({
+          target_date: r.target_date,
+          player_id: r.player_id,
+          player_name: r.player_name,
+          team: r.team,
+          rank: r.rank,
+          heat_score: r.heat_score,
+          reason: r.reason,
+        }));
+        // Pool coverage / near misses / exclusion reasons / best pool —
+        // all read-only over the same snapshots + HR index.
+        setPoolCoverage(computePoolCoverage(minimal, hrByDate, anchor));
+        setNearMisses(computeNearMisses(minimal, hrByDate, hrInfo, anchor, 14));
+        setExclusionReasons(computeExclusionReasons(minimal, hrByDate, hrInfo, anchor, 14));
+        setBestPool(computeBestHistoricalPool(minimal, hrByDate, hrInfo, anchor, 14));
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn('[diagnostics] load failed:', e);
+      } finally {
+        if (!cancelled) setDiagLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [targetDate, refreshKey]);
 
   const canonHrs = useMemo(() => applyCanonicalTeams(seasonHrs, playerIndex), [seasonHrs, playerIndex]);
 
@@ -641,55 +771,6 @@ export default function HrTargets() {
         </div>
       )}
 
-      {modelDisagreements.length > 0 && (
-        <div
-          className="panel"
-          style={{ marginBottom: 16, borderColor: 'var(--accent)', background: 'var(--panel-2)' }}
-        >
-          <h2 style={{ marginTop: 0 }}>⚠ Model disagreement: elite power hitter(s) ranked low</h2>
-          <p className="subtle" style={{ fontSize: 13, lineHeight: 1.5, marginTop: 6 }}>
-            These hitters are on the curated elite-power list but the model
-            ranked them below #{MODEL_DISAGREEMENT_RANK}. Usually means recent
-            data is thin (early season, just returned from IL) — check the
-            sportsbook line before discarding.
-          </p>
-          <div className="table-wrap" style={{ marginTop: 8 }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>Player</th>
-                  <th>Team</th>
-                  <th>Game</th>
-                  <th className="num">Season</th>
-                  <th className="num">Heat</th>
-                  <th>Reason</th>
-                </tr>
-              </thead>
-              <tbody>
-                {modelDisagreements.slice(0, 5).map(({ target: t, rank }) => (
-                  <tr key={`${t.player_id}-${rank}`}>
-                    <td className="num">{rank}</td>
-                    <td>
-                      <Link className="player-link" to={`/player/${t.player_id}?asOf=${asOf}`}>
-                        {t.player_name}
-                      </Link>
-                    </td>
-                    <td><span className="pill">{t.team}</span></td>
-                    <td className="subtle" style={{ fontSize: 12 }}>vs {t.opponent}</td>
-                    <td className="num">{t.season_hr}</td>
-                    <td className="num">{t.heat_score.toFixed(1)}</td>
-                    <td>
-                      <ReasonChips chips={t.reason_chips} />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
       {/* Snapshot status — four timestamps, in one row. The user explicitly
           wants Saved Snapshot and Live Preview tracked separately so it's
           obvious which view the dashboard is showing. */}
@@ -712,35 +793,55 @@ export default function HrTargets() {
         savedSnapshot={savedSnapshot}
       />
 
-      {/* Top 10 panel — content depends on viewMode */}
-      {(viewMode === 'saved' && savedSnapshot.length > 0) && (
+      {/* ───────────────── TODAY'S PICKS — Top 5 / 10 / 25 / 50 ─────────────────
+          Replaces the always-on Top 10 panel with a tier-tabbed view. Source
+          depends on viewMode (saved / live / compare) — same data, just
+          wider slice options. */}
+      {(viewMode === 'saved' || viewMode === 'live') && (allRanked.length > 0 || savedSnapshot.length > 0) && (
         <div className="panel" style={{ marginBottom: 16 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, alignItems: 'baseline' }}>
             <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-              Top 10 HR targets — {targetDate}
-              <SnapshotTypeBadge type={savedSnapshot[0]?.snapshot_type} />
+              Today's Picks — {targetDate}
+              {viewMode === 'saved' && <SnapshotTypeBadge type={savedSnapshot[0]?.snapshot_type} />}
             </h2>
             <span className="subtle" style={{ fontSize: 12 }}>
-              Saved Snapshot — same data Backtest uses
+              {viewMode === 'saved' ? 'Saved Snapshot — same data Backtest uses' : 'Live Preview · click any row for detail'}
             </span>
           </div>
-          <SavedTop10Table snapshot={savedSnapshot.slice(0, 10)} asOf={asOf} />
+
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 10 }}>
+            {([5, 10, 25, 50] as TopTier[]).map((n) => (
+              <button
+                key={n}
+                type="button"
+                onClick={() => setPicksTier(n)}
+                aria-pressed={picksTier === n}
+                className="diag-tab"
+                style={{
+                  background: picksTier === n ? '#2d3a52' : undefined,
+                  borderColor: picksTier === n ? '#4a6fa5' : undefined,
+                  color: picksTier === n ? '#fff' : undefined,
+                }}
+              >
+                Top {n}
+              </button>
+            ))}
+          </div>
+
+          {viewMode === 'saved' ? (
+            <SavedTop10Table snapshot={savedSnapshot.slice(0, picksTier)} asOf={asOf} />
+          ) : (
+            <Top10Table targets={allRanked.slice(0, picksTier)} asOf={asOf} />
+          )}
+          {viewMode === 'live' && allRanked.length < picksTier && (
+            <p className="subtle" style={{ fontSize: 11, marginTop: 6 }}>
+              Only {allRanked.length} confirmed/pending players available. Bench section below has the rest.
+            </p>
+          )}
         </div>
       )}
 
-      {(viewMode === 'live' && top10.length > 0) && (
-        <div className="panel" style={{ marginBottom: 16 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, alignItems: 'baseline' }}>
-            <h2 style={{ margin: 0 }}>Top 10 HR targets — {targetDate}</h2>
-            <span className="subtle" style={{ fontSize: 12 }}>
-              Live Preview · click any row for matchup detail · may differ from Backtest
-            </span>
-          </div>
-          <Top10Table targets={top10} asOf={asOf} />
-        </div>
-      )}
-
-      {(viewMode === 'compare' && (savedSnapshot.length > 0 || top10.length > 0)) && (
+      {viewMode === 'compare' && (savedSnapshot.length > 0 || top10.length > 0) && (
         <div className="panel" style={{ marginBottom: 16 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, alignItems: 'baseline' }}>
             <h2 style={{ margin: 0 }}>Saved vs Live — {targetDate}</h2>
@@ -752,23 +853,16 @@ export default function HrTargets() {
         </div>
       )}
 
-      {/* Certified Sleepers / Smart Money — curated value board + bankroll
-          goal tracker. Rendered above the chaos sleeper lists since it's
-          the higher-confidence "serious" board. */}
-      {allRanked.length > 0 && (
-        <CertifiedSleeperBoard picks={certifiedSleepers} asOf={asOf} />
-      )}
+      {/* ───────────────── DIAGNOSTICS (main page) ─────────────────
+          Pool Coverage → Near Misses → Exclusion Reasons → Best Historical Pool.
+          These four panels answer "is it a pool problem or a ranking problem?" */}
+      <PoolCoveragePanel coverage={poolCoverage} loading={diagLoading} />
+      <NearMissesPanel misses={nearMisses} loading={diagLoading} asOf={asOf} />
+      <ExclusionReasonsPanel reasons={exclusionReasons} loading={diagLoading} />
+      <BestHistoricalPoolPanel pool={bestPool} loading={diagLoading} />
 
-      {/* Sleeper / Chaos discovery layer — separate from core rankings.
-          Only meaningful in live computation (needs full ranked list), so
-          we render it whenever we have live targets for the date. */}
-      {allRanked.length > 0 && (
-        <SleeperBoardPanel board={sleeperBoard} asOf={asOf} />
-      )}
-
-      {/* Cold Batter Rebound — sits in the Sleeper / Chaos area as a
-          *separate* discovery card. Strictly read-only over allRanked;
-          NEVER feeds back into main rankings or the Top 10. */}
+      {/* Cold Batter Rebound — kept on the main page as an actionable discovery
+          card. Surfaces hitters the cold penalty hits but who carry real upside. */}
       {allRanked.length > 0 && (
         <ColdBatterReboundCard picks={coldRebound} asOf={asOf} />
       )}
@@ -779,24 +873,65 @@ export default function HrTargets() {
         <BenchSection players={benchPlayers} asOf={asOf} />
       )}
 
-      {/* Reverse-Engineering Analysis (task #179) — collapsible. Looks at
-          last 14 days of saved snapshots + actual HR results, surfaces
-          per-signal lift, combos, and weight-tuning recommendations. Lazy
-          loaded on first open. Recommendations are surfaced ONLY — nothing
-          here mutates HEAT_SCORE_WEIGHTS or any other scoring knob. */}
-      <ReverseAnalysisPanel
-        analysis={revResult}
-        actionable={revRules}
-        simulation={revSim}
-        reconstruction={revRecon}
-        adaptive={revAdaptive}
-        tiers={revTiers}
-        loading={revLoading}
-        open={revOpen}
-        onToggle={toggleRev}
-        asOf={targetDate}
-        windowDays={REVERSE_WINDOW_DAYS}
-      />
+      {/* ───────────────── RESEARCH DRAWER (collapsed by default) ─────────────────
+          All research-only sections live here so the main page stays focused
+          on daily picks + diagnostics. The drawer state is persisted in
+          localStorage per the ResearchDrawer component. */}
+      <ResearchDrawer>
+        {modelDisagreements.length > 0 && (
+          <div className="panel" style={{ borderColor: 'var(--accent)', background: 'var(--panel-2)' }}>
+            <h2 style={{ marginTop: 0, fontSize: 15 }}>⚠ Model disagreement: elite power hitter(s) ranked low</h2>
+            <p className="subtle" style={{ fontSize: 12, lineHeight: 1.5 }}>
+              Elite-power hitters our model ranked below #{MODEL_DISAGREEMENT_RANK} — sanity check against sportsbook lines.
+            </p>
+            <div className="table-wrap" style={{ marginTop: 8 }}>
+              <table>
+                <thead>
+                  <tr><th>#</th><th>Player</th><th>Team</th><th>Game</th><th className="num">Season</th><th className="num">Heat</th><th>Reason</th></tr>
+                </thead>
+                <tbody>
+                  {modelDisagreements.slice(0, 5).map(({ target: t, rank }) => (
+                    <tr key={`${t.player_id}-${rank}`}>
+                      <td className="num">{rank}</td>
+                      <td><Link className="player-link" to={`/player/${t.player_id}?asOf=${asOf}`}>{t.player_name}</Link></td>
+                      <td><span className="pill">{t.team}</span></td>
+                      <td className="subtle" style={{ fontSize: 12 }}>vs {t.opponent}</td>
+                      <td className="num">{t.season_hr}</td>
+                      <td className="num">{t.heat_score.toFixed(1)}</td>
+                      <td><ReasonChips chips={t.reason_chips} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Certified Sleepers / Smart Money — bankroll tracker, research-only. */}
+        {allRanked.length > 0 && (
+          <CertifiedSleeperBoard picks={certifiedSleepers} asOf={asOf} />
+        )}
+
+        {/* Sleeper / Chaos board — chaos discovery layer, research-only. */}
+        {allRanked.length > 0 && (
+          <SleeperBoardPanel board={sleeperBoard} asOf={asOf} />
+        )}
+
+        {/* Reverse-Engineering Analysis — full deep-dive with its own internal toggle. */}
+        <ReverseAnalysisPanel
+          analysis={revResult}
+          actionable={revRules}
+          simulation={revSim}
+          reconstruction={revRecon}
+          adaptive={revAdaptive}
+          tiers={revTiers}
+          loading={revLoading}
+          open={revOpen}
+          onToggle={toggleRev}
+          asOf={targetDate}
+          windowDays={REVERSE_WINDOW_DAYS}
+        />
+      </ResearchDrawer>
 
       <h3 className="section">All games — sorted within each card by Heat Score ↓</h3>
       <div style={{ display: 'grid', gap: 12 }}>
