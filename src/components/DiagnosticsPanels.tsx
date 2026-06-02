@@ -16,6 +16,9 @@ import type {
   NearMissPlayer,
   ExclusionReasonsResult,
   BestPoolResult,
+  MissQualityResult,
+  MissQualityMetrics,
+  TopNEfficiencyResult,
 } from '../lib/stats';
 
 function pct(n: number, d = 0): string { return `${(n * 100).toFixed(d)}%`; }
@@ -538,4 +541,233 @@ function DiagStyles() {
       }
     `}</style>
   );
+}
+
+// =============================================================================
+//  Top-N Efficiency — small KPI strip
+// =============================================================================
+
+export function TopNEfficiencyStrip({ eff, loading }: {
+  eff: TopNEfficiencyResult | null;
+  loading: boolean;
+}) {
+  if (loading) {
+    return (
+      <div className="panel" style={{ marginBottom: 12 }}>
+        <p className="subtle" style={{ fontSize: 12 }}>Loading efficiency metrics…</p>
+      </div>
+    );
+  }
+  if (!eff) return null;
+  const fmt = (x: number) => `${(x * 100).toFixed(1)}%`;
+  return (
+    <div className="panel" style={{ marginBottom: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+        <h3 style={{ margin: 0, fontSize: 14 }}>📈 Betting-relevant metrics ({eff.days_counted}d)</h3>
+        <span className="subtle" style={{ fontSize: 11 }}>
+          What the model is actually optimized for now — not "perfect 10/10".
+        </span>
+      </div>
+      <div className="diag-kpis">
+        <div className="diag-kpi diag-kpi--good">
+          <div className="diag-kpi-label">Top 5 efficiency</div>
+          <div className="diag-kpi-value">{fmt(eff.top5_efficiency)}</div>
+          <div className="diag-kpi-sub">{eff.top5_hits} hits / {eff.top5_slots} slots</div>
+        </div>
+        <div className="diag-kpi diag-kpi--good">
+          <div className="diag-kpi-label">Top 10 efficiency</div>
+          <div className="diag-kpi-value">{fmt(eff.top10_efficiency)}</div>
+          <div className="diag-kpi-sub">{eff.top10_hits} hits / {eff.top10_slots} slots</div>
+        </div>
+        <div className="diag-kpi diag-kpi--mid">
+          <div className="diag-kpi-label">Top 25 coverage</div>
+          <div className="diag-kpi-value">{fmt(eff.top25_coverage)}</div>
+          <div className="diag-kpi-sub">{eff.top25_hits} caught / {eff.total_hr_hitters} HRs</div>
+        </div>
+      </div>
+      <p className="subtle" style={{ fontSize: 11, marginTop: 6 }}>{eff.note}</p>
+      <DiagStyles />
+    </div>
+  );
+}
+
+// =============================================================================
+//  Miss Quality Analysis
+// =============================================================================
+
+const fmtOdds = (n: number | null) => n == null ? '—' : `${n > 0 ? '+' : ''}${Math.round(n)}`;
+const fmtPct = (n: number) => `${(n * 100).toFixed(0)}%`;
+const fmtNum = (n: number, d = 1) => n.toFixed(d);
+
+export function MissQualityPanel({ quality, loading }: {
+  quality: MissQualityResult | null;
+  loading: boolean;
+}) {
+  return (
+    <section className="panel" style={{ marginBottom: 16 }}>
+      <Header
+        title="Miss Quality Analysis"
+        sub="Are we missing realistic HR candidates, or random longshots and baseball variance?"
+      />
+      {loading ? (
+        <p className="subtle" style={{ fontSize: 13 }}>Loading miss-quality data…</p>
+      ) : !quality ? (
+        <p className="subtle" style={{ fontSize: 13 }}>No data available.</p>
+      ) : (
+        <>
+          <div className="diag-card" style={{ marginBottom: 10, borderLeft: '3px solid #ffb86c' }}>
+            <div style={{ fontSize: 12, opacity: 0.7, textTransform: 'uppercase', letterSpacing: 0.06 }}>Diagnosis</div>
+            <p style={{ fontSize: 13.5, margin: '4px 0 0', lineHeight: 1.5 }}>{quality.diagnosis}</p>
+          </div>
+
+          <h5 style={{ margin: '0 0 6px', fontSize: 13 }}>By rank bucket</h5>
+          <p className="subtle" style={{ fontSize: 11.5, marginBottom: 6 }}>
+            {quality.total_missed} missed HR-player-days across {quality.total_hr_hitters} actual HRs in the last {quality.window_days}d.
+          </p>
+          <div className="diag-table-wrap">
+            <table className="diag-table">
+              <thead>
+                <tr>
+                  <th>Bucket</th>
+                  <th className="num">HRs</th>
+                  <th className="num">% of misses</th>
+                  <th className="num">Avg Season HR</th>
+                  <th className="num">Avg Odds</th>
+                  <th className="num">Avg Heat</th>
+                  <th className="num">Park %</th>
+                  <th className="num">HR Pitcher %</th>
+                  <th className="num">Weather %</th>
+                  <th className="num">Cold %</th>
+                </tr>
+              </thead>
+              <tbody>
+                {quality.buckets.map((b) => (
+                  <tr key={b.label}>
+                    <td><strong>{b.label}</strong></td>
+                    <td className="num">{b.n}</td>
+                    <td className="num">{fmtPct(b.share_of_misses ?? 0)}</td>
+                    <td className="num">{b.n > 0 ? fmtNum(b.avg_season_hr) : '—'}</td>
+                    <td className="num">{fmtOdds(b.avg_american_odds)}</td>
+                    <td className="num">{b.n > 0 ? fmtNum(b.avg_heat_score) : '—'}</td>
+                    <td className="num">{b.n > 0 ? fmtPct(b.park_signal_rate) : '—'}</td>
+                    <td className="num">{b.n > 0 ? fmtPct(b.hr_pitcher_rate) : '—'}</td>
+                    <td className="num">{b.n > 0 ? fmtPct(b.weather_signal_rate) : '—'}</td>
+                    <td className="num">{b.n > 0 ? fmtPct(b.cold_penalty_rate) : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <h5 style={{ margin: '16px 0 6px', fontSize: 13 }}>Side-by-side: Top 10 vs Top 25 vs Top 50 vs Missed HRs</h5>
+          <p className="subtle" style={{ fontSize: 11.5, marginBottom: 6 }}>
+            Look for traits where Missed HRs are SIMILAR to Top 10 (=&nbsp;underweighted)
+            vs DISSIMILAR (=&nbsp;the model is correctly deprioritizing them).
+          </p>
+          <SideBySideTable
+            top10={quality.top10}
+            top25={quality.top25}
+            top50={quality.top50}
+            missed={quality.missed_overall}
+          />
+
+          <p className="subtle" style={{ fontSize: 11, marginTop: 8, lineHeight: 1.4 }}>{quality.note}</p>
+        </>
+      )}
+      <DiagStyles />
+    </section>
+  );
+}
+
+function SideBySideTable({ top10, top25, top50, missed }: {
+  top10: MissQualityMetrics; top25: MissQualityMetrics; top50: MissQualityMetrics; missed: MissQualityMetrics;
+}) {
+  // Build a "metric × group" view. Highlight when Missed is within ~10% of Top 10.
+  const rows: Array<{
+    metric: string;
+    extract: (m: MissQualityMetrics) => number | null;
+    format: (n: number | null) => string;
+  }> = [
+    { metric: 'Sample size',     extract: (m) => m.n, format: (n) => n == null ? '—' : String(n) },
+    { metric: 'Avg Season HR',   extract: (m) => m.avg_season_hr, format: (n) => n == null || n === 0 ? '—' : fmtNum(n) },
+    { metric: 'Avg American Odds', extract: (m) => m.avg_american_odds, format: fmtOdds },
+    { metric: 'Avg Batting Order', extract: () => null, format: () => '—' }, // not tracked yet
+    { metric: 'Avg Heat Score',  extract: (m) => m.avg_heat_score, format: (n) => n == null || n === 0 ? '—' : fmtNum(n) },
+    { metric: 'HR Pitcher %',    extract: (m) => m.hr_pitcher_rate, format: (n) => n == null ? '—' : fmtPct(n) },
+    { metric: 'Power Park %',    extract: (m) => m.park_signal_rate, format: (n) => n == null ? '—' : fmtPct(n) },
+    { metric: 'Weather signal %', extract: (m) => m.weather_signal_rate, format: (n) => n == null ? '—' : fmtPct(n) },
+    { metric: 'Cold Batter %',   extract: (m) => m.cold_penalty_rate, format: (n) => n == null ? '—' : fmtPct(n) },
+    { metric: 'Elite Power %',   extract: (m) => m.elite_power_rate, format: (n) => n == null ? '—' : fmtPct(n) },
+  ];
+
+  return (
+    <div className="diag-table-wrap">
+      <table className="diag-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th className="num">Top 10</th>
+            <th className="num">Top 25</th>
+            <th className="num">Top 50</th>
+            <th className="num">Missed HRs</th>
+            <th>Pattern</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => {
+            const v10 = r.extract(top10);
+            const v25 = r.extract(top25);
+            const v50 = r.extract(top50);
+            const vMiss = r.extract(missed);
+            const pattern = describePattern(r.metric, v10, vMiss);
+            return (
+              <tr key={r.metric}>
+                <td><strong>{r.metric}</strong></td>
+                <td className="num">{r.format(v10)}</td>
+                <td className="num">{r.format(v25)}</td>
+                <td className="num">{r.format(v50)}</td>
+                <td className={`num ${patternClass(pattern.kind)}`}>{r.format(vMiss)}</td>
+                <td>
+                  <span className={`diag-chip ${patternChipClass(pattern.kind)}`}>{pattern.label}</span>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+type PatternKind = 'similar' | 'higher' | 'lower' | 'unknown';
+function describePattern(metric: string, top10: number | null, missed: number | null): { kind: PatternKind; label: string } {
+  if (top10 == null || missed == null || top10 === 0) return { kind: 'unknown', label: 'n/a' };
+  const ratio = missed / top10;
+  // For odds (positive American), HIGHER missed is "longshot" (model right to skip),
+  // LOWER is "book likes them" (model missing a real candidate).
+  if (metric.includes('Odds')) {
+    if (ratio > 1.4) return { kind: 'higher', label: 'Longshots' };
+    if (ratio < 0.8) return { kind: 'lower', label: 'Book-favored' };
+    return { kind: 'similar', label: 'Similar' };
+  }
+  // For Cold Batter %, HIGHER missed = model penalized correctly
+  if (metric.includes('Cold')) {
+    if (ratio > 1.5) return { kind: 'higher', label: 'Penalty earned' };
+    return { kind: 'similar', label: 'Similar' };
+  }
+  // For everything else: similar/higher/lower
+  if (ratio > 1.15) return { kind: 'higher', label: 'Underweighted' };
+  if (ratio < 0.85) return { kind: 'lower', label: 'Correctly low' };
+  return { kind: 'similar', label: 'Similar' };
+}
+function patternClass(k: PatternKind): string {
+  if (k === 'higher') return 'diag-bad';
+  if (k === 'lower') return 'diag-good';
+  return '';
+}
+function patternChipClass(k: PatternKind): string {
+  if (k === 'higher') return 'diag-chip--low';
+  if (k === 'lower') return 'diag-chip--good';
+  if (k === 'unknown') return 'diag-chip--missing';
+  return '';
 }

@@ -5778,3 +5778,399 @@ export function computeBestHistoricalPool(
     note: 'Hindsight pool reconstruction — looks at HR hitters ranked 51–100 who would be promoted into a "actionable Top 100" pool. Surfaces signal profiles that repeat across days. NOT a live prediction tool.',
   };
 }
+
+// =============================================================================
+//  Miss Quality Analysis + Top-N Efficiency (task #217)
+// -----------------------------------------------------------------------------
+//  Reframe the optimizer goal: STOP chasing perfect 10/10 hindsight Top 10s
+//  (overfit to specific players) and START identifying recurring traits the
+//  model is systematically underweighting.
+//
+//  Two outputs:
+//
+//  MISS QUALITY ANALYSIS
+//    For HR hitters the model missed, bucket them by snapshot rank:
+//      51-100   — close miss, ranking nudge would fix
+//      101-150  — deeper miss, pool present but rank weak
+//      151-200  — pool edge
+//      200+     — barely in pool
+//      unranked — not in pool at all
+//    Per bucket aggregate the realistic-candidate proxies:
+//      • avg_season_hr        — power tier (high = realistic candidate)
+//      • avg_american_odds    — sportsbook expectation
+//      • avg_heat_score
+//      • park_signal_rate     — % of bucket with Power Park chip
+//      • hr_pitcher_rate      — % with HR Pitcher chip
+//      • weather_signal_rate  — % with Wind Out OR Warm chip
+//      • cold_penalty_rate    — % with Cold Batter chip
+//    Plus a side-by-side comparison row: Top 10 vs Top 25 vs Top 50 vs Missed.
+//    This answers: are we missing realistic candidates, or random longshots?
+//
+//  TOP-N EFFICIENCY
+//    The right betting-relevant metrics:
+//      • Top 5 efficiency   = hits in Top 5  / 5  (10-day daily betting size)
+//      • Top 10 efficiency  = hits in Top 10 / 10
+//      • Top 25 coverage    = HR hitters caught in Top 25 / total HR hitters
+//    These replace the "perfect 10/10" hindsight target.
+// =============================================================================
+
+/** Range descriptor for miss-quality bucketing. */
+const MISS_BUCKETS: { id: string; label: string; min: number; max: number }[] = [
+  { id: '51_100', label: '51–100',  min: 51,  max: 100 },
+  { id: '101_150', label: '101–150', min: 101, max: 150 },
+  { id: '151_200', label: '151–200', min: 151, max: 200 },
+  { id: '200_plus', label: '200+',   min: 201, max: Infinity },
+];
+
+/** Quality metrics for one bucket (or for a slice like "Top 10"). */
+export interface MissQualityMetrics {
+  /** Group label: "51-100", "Top 10", etc. */
+  label: string;
+  /** Number of player-days in this group. */
+  n: number;
+  /** Average season HR count (lookup at the snapshot's target_date). */
+  avg_season_hr: number;
+  /** Average American odds (positive numbers like +450). null if no odds samples. */
+  avg_american_odds: number | null;
+  /** Number of bucket members that had an odds row. */
+  odds_n: number;
+  avg_heat_score: number;
+  /** % of bucket members with a Power Park signal (0..1). */
+  park_signal_rate: number;
+  /** % with HR Pitcher signal. */
+  hr_pitcher_rate: number;
+  /** % with Wind Out OR Warm weather signal. */
+  weather_signal_rate: number;
+  /** % with Cold Batter signal. */
+  cold_penalty_rate: number;
+  /** % with Elite Power signal. */
+  elite_power_rate: number;
+  /** Bonus for the missed-HR buckets: share of total misses (rate of all misses). */
+  share_of_misses?: number;
+}
+
+export interface MissQualityResult {
+  anchor: string;
+  window_days: number;
+  total_hr_hitters: number;
+  total_missed: number;
+  /** Bucketed missed-HR analysis. */
+  buckets: MissQualityMetrics[];
+  /** Same metrics across the model's own slices. */
+  top10: MissQualityMetrics;
+  top25: MissQualityMetrics;
+  top50: MissQualityMetrics;
+  /** Same metrics across ALL missed HR hitters. */
+  missed_overall: MissQualityMetrics;
+  /** Plain-English diagnosis of what the misses suggest. */
+  diagnosis: string;
+  note: string;
+}
+
+/** Map of (target_date, player_id) → cumulative season HR through that
+ *  target_date. Built by the caller from the home_runs table. */
+export type SeasonHrIndex = Map<string, number>;
+/** Map of (target_date, player_id) → latest american odds for that target_date. */
+export type OddsIndex = Map<string, number>;
+
+function emptyMetrics(label: string): MissQualityMetrics {
+  return {
+    label, n: 0,
+    avg_season_hr: 0,
+    avg_american_odds: null,
+    odds_n: 0,
+    avg_heat_score: 0,
+    park_signal_rate: 0,
+    hr_pitcher_rate: 0,
+    weather_signal_rate: 0,
+    cold_penalty_rate: 0,
+    elite_power_rate: 0,
+  };
+}
+
+/** Aggregate a set of (snapshot, signals, season_hr, odds) tuples into a
+ *  single MissQualityMetrics row. */
+function aggregateMetrics(
+  label: string,
+  rows: Array<{
+    heat_score: number;
+    season_hr: number | null;
+    american_odds: number | null;
+    signals: Set<SignalKey>;
+  }>,
+): MissQualityMetrics {
+  const out = emptyMetrics(label);
+  if (rows.length === 0) return out;
+  let totalSeason = 0, seasonN = 0;
+  let totalOdds = 0, oddsN = 0;
+  let totalHeat = 0;
+  let park = 0, hrp = 0, weather = 0, cold = 0, elite = 0;
+  for (const r of rows) {
+    totalHeat += r.heat_score;
+    if (r.season_hr != null) { totalSeason += r.season_hr; seasonN++; }
+    if (r.american_odds != null) { totalOdds += r.american_odds; oddsN++; }
+    if (r.signals.has('power_park')) park++;
+    if (r.signals.has('hr_pitcher')) hrp++;
+    if (r.signals.has('wind_out') || r.signals.has('warm_weather')) weather++;
+    if (r.signals.has('cold_batter')) cold++;
+    if (r.signals.has('elite_power')) elite++;
+  }
+  out.n = rows.length;
+  out.avg_season_hr = seasonN > 0 ? totalSeason / seasonN : 0;
+  out.avg_american_odds = oddsN > 0 ? totalOdds / oddsN : null;
+  out.odds_n = oddsN;
+  out.avg_heat_score = totalHeat / rows.length;
+  out.park_signal_rate = park / rows.length;
+  out.hr_pitcher_rate = hrp / rows.length;
+  out.weather_signal_rate = weather / rows.length;
+  out.cold_penalty_rate = cold / rows.length;
+  out.elite_power_rate = elite / rows.length;
+  return out;
+}
+
+/** Produce a plain-English diagnosis of the miss-quality data. */
+function diagnoseMissQuality(top10: MissQualityMetrics, missed: MissQualityMetrics): string {
+  // If missed HR hitters have meaningfully higher season HR than Top 10
+  // → the model is underweighting elite power.
+  // If missed odds are similar to Top 10 odds → realistic candidates being missed.
+  // If missed odds are far longer (more positive) → mostly random longshots and variance.
+  const seasonGap = missed.avg_season_hr - top10.avg_season_hr;
+  const top10Odds = top10.avg_american_odds ?? 0;
+  const missedOdds = missed.avg_american_odds ?? 0;
+  const oddsClose = top10Odds > 0 && missedOdds > 0 && missedOdds < top10Odds * 1.8;
+  const oddsFar = missedOdds > top10Odds * 2.5;
+
+  if (missed.n < 20) {
+    return `Only ${missed.n} missed HR-player-days — sample too small for a confident call.`;
+  }
+  if (seasonGap >= 3 && oddsClose) {
+    return `Missed HR hitters average ${missed.avg_season_hr.toFixed(1)} season HR vs Top 10's ${top10.avg_season_hr.toFixed(1)}, with similar sportsbook expectations. Model is systematically underweighting realistic, well-priced power hitters — a rankings problem, not a variance problem.`;
+  }
+  if (oddsFar) {
+    return `Missed HRs average odds around ${missedOdds > 0 ? '+' : ''}${Math.round(missedOdds)} vs Top 10's ${top10Odds > 0 ? '+' : ''}${Math.round(top10Odds)} — most misses are sportsbook longshots / random variance, not realistic candidates the model could have caught.`;
+  }
+  if (seasonGap >= 2) {
+    return `Missed HR hitters have moderately higher season HR than Top 10 — some real candidates leaking out of the pool. Worth investigating the underlying chip profile in the buckets below.`;
+  }
+  return `Missed HR hitters and Top 10 picks have similar power + market profiles. Variance is doing most of the work — not a clear rankings problem.`;
+}
+
+/**
+ * Build the Miss Quality Analysis over the window. Returns per-rank-bucket
+ * stats plus the side-by-side comparison row.
+ *
+ * @param snapshots all snapshot rows in the window
+ * @param hrPlayersByDate game_date → set of HR player_ids
+ * @param hrPlayerInfo for fallback names of unranked HR hitters
+ * @param seasonHrAt (target_date, player_id) → season HR count up through that date
+ * @param oddsAt (target_date, player_id) → american odds
+ * @param anchor right-edge date (typically yesterday)
+ * @param windowDays defaults to 14
+ */
+export function computeMissQualityAnalysis(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+  hrPlayerInfo: Map<number, { player_name: string; team: string }>,
+  seasonHrAt: SeasonHrIndex,
+  oddsAt: OddsIndex,
+  anchor: string,
+  windowDays = 14,
+): MissQualityResult {
+  const rangeStart = addDays(anchor, -(windowDays - 1));
+
+  // Pre-index snapshot rows by (date, player_id) for quick lookup.
+  const snapByDayPlayer = new Map<string, RevAnalysisSnapshotRow>();
+  for (const snap of snapshots) {
+    if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
+    snapByDayPlayer.set(`${snap.target_date}:${snap.player_id}`, snap);
+  }
+
+  // Tally buckets for MISSED HR hitters.
+  const bucketRows: Record<string, Array<{ heat_score: number; season_hr: number | null; american_odds: number | null; signals: Set<SignalKey> }>> = {};
+  for (const b of MISS_BUCKETS) bucketRows[b.id] = [];
+  const unrankedRows: Array<{ heat_score: number; season_hr: number | null; american_odds: number | null; signals: Set<SignalKey> }> = [];
+  const top10Rows: typeof unrankedRows = [];
+  const top25Rows: typeof unrankedRows = [];
+  const top50Rows: typeof unrankedRows = [];
+  const missedRows: typeof unrankedRows = [];
+
+  let totalHr = 0;
+  let totalMissed = 0;
+
+  // First pass: aggregate Top 10/25/50 metrics over the window.
+  for (const snap of snapshots) {
+    if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
+    const key = `${snap.target_date}:${snap.player_id}`;
+    const signals = parseSignalsFromReason(snap.reason);
+    const row = {
+      heat_score: snap.heat_score,
+      season_hr: seasonHrAt.get(key) ?? null,
+      american_odds: oddsAt.get(key) ?? null,
+      signals,
+    };
+    if (snap.rank <= 10) top10Rows.push(row);
+    if (snap.rank <= 25) top25Rows.push(row);
+    if (snap.rank <= 50) top50Rows.push(row);
+  }
+
+  // Second pass: for every actual HR hitter, classify by snapshot rank.
+  for (const [date, hrSet] of hrPlayersByDate) {
+    if (date < rangeStart || date > anchor) continue;
+    for (const pid of hrSet) {
+      totalHr += 1;
+      const key = `${date}:${pid}`;
+      const snap = snapByDayPlayer.get(key);
+      // Inside Top 50 → not a miss
+      if (snap && snap.rank <= 50) continue;
+      totalMissed += 1;
+      const signals = snap ? parseSignalsFromReason(snap.reason) : new Set<SignalKey>();
+      const row = {
+        heat_score: snap?.heat_score ?? 0,
+        season_hr: seasonHrAt.get(key) ?? null,
+        american_odds: oddsAt.get(key) ?? null,
+        signals,
+      };
+      missedRows.push(row);
+      if (!snap) {
+        unrankedRows.push(row);
+      } else {
+        const bucket = MISS_BUCKETS.find((b) => snap.rank >= b.min && snap.rank <= b.max);
+        if (bucket) bucketRows[bucket.id].push(row);
+      }
+    }
+  }
+
+  // Build per-bucket metrics, including the share_of_misses field.
+  const buckets: MissQualityMetrics[] = MISS_BUCKETS.map((b) => {
+    const m = aggregateMetrics(b.label, bucketRows[b.id]);
+    m.share_of_misses = totalMissed > 0 ? m.n / totalMissed : 0;
+    return m;
+  });
+  const unrankedMetrics = aggregateMetrics('Unranked', unrankedRows);
+  unrankedMetrics.share_of_misses = totalMissed > 0 ? unrankedMetrics.n / totalMissed : 0;
+  buckets.push(unrankedMetrics);
+
+  const top10 = aggregateMetrics('Top 10', top10Rows);
+  const top25 = aggregateMetrics('Top 25', top25Rows);
+  const top50 = aggregateMetrics('Top 50', top50Rows);
+  const missedOverall = aggregateMetrics('Missed HRs', missedRows);
+
+  const diagnosis = diagnoseMissQuality(top10, missedOverall);
+
+  return {
+    anchor,
+    window_days: windowDays,
+    total_hr_hitters: totalHr,
+    total_missed: totalMissed,
+    buckets,
+    top10, top25, top50,
+    missed_overall: missedOverall,
+    diagnosis,
+    note: 'Park / HR Pitcher / Weather / Cold metrics are SIGNAL-PRESENCE rates (% of bucket with the chip), not numeric scores. Batting order position is not tracked in snapshots yet — shown as "—".',
+  };
+}
+
+// -----------------------------------------------------------------------------
+//  Top-N Efficiency (replaces "perfect 10/10" optimizer target)
+// -----------------------------------------------------------------------------
+
+export interface TopNEfficiencyResult {
+  anchor: string;
+  window_days: number;
+  days_counted: number;
+  /** Hits in Top 5 / 5 / days. */
+  top5_efficiency: number;
+  top5_hits: number;
+  top5_slots: number;
+  /** Hits in Top 10 / 10 / days. */
+  top10_efficiency: number;
+  top10_hits: number;
+  top10_slots: number;
+  /** Top 25 COVERAGE — share of total HR hitters caught in Top 25. */
+  top25_coverage: number;
+  top25_hits: number;
+  total_hr_hitters: number;
+  note: string;
+}
+
+/**
+ * The right betting-relevant optimizer metrics:
+ *   • Top 5 efficiency = how often each top-5 slot homers (5-bet daily basis)
+ *   • Top 10 efficiency = same for Top 10 (10-bet daily basis)
+ *   • Top 25 coverage = of all HR hitters that day, how many in Top 25
+ *
+ * These replace "perfect 10/10 hindsight" as the optimizer target — they
+ * reward the model for the bets the user actually places.
+ */
+export function computeTopNEfficiency(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+  anchor: string,
+  windowDays = 14,
+): TopNEfficiencyResult {
+  const rangeStart = addDays(anchor, -(windowDays - 1));
+  // Per-date set of player_ids in Top N.
+  const top5ByDate = new Map<string, Set<number>>();
+  const top10ByDate = new Map<string, Set<number>>();
+  const top25ByDate = new Map<string, Set<number>>();
+
+  for (const snap of snapshots) {
+    if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
+    if (snap.rank > 25) continue;
+    const set5 = top5ByDate.get(snap.target_date) ?? new Set<number>();
+    const set10 = top10ByDate.get(snap.target_date) ?? new Set<number>();
+    const set25 = top25ByDate.get(snap.target_date) ?? new Set<number>();
+    if (snap.rank <= 5) set5.add(snap.player_id);
+    if (snap.rank <= 10) set10.add(snap.player_id);
+    set25.add(snap.player_id);
+    top5ByDate.set(snap.target_date, set5);
+    top10ByDate.set(snap.target_date, set10);
+    top25ByDate.set(snap.target_date, set25);
+  }
+
+  let top5Hits = 0, top10Hits = 0, top25Hits = 0;
+  let top5Slots = 0, top10Slots = 0;
+  let totalHr = 0;
+  let daysCounted = 0;
+  const dates = new Set<string>();
+  for (const d of hrPlayersByDate.keys()) {
+    if (d < rangeStart || d > anchor) continue;
+    dates.add(d);
+  }
+  for (const d of top25ByDate.keys()) {
+    if (d < rangeStart || d > anchor) continue;
+    dates.add(d);
+  }
+
+  for (const date of dates) {
+    daysCounted += 1;
+    const hrSet = hrPlayersByDate.get(date) ?? new Set<number>();
+    totalHr += hrSet.size;
+    const t5 = top5ByDate.get(date) ?? new Set<number>();
+    const t10 = top10ByDate.get(date) ?? new Set<number>();
+    const t25 = top25ByDate.get(date) ?? new Set<number>();
+    top5Slots += t5.size;       // typically 5 unless the snapshot is short
+    top10Slots += t10.size;     // typically 10
+    for (const pid of hrSet) {
+      if (t5.has(pid)) top5Hits++;
+      if (t10.has(pid)) top10Hits++;
+      if (t25.has(pid)) top25Hits++;
+    }
+  }
+
+  return {
+    anchor,
+    window_days: windowDays,
+    days_counted: daysCounted,
+    top5_efficiency: top5Slots > 0 ? top5Hits / top5Slots : 0,
+    top5_hits: top5Hits,
+    top5_slots: top5Slots,
+    top10_efficiency: top10Slots > 0 ? top10Hits / top10Slots : 0,
+    top10_hits: top10Hits,
+    top10_slots: top10Slots,
+    top25_coverage: totalHr > 0 ? top25Hits / totalHr : 0,
+    top25_hits: top25Hits,
+    total_hr_hitters: totalHr,
+    note: 'Betting-relevant metrics: Top 5/10 efficiency = per-bet hit rate; Top 25 coverage = % of all HR hitters caught in the actionable pool.',
+  };
+}

@@ -32,6 +32,8 @@ import {
   NearMissesPanel,
   ExclusionReasonsPanel,
   BestHistoricalPoolPanel,
+  MissQualityPanel,
+  TopNEfficiencyStrip,
 } from '../components/DiagnosticsPanels';
 import {
   addDays,
@@ -43,9 +45,11 @@ import {
   computeConfidenceTiers,
   computeExclusionReasons,
   computeHrTargets,
+  computeMissQualityAnalysis,
   computeNearMisses,
   computePoolCoverage,
   computeReverseAnalysis,
+  computeTopNEfficiency,
   computeSleepers,
   computeCertifiedSleepers,
   currentReverseAnalysisWeights,
@@ -62,11 +66,15 @@ import {
   type HrTarget,
   type HrTargetGame,
   type HrTargetsBoard,
+  type MissQualityResult,
   type NearMissResult,
+  type OddsIndex,
   type PitcherFormLite,
   type PlayerTeamIndex,
   type PoolCoverageResult,
   type ReconstructionResult,
+  type SeasonHrIndex,
+  type TopNEfficiencyResult,
   type ReverseAnalysisResult,
   type RevAnalysisSnapshotRow,
   type SimulatedTop10Result,
@@ -283,6 +291,8 @@ export default function HrTargets() {
   const [nearMisses, setNearMisses] = useState<NearMissResult | null>(null);
   const [exclusionReasons, setExclusionReasons] = useState<ExclusionReasonsResult | null>(null);
   const [bestPool, setBestPool] = useState<BestPoolResult | null>(null);
+  const [missQuality, setMissQuality] = useState<MissQualityResult | null>(null);
+  const [topNEff, setTopNEff] = useState<TopNEfficiencyResult | null>(null);
   const [diagLoading, setDiagLoading] = useState<boolean>(true);
   // Cached historical snapshots/HRs so the reverse-analysis panel can
   // reuse them without re-fetching when the user opens the drawer.
@@ -514,12 +524,69 @@ export default function HrTargets() {
           heat_score: r.heat_score,
           reason: r.reason,
         }));
+        // Build (target_date, player_id) → cumulative season HR index.
+        // Walk hrs sorted by date asc, tally per player. Map key is
+        // "YYYY-MM-DD:player_id" — the cumulative count through that date.
+        const seasonHr: SeasonHrIndex = new Map();
+        const cumulative = new Map<number, number>();
+        const hrsSorted = hrs.slice().sort((a, b) => a.game_date < b.game_date ? -1 : a.game_date > b.game_date ? 1 : 0);
+        for (const r of hrsSorted) {
+          const prev = cumulative.get(r.player_id) ?? 0;
+          const next = prev + 1;
+          cumulative.set(r.player_id, next);
+          seasonHr.set(`${r.game_date}:${r.player_id}`, next);
+        }
+        // Backfill season HR for snapshot rows whose date isn't in seasonHr.
+        // For each snapshot row, look up the player's latest season HR ≤ target_date.
+        for (const snap of snaps) {
+          const key = `${snap.target_date}:${snap.player_id}`;
+          if (seasonHr.has(key)) continue;
+          // Find the latest count for this player at or before target_date.
+          let best = 0;
+          for (const r of hrsSorted) {
+            if (r.player_id !== snap.player_id) continue;
+            if (r.game_date > snap.target_date) break;
+            best++;
+          }
+          if (best > 0) seasonHr.set(key, best);
+        }
+
+        // Build odds index from the most recent odds_snapshots row per
+        // (target_date, player_id). One DB call covers the window.
+        const odds: OddsIndex = new Map();
+        try {
+          const PAGE_SIZE = 1000;
+          for (let page = 0; page < 30; page++) {
+            const { data, error } = await supabase
+              .from('odds_snapshots')
+              .select('target_date, player_id, american_odds, snapshot_time')
+              .gte('target_date', from30)
+              .lte('target_date', anchor)
+              .order('snapshot_time', { ascending: true })
+              .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+            if (error) break;
+            const rows = (data ?? []) as { target_date: string; player_id: number | null; american_odds: number; snapshot_time: string }[];
+            for (const r of rows) {
+              if (r.player_id == null) continue;
+              // Most recent wins (ascending order means later overwrites earlier).
+              odds.set(`${r.target_date}:${r.player_id}`, r.american_odds);
+            }
+            if (rows.length < PAGE_SIZE) break;
+          }
+        } catch (oddsErr) {
+          // eslint-disable-next-line no-console
+          console.warn('[diagnostics] odds index failed (graceful):', oddsErr);
+        }
+
         // Pool coverage / near misses / exclusion reasons / best pool —
         // all read-only over the same snapshots + HR index.
         setPoolCoverage(computePoolCoverage(minimal, hrByDate, anchor));
         setNearMisses(computeNearMisses(minimal, hrByDate, hrInfo, anchor, 14));
         setExclusionReasons(computeExclusionReasons(minimal, hrByDate, hrInfo, anchor, 14));
         setBestPool(computeBestHistoricalPool(minimal, hrByDate, hrInfo, anchor, 14));
+        // NEW: miss-quality + Top-N efficiency (task #217 / #218).
+        setMissQuality(computeMissQualityAnalysis(minimal, hrByDate, hrInfo, seasonHr, odds, anchor, 14));
+        setTopNEff(computeTopNEfficiency(minimal, hrByDate, anchor, 14));
       } catch (e) {
         // eslint-disable-next-line no-console
         console.warn('[diagnostics] load failed:', e);
@@ -854,12 +921,14 @@ export default function HrTargets() {
       )}
 
       {/* ───────────────── DIAGNOSTICS (main page) ─────────────────
-          Pool Coverage → Near Misses → Exclusion Reasons → Best Historical Pool.
-          These four panels answer "is it a pool problem or a ranking problem?" */}
+          Top-N efficiency strip → Pool Coverage → Miss Quality Analysis.
+          Together: "what % of bets hit?" + "did we even consider these players?"
+          + "are we missing realistic candidates or just longshots?"
+          Near Misses / Exclusion Reasons / Best Historical Pool are moved
+          into the Research drawer per task #220. */}
+      <TopNEfficiencyStrip eff={topNEff} loading={diagLoading} />
       <PoolCoveragePanel coverage={poolCoverage} loading={diagLoading} />
-      <NearMissesPanel misses={nearMisses} loading={diagLoading} asOf={asOf} />
-      <ExclusionReasonsPanel reasons={exclusionReasons} loading={diagLoading} />
-      <BestHistoricalPoolPanel pool={bestPool} loading={diagLoading} />
+      <MissQualityPanel quality={missQuality} loading={diagLoading} />
 
       {/* Cold Batter Rebound — kept on the main page as an actionable discovery
           card. Surfaces hitters the cold penalty hits but who carry real upside. */}
@@ -878,6 +947,13 @@ export default function HrTargets() {
           on daily picks + diagnostics. The drawer state is persisted in
           localStorage per the ResearchDrawer component. */}
       <ResearchDrawer>
+        {/* Moved here per the user's reframe — these answer pool-construction
+            questions in detail but aren't needed for daily betting decisions. */}
+        <NearMissesPanel misses={nearMisses} loading={diagLoading} asOf={asOf} />
+        <ExclusionReasonsPanel reasons={exclusionReasons} loading={diagLoading} />
+        <BestHistoricalPoolPanel pool={bestPool} loading={diagLoading} />
+
+
         {modelDisagreements.length > 0 && (
           <div className="panel" style={{ borderColor: 'var(--accent)', background: 'var(--panel-2)' }}>
             <h2 style={{ marginTop: 0, fontSize: 15 }}>⚠ Model disagreement: elite power hitter(s) ranked low</h2>
