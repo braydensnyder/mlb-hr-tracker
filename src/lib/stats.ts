@@ -6174,3 +6174,181 @@ export function computeTopNEfficiency(
     note: 'Betting-relevant metrics: Top 5/10 efficiency = per-bet hit rate; Top 25 coverage = % of all HR hitters caught in the actionable pool.',
   };
 }
+
+// =============================================================================
+//  The Card — tier classifier + back-to-back edge measurement (task #223)
+// -----------------------------------------------------------------------------
+//  The Card is a parlay-builder page tuned for the user's actual betting
+//  workflow (5-8 leg HR-prop parlays at small stakes on FanDuel/MGM). The
+//  page surfaces three tiers — Cores, Boosts, Spice — instead of the
+//  generic Top 50 grid, plus a "Back-to-Back Watch" card that surfaces
+//  yesterday's HR hitters playing tonight (the user's founding insight).
+//
+//  Helpers in this section are FORWARD-LOOKING from already-computed data
+//  (no scoring changes, no mutation). The back-to-back edge measurement is
+//  a one-shot historical validation that the page renders right on the
+//  card — so the user sees whether the pattern actually has measurable lift
+//  over the baseline HR rate every time they open the page.
+// =============================================================================
+
+/** Three tiers tuned to parlay-leg shopping behavior. */
+export type PickTier = 'core' | 'boost' | 'spice';
+
+export interface PickTierBands {
+  /** Heat-score floor for Cores (rank-1 player with weak heat is still NOT a Core). */
+  coreHeatMin: number;
+  /** American-odds ceiling for Cores. Above this, demote to Boost. */
+  coreOddsMax: number;
+  /** American-odds ceiling for Boosts. Above this → Spice. */
+  boostOddsMax: number;
+  /** Max rank that can reach Boost without exceptional signal. */
+  boostRankMax: number;
+}
+
+export const DEFAULT_PICK_TIER_BANDS: PickTierBands = {
+  coreHeatMin: 55,
+  coreOddsMax: 400,    // +400
+  boostOddsMax: 700,   // +700
+  boostRankMax: 30,
+};
+
+/**
+ * Classify a single pick into a tier. Combines model rank, heat score, and
+ * the sportsbook's American odds so the tier matches the user's parlay
+ * shopping behavior (anchor on Cores, mix Boosts, sprinkle a Spice for
+ * payout variance).
+ *
+ *   Core   = high model conviction AND book-favored. Rank ≤ 10 AND heat ≥
+ *            coreHeatMin AND (odds ≤ coreOddsMax OR no odds).
+ *   Boost  = strong pick but priced longer, OR mid-rank with good chips.
+ *            Rank 11-30, OR a Top-10 player priced above coreOddsMax.
+ *   Spice  = lottery ticket — high payout, lower hit rate. Odds above
+ *            boostOddsMax, OR rank 31+ with at least one upside signal.
+ *
+ * `signalCount` is the number of GOOD-tone chips on the target — passed
+ * by the page since signals live on HrTarget.reason_chips.
+ */
+export function classifyPickTier(
+  rank: number,
+  heat_score: number,
+  american_odds: number | null | undefined,
+  signalCount: number,
+  bands: PickTierBands = DEFAULT_PICK_TIER_BANDS,
+): PickTier {
+  const odds = american_odds ?? null;
+
+  // Spice — pure longshot path
+  if (odds != null && odds > bands.boostOddsMax) return 'spice';
+
+  // Core — top of rankings + book agrees
+  if (rank <= 10 && heat_score >= bands.coreHeatMin) {
+    if (odds == null || odds <= bands.coreOddsMax) return 'core';
+    // Book has them priced longer than expected → demote to Boost
+    return 'boost';
+  }
+
+  // Boost — mid-rank, or top-rank priced above core threshold
+  if (rank <= bands.boostRankMax) return 'boost';
+
+  // Below boost rank: only surfaces as Spice if there's real upside signal
+  if (signalCount >= 1) return 'spice';
+  // Otherwise this pick doesn't belong on the card at all — caller filters.
+  return 'spice';
+}
+
+/** Back-to-back edge measurement: rate at which a player who homered on
+ *  day D homers on day D+1, compared to the baseline rate (any snapshot
+ *  player on any day). Computed over the historical window the page
+ *  already fetches. */
+export interface BackToBackEdgeResult {
+  anchor: string;
+  window_days: number;
+  /** Number of (player, day-after-HR) pairs counted. */
+  n_pairs: number;
+  /** Of those pairs, how many homered the next day too. */
+  back_to_back_hits: number;
+  /** back_to_back_hits / n_pairs. */
+  back_to_back_rate: number;
+  /** Baseline = total snapshot player-day HRs / total player-days. */
+  baseline_rate: number;
+  /** back_to_back_rate / baseline_rate. 1.0 = no edge. */
+  lift: number;
+  /** Plain-English diagnosis. */
+  diagnosis: string;
+}
+
+/**
+ * Measure whether back-to-back HR is real edge or vibes. For each player
+ * who homered on day D, we check whether they ALSO homered on day D+1
+ * (requires a snapshot row on D+1 to know they played).
+ */
+export function computeBackToBackEdge(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrPlayersByDate: Map<string, Set<number>>,
+  anchor: string,
+  windowDays = 30,
+): BackToBackEdgeResult {
+  const rangeStart = addDays(anchor, -(windowDays - 1));
+
+  // (date, player_id) → snapshot row (means "played that day, model considered them")
+  const snapByDayPlayer = new Map<string, boolean>();
+  let totalPlayerDays = 0;
+  for (const snap of snapshots) {
+    if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
+    snapByDayPlayer.set(`${snap.target_date}:${snap.player_id}`, true);
+    totalPlayerDays += 1;
+  }
+
+  // Baseline: total HR-player-days / total snapshot player-days.
+  let baselineHits = 0;
+  for (const [date, hrSet] of hrPlayersByDate) {
+    if (date < rangeStart || date > anchor) continue;
+    for (const pid of hrSet) {
+      if (snapByDayPlayer.has(`${date}:${pid}`)) baselineHits += 1;
+    }
+  }
+  const baselineRate = totalPlayerDays > 0 ? baselineHits / totalPlayerDays : 0;
+
+  // Back-to-back pairs: for every (day D, player who homered AND was in pool),
+  // is there a day D+1 where they're also in the pool? If yes, did they homer?
+  let nPairs = 0;
+  let b2bHits = 0;
+  for (const [date, hrSet] of hrPlayersByDate) {
+    if (date < rangeStart || date > anchor) continue;
+    const nextDate = addDays(date, 1);
+    if (nextDate > anchor) continue;
+    const nextHr = hrPlayersByDate.get(nextDate);
+    for (const pid of hrSet) {
+      if (!snapByDayPlayer.has(`${date}:${pid}`)) continue;     // wasn't in pool on D
+      if (!snapByDayPlayer.has(`${nextDate}:${pid}`)) continue; // didn't play D+1
+      nPairs += 1;
+      if (nextHr && nextHr.has(pid)) b2bHits += 1;
+    }
+  }
+  const b2bRate = nPairs > 0 ? b2bHits / nPairs : 0;
+  const lift = baselineRate > 0 ? b2bRate / baselineRate : 0;
+
+  let diagnosis: string;
+  if (nPairs < 30) {
+    diagnosis = `Only ${nPairs} back-to-back pairs in the ${windowDays}d window — sample too small for a confident call.`;
+  } else if (lift >= 1.5) {
+    diagnosis = `Players who homer one night cash at ${(b2bRate * 100).toFixed(1)}% the next night vs the ${(baselineRate * 100).toFixed(1)}% baseline. Real, measurable back-to-back edge — the card earns its place.`;
+  } else if (lift >= 1.15) {
+    diagnosis = `Modest back-to-back lift (${(b2bRate * 100).toFixed(1)}% vs ${(baselineRate * 100).toFixed(1)}% baseline). Small edge — worth including as a parlay leg input but not by itself.`;
+  } else if (lift >= 0.85) {
+    diagnosis = `Back-to-back rate (${(b2bRate * 100).toFixed(1)}%) is essentially the same as the baseline (${(baselineRate * 100).toFixed(1)}%). The pattern you noticed is mostly recency bias — homers don't cluster more than chance over this window.`;
+  } else {
+    diagnosis = `Back-to-back rate (${(b2bRate * 100).toFixed(1)}%) is BELOW the baseline (${(baselineRate * 100).toFixed(1)}%) — regression dominates. Treat back-to-back picks as a fade, not a follow.`;
+  }
+
+  return {
+    anchor,
+    window_days: windowDays,
+    n_pairs: nPairs,
+    back_to_back_hits: b2bHits,
+    back_to_back_rate: b2bRate,
+    baseline_rate: baselineRate,
+    lift,
+    diagnosis,
+  };
+}

@@ -3,6 +3,7 @@ import Dashboard from './pages/Dashboard';
 import PlayerDetail from './pages/PlayerDetail';
 import Matchups from './pages/Matchups';
 import HrTargets from './pages/HrTargets';
+import TonightsCard from './pages/TonightsCard';
 import Backtest from './pages/Backtest';
 import Odds from './pages/Odds';
 import ClubhouseMenu from './components/ClubhouseMenu';
@@ -34,6 +35,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/matchups" element={<Matchups />} />
+        <Route path="/card" element={<TonightsCard />} />
         <Route path="/targets" element={<HrTargets />} />
         <Route path="/odds" element={<Odds />} />
         <Route path="/backtest" element={<Backtest />} />
