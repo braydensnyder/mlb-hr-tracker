@@ -32,6 +32,7 @@ interface NavItem {
 const ITEMS: NavItem[] = [
   { to: '/',         label: 'Dashboard',  description: "Today's HRs, leaders, and live status", end: true },
   { to: '/card',     label: 'The Card',   description: 'Tonight\'s picks — Cores, Boosts, Spice' },
+  { to: '/teams',    label: 'Team Board', description: 'One pick per team — league-wide representation' },
   { to: '/matchups', label: 'Matchups',   description: 'Today\'s probable pitchers and game notes' },
   { to: '/targets',  label: 'HR Targets', description: 'Heat Score model + research deep-dive' },
   { to: '/odds',     label: 'Odds',       description: 'HR props, line movement, Model vs Market' },
