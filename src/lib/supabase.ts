@@ -662,6 +662,88 @@ export async function fetchLearningPredictions(opts: {
   return all;
 }
 
+/** Per-date capture summary for the Learning Dashboard. Aggregates
+ *  learning_predictions rows server-side via a lightweight query. */
+export interface LearningCaptureDay {
+  date: string;
+  model_version: number;
+  player_count: number;
+  hr_hitter_count: number;
+  tp: number; fp: number; fn: number; tn: number;
+  /** Most recent captured_at across all rows for the date. */
+  last_captured_at: string | null;
+}
+
+/**
+ * Build a per-day aggregate for the Learning Dashboard. Pulls minimal
+ * fields (no signals_json / no reason text) so the page stays fast.
+ */
+export async function fetchLearningCaptureSummary(opts: {
+  from?: string; to?: string; limit?: number;
+} = {}): Promise<LearningCaptureDay[]> {
+  const PAGE_SIZE = 1000;
+  let q = supabase
+    .from('learning_predictions')
+    .select('target_date, model_version, player_id, homered, classification, captured_at')
+    .order('target_date', { ascending: false })
+    .order('captured_at', { ascending: false });
+  if (opts.from) q = q.gte('target_date', opts.from);
+  if (opts.to) q = q.lte('target_date', opts.to);
+
+  const all: { target_date: string; model_version: number; player_id: number; homered: boolean | null; classification: string | null; captured_at: string | null }[] = [];
+  for (let page = 0; page < 30; page++) {
+    const { data, error } = await q.range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return [];
+      throw new Error(error.message);
+    }
+    const rows = (data ?? []) as typeof all;
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+
+  // Aggregate by (date, version).
+  type Accum = LearningCaptureDay & { player_set: Set<number>; hr_set: Set<number> };
+  const acc = new Map<string, Accum>();
+  for (const r of all) {
+    const key = `${r.target_date}:${r.model_version}`;
+    let entry = acc.get(key);
+    if (!entry) {
+      entry = {
+        date: r.target_date,
+        model_version: r.model_version,
+        player_count: 0,
+        hr_hitter_count: 0,
+        tp: 0, fp: 0, fn: 0, tn: 0,
+        last_captured_at: null,
+        player_set: new Set(),
+        hr_set: new Set(),
+      };
+      acc.set(key, entry);
+    }
+    entry.player_set.add(r.player_id);
+    if (r.homered === true) entry.hr_set.add(r.player_id);
+    if (r.classification === 'TP') entry.tp++;
+    else if (r.classification === 'FP') entry.fp++;
+    else if (r.classification === 'FN') entry.fn++;
+    else if (r.classification === 'TN') entry.tn++;
+    if (r.captured_at && (!entry.last_captured_at || r.captured_at > entry.last_captured_at)) {
+      entry.last_captured_at = r.captured_at;
+    }
+  }
+  const summaries: LearningCaptureDay[] = Array.from(acc.values()).map((e) => ({
+    date: e.date,
+    model_version: e.model_version,
+    player_count: e.player_set.size,
+    hr_hitter_count: e.hr_set.size,
+    tp: e.tp, fp: e.fp, fn: e.fn, tn: e.tn,
+    last_captured_at: e.last_captured_at,
+  }));
+  summaries.sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : 0);
+  if (opts.limit) return summaries.slice(0, opts.limit);
+  return summaries;
+}
+
 /** Most-recent feature_importance row per signal_key for a window. */
 export async function fetchFeatureImportance(opts: {
   model_version: number; window_days: number;

@@ -34,6 +34,7 @@ const ITEMS: NavItem[] = [
   { to: '/card',     label: 'The Card',   description: 'Tonight\'s picks — Cores, Boosts, Spice' },
   { to: '/teams',    label: 'Team Board', description: 'One pick per team — league-wide representation' },
   { to: '/lab',      label: 'Parlay Lab', description: 'Safe / Value / Chaos parlays + historical backtest' },
+  { to: '/learning', label: 'Learning',   description: 'Captured days, model versions, feedback timeline' },
   { to: '/matchups', label: 'Matchups',   description: 'Today\'s probable pitchers and game notes' },
   { to: '/targets',  label: 'HR Targets', description: 'Heat Score model + research deep-dive' },
   { to: '/odds',     label: 'Odds',       description: 'HR props, line movement, Model vs Market' },

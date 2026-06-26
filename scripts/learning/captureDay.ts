@@ -7,20 +7,15 @@
  *   3. Loads saved odds for that target_date.
  *   4. Re-runs the parlay generator with the SAME live rules — same code,
  *      same constants. Records which players ended up in Safe / Value / Chaos.
- *   5. For every snapshot row, writes one learning_predictions record:
- *        - pre-game signals (signals_json)
- *        - rank + heat + model_prob
- *        - parlay membership (in_safe/value/chaos)
- *        - outcome (homered, hr_count)
- *        - classification (TP/FP/FN/TN)
- *   6. Computes feature_importance over (target_date - window..target_date)
- *      and inserts/upserts rows for 7d/14d/30d windows.
+ *   5. For every snapshot row, writes one learning_predictions record
+ *      (pre-game signals, rank, heat, model_prob, parlay membership,
+ *      outcome, classification).
+ *   6. Computes feature_importance over rolling 7d / 14d / 30d windows.
  *   7. Refreshes the active model_version's roll-up metrics.
  *
- * Idempotent: uses upsert on (target_date, player_id, model_version) so
- * re-running is safe. --force is implicit because upsert overwrites the
- * outcome side; the pre-game state is also re-derived from the snapshot
- * (which itself is immutable once written).
+ * Logging — verbose by default. Each stage prints a [captureDay] line so
+ * you can see what landed and where. After every write we COUNT to
+ * verify the rows are actually in Supabase, not just upsert-acknowledged.
  *
  * Usage:
  *   npm run learning:capture                       # yesterday (Pacific)
@@ -41,8 +36,8 @@ import {
 } from '../../src/lib/stats.js';
 
 // Local mirror of signal labels so this script doesn't depend on
-// stats.ts's internal naming choices. Keep in sync if stats.ts adds new
-// signal kinds.
+// stats.ts's internal naming choices. Keep in sync if stats.ts adds
+// new signal kinds.
 const SIGNAL_LABEL: Record<string, string> = {
   hr_pitcher: 'HR Pitcher',
   power_park: 'Power Park',
@@ -87,7 +82,6 @@ interface GameLite {
   home_team: string;
   away_team: string;
 }
-
 interface HrRowLite {
   game_pk: number;
   game_date: string;
@@ -97,20 +91,51 @@ interface HrRowLite {
   opponent: string;
 }
 
+// --- pretty logger ---
+function log(msg: string) {
+  console.log(`[captureDay] ${msg}`);
+}
+function logStep(n: string, msg: string) {
+  console.log(`[captureDay] ${n} ${msg}`);
+}
+function logOk(msg: string) {
+  console.log(`[captureDay] ✓ ${msg}`);
+}
+function logWarn(msg: string) {
+  console.warn(`[captureDay] ⚠ ${msg}`);
+}
+function logErr(msg: string) {
+  console.error(`[captureDay] ✗ ${msg}`);
+}
+
 async function loadActiveModelVersion(): Promise<{ version: number; name: string }> {
+  logStep('1)', 'Loading active model_version…');
   const { data, error } = await supabaseAdmin
     .from('model_versions')
     .select('version, name')
     .eq('active', true)
     .order('version', { ascending: false })
     .limit(1);
-  if (error) throw new Error(`model_versions: ${error.message}`);
+  if (error) {
+    if (/relation .* does not exist|does not exist|schema cache/i.test(error.message)) {
+      throw new Error(
+        'model_versions table is missing. Apply supabase/migrations/013_learning_engine.sql in the Supabase SQL editor first.'
+      );
+    }
+    throw new Error(`model_versions: ${error.message}`);
+  }
   const row = (data ?? [])[0] as { version: number; name: string } | undefined;
-  if (!row) throw new Error('No active model_version row found. Apply migration 013 first.');
+  if (!row) {
+    throw new Error(
+      'No active model_version row found. The migration should seed v1 automatically; check the seed INSERT in 013_learning_engine.sql.'
+    );
+  }
+  logOk(`active version: v${row.version} (${row.name})`);
   return row;
 }
 
 async function loadSnapshots(date: string): Promise<RevAnalysisSnapshotRow[]> {
+  logStep('2)', `Loading snapshots for ${date}…`);
   const all: RevAnalysisSnapshotRow[] = [];
   for (let page = 0; page < 10; page++) {
     const { data, error } = await supabaseAdmin
@@ -119,24 +144,35 @@ async function loadSnapshots(date: string): Promise<RevAnalysisSnapshotRow[]> {
       .eq('target_date', date)
       .order('rank', { ascending: true })
       .range(page * 1000, page * 1000 + 999);
-    if (error) throw new Error(`snapshots: ${error.message}`);
+    if (error) throw new Error(`snapshots fetch: ${error.message}`);
     const rows = (data ?? []) as RevAnalysisSnapshotRow[];
     all.push(...rows);
     if (rows.length < 1000) break;
+  }
+  logOk(`snapshots loaded: ${all.length} rows`);
+  if (all.length === 0) {
+    throw new Error(
+      `No snapshot rows for ${date}. Did snapshot:targets run for that date? ` +
+        `Try: npm run snapshot:targets -- ${date} --force`
+    );
   }
   return all;
 }
 
 async function loadGames(date: string): Promise<GameLite[]> {
+  logStep('3)', `Loading games for ${date}…`);
   const { data, error } = await supabaseAdmin
     .from('games')
     .select('game_pk, home_team, away_team')
     .eq('game_date', date);
-  if (error) throw new Error(`games: ${error.message}`);
-  return (data ?? []) as GameLite[];
+  if (error) throw new Error(`games fetch: ${error.message}`);
+  const rows = (data ?? []) as GameLite[];
+  logOk(`games loaded: ${rows.length}`);
+  return rows;
 }
 
 async function loadHrs(date: string): Promise<HrRowLite[]> {
+  logStep('4)', `Loading home_runs for ${date}…`);
   const all: HrRowLite[] = [];
   for (let page = 0; page < 10; page++) {
     const { data, error } = await supabaseAdmin
@@ -144,15 +180,17 @@ async function loadHrs(date: string): Promise<HrRowLite[]> {
       .select('game_pk, game_date, player_id, player_name, team, opponent')
       .eq('game_date', date)
       .range(page * 1000, page * 1000 + 999);
-    if (error) throw new Error(`home_runs: ${error.message}`);
+    if (error) throw new Error(`home_runs fetch: ${error.message}`);
     const rows = (data ?? []) as HrRowLite[];
     all.push(...rows);
     if (rows.length < 1000) break;
   }
+  logOk(`home_runs loaded: ${all.length} rows`);
   return all;
 }
 
 async function loadOdds(date: string): Promise<Map<number, number>> {
+  logStep('5)', `Loading odds for ${date}…`);
   const out = new Map<number, number>();
   const { data, error } = await supabaseAdmin
     .from('odds_snapshots')
@@ -160,17 +198,25 @@ async function loadOdds(date: string): Promise<Map<number, number>> {
     .eq('target_date', date)
     .order('snapshot_time', { ascending: true });
   if (error) {
-    if (/odds_snapshots/i.test(error.message) && /does not exist/i.test(error.message)) return out;
-    throw new Error(`odds: ${error.message}`);
+    if (/odds_snapshots/i.test(error.message) && /does not exist|schema cache/i.test(error.message)) {
+      logWarn('odds_snapshots table missing — continuing without odds (model_prob still computed)');
+      return out;
+    }
+    throw new Error(`odds fetch: ${error.message}`);
   }
   for (const r of (data ?? []) as { player_id: number | null; american_odds: number }[]) {
     if (r.player_id == null) continue;
-    out.set(r.player_id, r.american_odds); // latest wins
+    out.set(r.player_id, r.american_odds);
   }
+  logOk(`odds loaded: ${out.size} player-day entries`);
   return out;
 }
 
-async function loadLearningRowsFor(date: string, modelVersion: number, lookbackDays: number): Promise<LearningRowForImportance[]> {
+async function loadLearningRowsFor(
+  date: string,
+  modelVersion: number,
+  lookbackDays: number,
+): Promise<LearningRowForImportance[]> {
   const from = addDays(date, -(lookbackDays - 1));
   const all: LearningRowForImportance[] = [];
   for (let page = 0; page < 20; page++) {
@@ -197,24 +243,55 @@ interface CaptureResult {
   date: string;
   model_version: number;
   predictions_written: number;
-  tp: number; fp: number; fn: number; tn: number;
+  tp: number;
+  fp: number;
+  fn: number;
+  tn: number;
   unranked_hr_hitters: number;
   importance_rows_written: number;
+  importance_by_window: { window_days: number; rows: number }[];
+  /** Pre-write count of rows for this (date, version), post-write count, delta. */
+  predictions_verified: { before: number; after: number };
+  feature_importance_verified: number;
 }
 
 export async function captureDay(date: string, importanceWindows: number[]): Promise<CaptureResult> {
-  // 1. Load active model + the day's data
+  log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  log(`START — date=${date} windows=${importanceWindows.join(',')}`);
+  log(`Supabase URL (admin): ${process.env.SUPABASE_URL ? '✓ set' : '✗ MISSING'}`);
+  log(`Supabase service key: ${process.env.SUPABASE_SERVICE_ROLE_KEY ? '✓ set' : '✗ MISSING'}`);
+  log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+  // ---- 1) Active model version ----
   const mv = await loadActiveModelVersion();
+
+  // ---- 2-5) Load source data ----
   const [snapshots, games, hrs, odds] = await Promise.all([
-    loadSnapshots(date), loadGames(date), loadHrs(date), loadOdds(date),
+    loadSnapshots(date),
+    loadGames(date),
+    loadHrs(date),
+    loadOdds(date),
   ]);
-  console.log(`[captureDay] ${date} — model v${mv.version} (${mv.name}). snapshots=${snapshots.length}, games=${games.length}, hrs=${hrs.length}, odds=${odds.size}`);
 
-  if (snapshots.length === 0) {
-    throw new Error(`No snapshot rows for ${date}. Run snapshot:targets first.`);
+  // ---- Pre-write count ----
+  logStep('6)', 'Counting existing learning_predictions for this (date, version)…');
+  const { count: preCount, error: preCountErr } = await supabaseAdmin
+    .from('learning_predictions')
+    .select('id', { count: 'exact', head: true })
+    .eq('target_date', date)
+    .eq('model_version', mv.version);
+  if (preCountErr) {
+    if (/relation .* does not exist|does not exist|schema cache/i.test(preCountErr.message)) {
+      throw new Error(
+        'learning_predictions table is missing. Apply supabase/migrations/013_learning_engine.sql first.'
+      );
+    }
+    throw new Error(`pre-count: ${preCountErr.message}`);
   }
+  log(`pre-count: ${preCount ?? 0} existing rows (will be overwritten by upsert)`);
 
-  // 2. Build HR outcome index per (date, player_id) and per-player opponent
+  // ---- 7) Build HR outcome index ----
+  logStep('7)', 'Indexing HR outcomes…');
   const hrCountByPlayer = new Map<number, number>();
   const opponentByPlayer = new Map<number, string>();
   const gamePkByPlayer = new Map<number, number>();
@@ -223,9 +300,8 @@ export async function captureDay(date: string, importanceWindows: number[]): Pro
     opponentByPlayer.set(hr.player_id, hr.opponent);
     gamePkByPlayer.set(hr.player_id, hr.game_pk);
   }
+  logOk(`distinct HR hitters: ${hrCountByPlayer.size}`);
 
-  // Game lookup by team — for snapshot rows that aren't HR hitters but need
-  // opponent/game_pk for completeness.
   const gameByTeam = new Map<string, GameLite>();
   for (const g of games) {
     gameByTeam.set(g.home_team, g);
@@ -240,18 +316,24 @@ export async function captureDay(date: string, importanceWindows: number[]): Pro
     };
   }
 
-  // 3. Re-run parlay generator with current live rules
-  const candidates = snapshots.map((snap) => snapshotToParlayCandidate(snap, odds.get(snap.player_id) ?? null));
+  // ---- 8) Re-run parlay generator ----
+  logStep('8)', 'Re-running parlay generator with current live rules…');
+  const candidates = snapshots.map((snap) =>
+    snapshotToParlayCandidate(snap, odds.get(snap.player_id) ?? null),
+  );
   const { safe, value, chaos } = generateParlays(candidates);
+  log(`  Safe:  ${safe.legs.length}/3 legs ${safe.incomplete ? '(incomplete)' : ''}`);
+  log(`  Value: ${value.legs.length}/3 legs ${value.incomplete ? '(incomplete)' : ''}`);
+  log(`  Chaos: ${chaos.legs.length}/3 legs ${chaos.incomplete ? '(incomplete)' : ''}`);
   const inSafe = new Set(safe.legs.map((l) => l.player_id));
   const inValue = new Set(value.legs.map((l) => l.player_id));
   const inChaos = new Set(chaos.legs.map((l) => l.player_id));
 
-  // 4. Build learning_predictions records — one per snapshot row.
+  // ---- 9) Build learning records ----
+  logStep('9)', 'Building learning_predictions records…');
   const records = snapshots.map((snap) => {
     const homered = hrCountByPlayer.has(snap.player_id);
     const hrCount = hrCountByPlayer.get(snap.player_id) ?? 0;
-    // Prefer the HR row's opponent when available; otherwise fall back to game lookup.
     const fallback = lookupOpponentAndPk(snap.team ?? '');
     return buildLearningPredictionRecord({
       snapshot: snap,
@@ -266,13 +348,11 @@ export async function captureDay(date: string, importanceWindows: number[]): Pro
     });
   });
 
-  // ALSO: HR hitters NOT in the snapshot — represent as a phantom row with rank=null.
-  // Classification = FN, signals empty. captured_at marks the row.
+  // Phantom FN rows — HR hitters NOT in snapshot (the pool gap)
   const inSnapshotIds = new Set(snapshots.map((s) => s.player_id));
   let phantomCount = 0;
   for (const [pid, count] of hrCountByPlayer) {
     if (inSnapshotIds.has(pid)) continue;
-    // Look up name/team/opponent from HR rows
     const hrRow = hrs.find((r) => r.player_id === pid)!;
     records.push({
       target_date: date,
@@ -287,15 +367,18 @@ export async function captureDay(date: string, importanceWindows: number[]): Pro
       model_prob: null,
       reason: null,
       signals_json: {},
-      in_safe: false, in_value: false, in_chaos: false,
+      in_safe: false,
+      in_value: false,
+      in_chaos: false,
       homered: true,
       hr_count: count,
       classification: 'FN' as const,
     });
     phantomCount++;
   }
+  log(`  built ${records.length} records (${snapshots.length} from snapshot + ${phantomCount} phantom FN rows)`);
 
-  // 5. Tally classifications + upsert into Supabase
+  // ---- 10) Tally classifications ----
   let tp = 0, fp = 0, fn = 0, tn = 0;
   for (const r of records) {
     if (r.classification === 'TP') tp++;
@@ -303,20 +386,58 @@ export async function captureDay(date: string, importanceWindows: number[]): Pro
     else if (r.classification === 'FN') fn++;
     else if (r.classification === 'TN') tn++;
   }
-  console.log(`[captureDay] classifications: TP=${tp} FP=${fp} FN=${fn} TN=${tn} (phantom FN from unranked HR hitters: ${phantomCount})`);
+  log(`  classification: TP=${tp} FP=${fp} FN=${fn} TN=${tn}`);
 
+  // ---- 11) Upsert learning_predictions ----
+  logStep('10)', `Upserting ${records.length} learning_predictions rows…`);
   const nowIso = new Date().toISOString();
   const upsertRows = records.map((r) => ({ ...r, captured_at: nowIso }));
-  const { error: upsertErr } = await supabaseAdmin
-    .from('learning_predictions')
-    .upsert(upsertRows, { onConflict: 'target_date,player_id,model_version' });
-  if (upsertErr) throw new Error(`learning_predictions upsert: ${upsertErr.message}`);
 
-  // 6. Refresh feature_importance for each window
+  // Batch upsert in chunks of 500 to keep request bodies modest.
+  const BATCH = 500;
+  let totalUpserted = 0;
+  for (let i = 0; i < upsertRows.length; i += BATCH) {
+    const chunk = upsertRows.slice(i, i + BATCH);
+    const { error: upsertErr, count } = await supabaseAdmin
+      .from('learning_predictions')
+      .upsert(chunk, { onConflict: 'target_date,player_id,model_version', count: 'exact' });
+    if (upsertErr) throw new Error(`learning_predictions upsert (batch ${i / BATCH}): ${upsertErr.message}`);
+    totalUpserted += count ?? chunk.length;
+    log(`  upsert batch ${Math.floor(i / BATCH) + 1}: ${chunk.length} rows acknowledged`);
+  }
+  logOk(`learning_predictions upserts acknowledged: ${totalUpserted}`);
+
+  // ---- 12) VERIFY by re-counting ----
+  logStep('11)', 'Verifying learning_predictions persisted…');
+  const { count: postCount, error: postCountErr } = await supabaseAdmin
+    .from('learning_predictions')
+    .select('id', { count: 'exact', head: true })
+    .eq('target_date', date)
+    .eq('model_version', mv.version);
+  if (postCountErr) throw new Error(`post-count: ${postCountErr.message}`);
+  log(`  post-count: ${postCount ?? 0} rows in DB for (${date}, v${mv.version})`);
+  if ((postCount ?? 0) < records.length) {
+    logWarn(
+      `Expected at least ${records.length} rows but DB has ${postCount}. ` +
+        'Possible RLS issue — check that the service-role key has insert privileges and that ' +
+        'allow_anon_read policy is enabled.',
+    );
+  } else {
+    logOk(`verified: DB contains ${postCount} rows for this (date, version)`);
+  }
+
+  // ---- 13) Refresh feature_importance ----
+  logStep('12)', `Refreshing feature_importance for windows ${importanceWindows.join(', ')}…`);
   let importanceWritten = 0;
+  const importanceByWindow: { window_days: number; rows: number }[] = [];
   for (const winDays of importanceWindows) {
     const rows = await loadLearningRowsFor(date, mv.version, winDays);
-    if (rows.length === 0) continue;
+    log(`  ${winDays}d window: ${rows.length} player-days in learning_predictions`);
+    if (rows.length === 0) {
+      log(`  ${winDays}d window: skipped (no learning rows yet — backfill more days first)`);
+      importanceByWindow.push({ window_days: winDays, rows: 0 });
+      continue;
+    }
     const imp = computeFeatureImportance(rows, date, winDays);
     const fiRows = imp.rows.map((r) => ({
       model_version: mv.version,
@@ -338,20 +459,37 @@ export async function captureDay(date: string, importanceWindows: number[]): Pro
       .from('feature_importance')
       .upsert(fiRows, { onConflict: 'model_version,window_days,computed_for,signal_key' });
     if (fiErr) throw new Error(`feature_importance upsert (${winDays}d): ${fiErr.message}`);
+    log(`  ${winDays}d window: wrote ${fiRows.length} feature_importance rows`);
     importanceWritten += fiRows.length;
+    importanceByWindow.push({ window_days: winDays, rows: fiRows.length });
+  }
+  logOk(`feature_importance refreshed: ${importanceWritten} total rows across windows`);
+
+  // ---- 14) Verify feature_importance for this anchor ----
+  logStep('13)', 'Verifying feature_importance persisted for this anchor…');
+  const { count: fiCount, error: fiCountErr } = await supabaseAdmin
+    .from('feature_importance')
+    .select('id', { count: 'exact', head: true })
+    .eq('model_version', mv.version)
+    .eq('computed_for', date);
+  if (fiCountErr) {
+    logWarn(`feature_importance count check failed: ${fiCountErr.message}`);
+  } else {
+    log(`  post-count: ${fiCount ?? 0} feature_importance rows for (v${mv.version}, computed_for=${date})`);
   }
 
-  // 7. Refresh model_versions roll-up (per-leg + coverage from the
-  //    classification — no separate parlay backtest needed since we
-  //    already have all the data inline).
-  const totalParlayLegs = (safe.incomplete ? 0 : 3) + (value.incomplete ? 0 : 3) + (chaos.incomplete ? 0 : 3);
+  // ---- 15) Refresh model_versions roll-up ----
+  logStep('14)', 'Refreshing model_versions roll-up metrics…');
+  const totalParlayLegs =
+    (safe.incomplete ? 0 : 3) + (value.incomplete ? 0 : 3) + (chaos.incomplete ? 0 : 3);
   let legsHit = 0;
   for (const leg of [...safe.legs, ...value.legs, ...chaos.legs]) {
     if (hrCountByPlayer.has(leg.player_id)) legsHit++;
   }
   const top10Ids = new Set(snapshots.filter((s) => s.rank <= 10).map((s) => s.player_id));
   const poolIds = new Set(snapshots.map((s) => s.player_id));
-  let inTop10 = 0, inPool = 0;
+  let inTop10 = 0,
+    inPool = 0;
   for (const pid of hrCountByPlayer.keys()) {
     if (top10Ids.has(pid)) inTop10++;
     if (poolIds.has(pid)) inPool++;
@@ -366,28 +504,53 @@ export async function captureDay(date: string, importanceWindows: number[]): Pro
       top10_coverage_rate: totalHr > 0 ? inTop10 / totalHr : null,
     })
     .eq('version', mv.version);
-  if (mvErr) console.warn(`[captureDay] model_versions update warning: ${mvErr.message}`);
+  if (mvErr) logWarn(`model_versions update: ${mvErr.message}`);
+  else logOk(`model_versions v${mv.version} roll-up updated`);
+
+  // ---- DONE ----
+  log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  log(`✅ SUCCESS — ${date} captured`);
+  log(`   model_version       = v${mv.version}`);
+  log(`   snapshot rows       = ${snapshots.length}`);
+  log(`   distinct HR hitters = ${hrCountByPlayer.size}`);
+  log(`   phantom FN rows     = ${phantomCount}`);
+  log(`   predictions written = ${totalUpserted} (DB now has ${postCount ?? '?'} for this date+version)`);
+  log(`   classification      = TP=${tp} FP=${fp} FN=${fn} TN=${tn}`);
+  log(`   importance written  = ${importanceWritten} rows`);
+  log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
   return {
     date,
     model_version: mv.version,
-    predictions_written: upsertRows.length,
-    tp, fp, fn, tn,
+    predictions_written: totalUpserted,
+    tp,
+    fp,
+    fn,
+    tn,
     unranked_hr_hitters: phantomCount,
     importance_rows_written: importanceWritten,
+    importance_by_window: importanceByWindow,
+    predictions_verified: { before: preCount ?? 0, after: postCount ?? 0 },
+    feature_importance_verified: fiCount ?? 0,
   };
 }
 
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const result = await captureDay(args.date, args.importanceWindows);
-  console.log('[captureDay] result:', JSON.stringify(result, null, 2));
+  try {
+    const args = parseArgs(process.argv.slice(2));
+    const result = await captureDay(args.date, args.importanceWindows);
+    console.log('[captureDay] result JSON:');
+    console.log(JSON.stringify(result, null, 2));
+    process.exit(0);
+  } catch (err) {
+    logErr(`FAILED: ${err instanceof Error ? err.message : String(err)}`);
+    if (err instanceof Error && err.stack) console.error(err.stack);
+    process.exit(1);
+  }
 }
 
-// Only invoke main when run directly (allows import for cron orchestrator).
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((err) => {
-    console.error('[captureDay] FAILED:', err);
-    process.exit(1);
-  });
-}
+// Always run main when this file is the CLI entry. The previous version
+// gated on `import.meta.url === \`file://\${process.argv[1]}\`` which
+// silently failed for paths with spaces (URL-encoded vs raw mismatch).
+// Since this script has no programmatic importers, just always run it.
+main();
