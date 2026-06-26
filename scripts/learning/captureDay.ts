@@ -24,6 +24,7 @@
  *   npm run learning:capture -- --window 30        # also refresh 30d importance
  */
 import 'dotenv/config';
+import { fileURLToPath } from 'node:url';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { mlbToday, addDays as mlbAddDays } from '../lib/mlbDate.js';
 import {
@@ -549,8 +550,14 @@ async function main() {
   }
 }
 
-// Always run main when this file is the CLI entry. The previous version
-// gated on `import.meta.url === \`file://\${process.argv[1]}\`` which
-// silently failed for paths with spaces (URL-encoded vs raw mismatch).
-// Since this script has no programmatic importers, just always run it.
-main();
+// Entry guard — only run main() when this file IS the CLI entry, so that
+// captureRange.ts (and any future programmatic caller) can import
+// captureDay() without auto-running this script's CLI logic.
+//
+// The previous version used `import.meta.url === \`file://\${process.argv[1]}\``
+// which silently failed for paths with spaces (URL-encoded vs raw mismatch).
+// fileURLToPath() decodes %20 back to a literal space, matching argv[1].
+const __filename = fileURLToPath(import.meta.url);
+if (__filename === process.argv[1]) {
+  main();
+}

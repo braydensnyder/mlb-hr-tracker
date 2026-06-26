@@ -242,20 +242,26 @@ export default function LearningDashboard() {
             <div className="ld-panel" style={{ marginTop: 12, borderLeft: '3px solid #ffd28c' }}>
               <h3 style={{ margin: 0, fontSize: 14 }}>🗓 Missing in window ({missingDates.length})</h3>
               <p className="subtle" style={{ fontSize: 11, marginTop: 2 }}>
-                Days inside the {windowDays}-day window with no captures. Run the commands below to
-                backfill (one date per command):
+                Days inside the {windowDays}-day window with no captures. Backfill the whole range in
+                one command (continues past errors, skips already-captured dates):
+              </p>
+              <pre className="ld-code">
+{`npm run learning:capture-range -- --from ${missingDates[missingDates.length - 1]} --to ${missingDates[0]} --skip-existing`}
+              </pre>
+              <p className="subtle" style={{ fontSize: 11, marginTop: 6 }}>
+                Or, one date at a time:
               </p>
               <pre className="ld-code">
                 {missingDates
-                  .slice(0, 30)
+                  .slice(0, 10)
                   .map((d) => `npm run learning:capture -- ${d}`)
                   .join('\n')}
-                {missingDates.length > 30 ? `\n# … and ${missingDates.length - 30} more` : ''}
+                {missingDates.length > 10 ? `\n# … and ${missingDates.length - 10} more` : ''}
               </pre>
               <p className="subtle" style={{ fontSize: 10.5, marginTop: 6 }}>
-                Each capture takes ~2-5s. Watch the script output — if you see "✅ SUCCESS" the row count is
-                verified post-write. If you see no output at all, you're on the old captureDay.ts that silently
-                exited; pull the latest.
+                Each capture takes ~2-5s. Watch the script output — if you see "✅ SUCCESS" the row count
+                is verified post-write. The range script prints a final aggregate summary so you can spot any
+                failed dates without scrolling.
               </p>
             </div>
           )}

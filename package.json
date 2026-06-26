@@ -38,6 +38,7 @@
     "backfill:season": "tsx scripts/runBackfillSeason.ts",
     "learning:capture": "tsx scripts/learning/captureDay.ts",
     "learning:capture:yesterday": "tsx scripts/learning/captureDay.ts yesterday",
+    "learning:capture-range": "tsx scripts/learning/captureRange.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json"
   },
   "dependencies": {
