@@ -559,3 +559,129 @@ export async function fetchWeatherCoverage(date: string): Promise<WeatherCoverag
     lastWeatherUpdatedAt: latest,
   };
 }
+
+// =============================================================================
+//  Learning Engine fetchers (migration 013)
+// =============================================================================
+
+export interface ModelVersionRow {
+  version: number;
+  name: string;
+  created_at: string;
+  weights_json: Record<string, unknown>;
+  notes: string | null;
+  active: boolean;
+  parlays_built: number | null;
+  full_3of3_hits: number | null;
+  partial_2of3_hits: number | null;
+  per_leg_hit_rate: number | null;
+  pool_coverage_rate: number | null;
+  top10_coverage_rate: number | null;
+  last_evaluated_for: string | null;
+}
+
+export interface LearningPredictionRow {
+  id: number;
+  target_date: string;
+  player_id: number;
+  model_version: number;
+  player_name: string;
+  team: string;
+  opponent: string | null;
+  game_pk: number | null;
+  rank: number | null;
+  heat_score: number | null;
+  model_prob: number | null;
+  reason: string | null;
+  signals_json: Record<string, boolean>;
+  in_safe: boolean;
+  in_value: boolean;
+  in_chaos: boolean;
+  homered: boolean | null;
+  hr_count: number | null;
+  classification: 'TP' | 'FP' | 'FN' | 'TN' | null;
+  captured_at: string | null;
+}
+
+export interface FeatureImportanceRowDB {
+  id: number;
+  model_version: number;
+  window_days: number;
+  computed_for: string;
+  signal_key: string;
+  signal_label: string;
+  n_present: number;
+  hits_present: number;
+  rate_present: number;
+  n_absent: number;
+  hits_absent: number;
+  rate_absent: number;
+  lift: number;
+  importance_score: number;
+  sample_quality: 'high' | 'medium' | 'low';
+  created_at: string;
+}
+
+/** All model versions, newest first. */
+export async function fetchModelVersions(): Promise<ModelVersionRow[]> {
+  const { data, error } = await supabase
+    .from('model_versions')
+    .select('*')
+    .order('version', { ascending: false });
+  if (error) {
+    if (/does not exist|schema cache/i.test(error.message)) return [];
+    throw new Error(error.message);
+  }
+  return (data ?? []) as ModelVersionRow[];
+}
+
+/** Recent learning_predictions for a window. */
+export async function fetchLearningPredictions(opts: {
+  from: string; to: string; model_version?: number;
+}): Promise<LearningPredictionRow[]> {
+  const PAGE_SIZE = 1000;
+  const all: LearningPredictionRow[] = [];
+  for (let page = 0; page < 30; page++) {
+    let q = supabase
+      .from('learning_predictions')
+      .select('*')
+      .gte('target_date', opts.from)
+      .lte('target_date', opts.to)
+      .order('target_date', { ascending: false })
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (opts.model_version != null) q = q.eq('model_version', opts.model_version);
+    const { data, error } = await q;
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return [];
+      throw new Error(error.message);
+    }
+    const rows = (data ?? []) as LearningPredictionRow[];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+  return all;
+}
+
+/** Most-recent feature_importance row per signal_key for a window. */
+export async function fetchFeatureImportance(opts: {
+  model_version: number; window_days: number;
+}): Promise<FeatureImportanceRowDB[]> {
+  const { data, error } = await supabase
+    .from('feature_importance')
+    .select('*')
+    .eq('model_version', opts.model_version)
+    .eq('window_days', opts.window_days)
+    .order('computed_for', { ascending: false })
+    .order('importance_score', { ascending: false })
+    .limit(200);
+  if (error) {
+    if (/does not exist|schema cache/i.test(error.message)) return [];
+    throw new Error(error.message);
+  }
+  const rows = (data ?? []) as FeatureImportanceRowDB[];
+  if (rows.length === 0) return [];
+  // Filter to most-recent computed_for (multiple windows may share the same
+  // anchor; this query already filtered window_days, so they're all the same date).
+  const mostRecent = rows[0].computed_for;
+  return rows.filter((r) => r.computed_for === mostRecent);
+}

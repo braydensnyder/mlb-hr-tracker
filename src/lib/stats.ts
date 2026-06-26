@@ -7283,3 +7283,311 @@ export const PARLAY_STYLE_LABELS = PARLAY_STYLE_LABEL;
 export const PARLAY_STYLE_DESCRIPTIONS = PARLAY_STYLE_DESCRIPTION;
 export const PARLAY_MISS_LABELS = PARLAY_MISS_LABEL;
 export const PARLAY_MISS_CATEGORIES = PARLAY_MISS_CATEGORY;
+
+// =============================================================================
+//  Learning Engine — Phase 1 feedback loop + Phase 2 feature importance
+// -----------------------------------------------------------------------------
+//  Pure helpers for the persistent feedback loop. The DB tables that store
+//  this data live in supabase/migrations/013_learning_engine.sql. These
+//  functions are framework-agnostic — the same code runs in the browser
+//  (UI roll-ups) and in the Node capture script (writing rows).
+//
+//  Honesty rules:
+//    • Classification is a BINARY rule — predicted-positive = rank ≤
+//      PRED_RANK_FLOOR, predicted-negative = anything else. We don't try
+//      to be clever; the user can adjust the floor downstream.
+//    • Importance scores are absolute Cohen's h, capped at sample_quality
+//      thresholds. Tiny-sample features are flagged 'low' rather than
+//      treated as authoritative.
+//    • Surfacing only. Nothing mutates HEAT_SCORE_WEIGHTS — that requires
+//      the user explicitly promoting a candidate weight set.
+// =============================================================================
+
+/** Binary classification of a single (player-day, outcome) row. */
+export type PredictionClass = 'TP' | 'FP' | 'FN' | 'TN';
+
+/** Predicted-positive cutoff. Rank ≤ this is "model said yes." */
+export const PRED_RANK_FLOOR = 50;
+
+const PREDICTION_LABEL: Record<PredictionClass, string> = {
+  TP: 'True positive',
+  FP: 'False positive',
+  FN: 'False negative',
+  TN: 'True negative',
+};
+export const PREDICTION_LABELS = PREDICTION_LABEL;
+
+/**
+ * Classify a single prediction row. A "positive" prediction means the
+ * model ranked the player in the actionable top-N pool (≤ PRED_RANK_FLOOR).
+ */
+export function classifyPrediction(
+  rank: number | null | undefined,
+  homered: boolean,
+  floor: number = PRED_RANK_FLOOR,
+): PredictionClass {
+  const predicted_positive = rank != null && rank <= floor;
+  if (predicted_positive && homered) return 'TP';
+  if (predicted_positive && !homered) return 'FP';
+  if (!predicted_positive && homered) return 'FN';
+  return 'TN';
+}
+
+/** Classification roll-up for a window. */
+export interface ClassificationCounts {
+  TP: number;
+  FP: number;
+  FN: number;
+  TN: number;
+  total: number;
+  /** TP / (TP + FN) — of all actual HRs, what fraction did we predict? */
+  recall: number;
+  /** TP / (TP + FP) — of all our predicted picks, what fraction homered? */
+  precision: number;
+  /** (TP + TN) / total — overall classification accuracy. */
+  accuracy: number;
+  /** 2 * precision * recall / (precision + recall) — single quality number. */
+  f1: number;
+}
+
+export function rollupClassifications(rows: Array<{ classification: PredictionClass }>): ClassificationCounts {
+  let TP = 0, FP = 0, FN = 0, TN = 0;
+  for (const r of rows) {
+    if (r.classification === 'TP') TP++;
+    else if (r.classification === 'FP') FP++;
+    else if (r.classification === 'FN') FN++;
+    else if (r.classification === 'TN') TN++;
+  }
+  const total = TP + FP + FN + TN;
+  const recall = TP + FN > 0 ? TP / (TP + FN) : 0;
+  const precision = TP + FP > 0 ? TP / (TP + FP) : 0;
+  const accuracy = total > 0 ? (TP + TN) / total : 0;
+  const f1 = precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
+  return { TP, FP, FN, TN, total, recall, precision, accuracy, f1 };
+}
+
+// -----------------------------------------------------------------------------
+//  Feature Importance — per-signal correlation with HR outcomes
+// -----------------------------------------------------------------------------
+
+/** One row consumed by the feature-importance computer. */
+export interface LearningRowForImportance {
+  signals_json: Record<string, boolean>;
+  homered: boolean;
+}
+
+export interface FeatureImportanceRow {
+  signal_key: SignalKey;
+  signal_label: string;
+  n_present: number;
+  hits_present: number;
+  rate_present: number;
+  n_absent: number;
+  hits_absent: number;
+  rate_absent: number;
+  /** rate_present / rate_absent. 1.0 = no edge. */
+  lift: number;
+  /** Absolute Cohen's h between rate_present and rate_absent. 0 = no effect,
+   *  values approaching π = maximal effect. Used as a single importance number. */
+  importance_score: number;
+  sample_quality: 'high' | 'medium' | 'low';
+}
+
+export interface FeatureImportanceResult {
+  anchor: string;
+  window_days: number;
+  total_player_days: number;
+  total_hrs: number;
+  baseline_rate: number;
+  rows: FeatureImportanceRow[];
+  /** Sorted by importance desc; top 3 by lift > 1. */
+  most_predictive_positive: FeatureImportanceRow[];
+  /** Top 3 by lift < 1 (negative predictors). */
+  most_predictive_negative: FeatureImportanceRow[];
+}
+
+const FEATURE_SIGNAL_KEYS: SignalKey[] = [
+  'hr_pitcher', 'power_park', 'wind_out', 'wind_in', 'warm_weather',
+  'hot_l7d', 'hr_streak', 'platoon_edge', 'elite_power', 'mid_power',
+  'low_season_power', 'cold_batter', 'pitcher_dominant',
+];
+
+function sampleQualityForN(n: number): 'high' | 'medium' | 'low' {
+  if (n >= 100) return 'high';
+  if (n >= 30) return 'medium';
+  return 'low';
+}
+
+/** Absolute Cohen's h — a standard effect-size metric for two proportions. */
+function cohensH(p1: number, p2: number): number {
+  const phi = (p: number) => 2 * Math.asin(Math.sqrt(Math.max(0, Math.min(1, p))));
+  return Math.abs(phi(p1) - phi(p2));
+}
+
+/**
+ * Compute per-signal importance over a window of learning predictions.
+ * Each input row contributes one player-day; signals_json is the boolean
+ * map of which chips fired on that snapshot.
+ */
+export function computeFeatureImportance(
+  rows: LearningRowForImportance[],
+  anchor: string,
+  windowDays: number,
+): FeatureImportanceResult {
+  const totalN = rows.length;
+  const totalHr = rows.reduce((s, r) => s + (r.homered ? 1 : 0), 0);
+  const baseline = totalN > 0 ? totalHr / totalN : 0;
+
+  const out: FeatureImportanceRow[] = [];
+  for (const k of FEATURE_SIGNAL_KEYS) {
+    let nPres = 0, hPres = 0, nAbs = 0, hAbs = 0;
+    for (const r of rows) {
+      const has = !!r.signals_json[k];
+      if (has) { nPres++; if (r.homered) hPres++; }
+      else { nAbs++; if (r.homered) hAbs++; }
+    }
+    const rPres = nPres > 0 ? hPres / nPres : 0;
+    const rAbs = nAbs > 0 ? hAbs / nAbs : 0;
+    out.push({
+      signal_key: k,
+      signal_label: SIGNAL_LABELS[k],
+      n_present: nPres,
+      hits_present: hPres,
+      rate_present: rPres,
+      n_absent: nAbs,
+      hits_absent: hAbs,
+      rate_absent: rAbs,
+      lift: rAbs > 0 ? rPres / rAbs : 0,
+      importance_score: cohensH(rPres, rAbs),
+      sample_quality: sampleQualityForN(nPres),
+    });
+  }
+
+  const sorted = out.slice().sort((a, b) => b.importance_score - a.importance_score);
+  const positives = sorted.filter((r) => r.lift > 1 && r.n_present >= 20).slice(0, 5);
+  const negatives = sorted.filter((r) => r.lift < 1 && r.n_present >= 20).slice(0, 5);
+
+  return {
+    anchor, window_days: windowDays,
+    total_player_days: totalN,
+    total_hrs: totalHr,
+    baseline_rate: baseline,
+    rows: sorted,
+    most_predictive_positive: positives,
+    most_predictive_negative: negatives,
+  };
+}
+
+// -----------------------------------------------------------------------------
+//  Building a learning-prediction record from a snapshot + outcome
+// -----------------------------------------------------------------------------
+
+/** Shape that gets written to the learning_predictions DB table. */
+export interface LearningPredictionRecord {
+  target_date: string;
+  player_id: number;
+  model_version: number;
+  player_name: string;
+  team: string;
+  opponent: string | null;
+  game_pk: number | null;
+  rank: number | null;
+  heat_score: number | null;
+  model_prob: number | null;
+  reason: string | null;
+  signals_json: Record<string, boolean>;
+  in_safe: boolean;
+  in_value: boolean;
+  in_chaos: boolean;
+  homered: boolean | null;
+  hr_count: number | null;
+  classification: PredictionClass | null;
+}
+
+/** Build a single learning-prediction record from a saved snapshot row +
+ *  the parlay sets it appeared in + the actual HR outcome. */
+export function buildLearningPredictionRecord(opts: {
+  snapshot: RevAnalysisSnapshotRow;
+  model_version: number;
+  opponent: string | null;
+  game_pk: number | null;
+  in_safe: boolean;
+  in_value: boolean;
+  in_chaos: boolean;
+  homered: boolean;
+  hr_count: number;
+}): LearningPredictionRecord {
+  const signals = parseSignalsFromReason(opts.snapshot.reason);
+  const signalsObj: Record<string, boolean> = {};
+  for (const k of FEATURE_SIGNAL_KEYS) signalsObj[k] = signals.has(k);
+  const heat = opts.snapshot.heat_score;
+  const modelProb = heatToProb(heat);
+  return {
+    target_date: opts.snapshot.target_date,
+    player_id: opts.snapshot.player_id,
+    model_version: opts.model_version,
+    player_name: opts.snapshot.player_name ?? `#${opts.snapshot.player_id}`,
+    team: opts.snapshot.team ?? '',
+    opponent: opts.opponent,
+    game_pk: opts.game_pk,
+    rank: opts.snapshot.rank,
+    heat_score: heat,
+    model_prob: modelProb,
+    reason: opts.snapshot.reason,
+    signals_json: signalsObj,
+    in_safe: opts.in_safe,
+    in_value: opts.in_value,
+    in_chaos: opts.in_chaos,
+    homered: opts.homered,
+    hr_count: opts.hr_count,
+    classification: classifyPrediction(opts.snapshot.rank, opts.homered),
+  };
+}
+
+// -----------------------------------------------------------------------------
+//  Model version metrics — roll-up filled by the capture script
+// -----------------------------------------------------------------------------
+
+export interface ModelVersionMetrics {
+  parlays_built: number;
+  full_3of3_hits: number;
+  partial_2of3_hits: number;
+  per_leg_hit_rate: number;
+  pool_coverage_rate: number;
+  top10_coverage_rate: number;
+}
+
+/** Compute version-level metrics from a backtest result + coverage. */
+export function computeModelVersionMetrics(
+  backtest: ParlayBacktestResult,
+  coverage: CoverageScore,
+): ModelVersionMetrics {
+  const totalLegs =
+    backtest.safe_summary.total_legs +
+    backtest.value_summary.total_legs +
+    backtest.chaos_summary.total_legs;
+  const totalLegsHit =
+    backtest.safe_summary.legs_hit +
+    backtest.value_summary.legs_hit +
+    backtest.chaos_summary.legs_hit;
+  const parlaysBuilt =
+    backtest.safe_summary.parlays_built +
+    backtest.value_summary.parlays_built +
+    backtest.chaos_summary.parlays_built;
+  const fullHits =
+    backtest.safe_summary.full_hits +
+    backtest.value_summary.full_hits +
+    backtest.chaos_summary.full_hits;
+  const partialHits =
+    backtest.safe_summary.partial_2of3_hits +
+    backtest.value_summary.partial_2of3_hits +
+    backtest.chaos_summary.partial_2of3_hits;
+  return {
+    parlays_built: parlaysBuilt,
+    full_3of3_hits: fullHits,
+    partial_2of3_hits: partialHits,
+    per_leg_hit_rate: totalLegs > 0 ? totalLegsHit / totalLegs : 0,
+    pool_coverage_rate: coverage.pool_coverage_rate,
+    top10_coverage_rate: coverage.top10_coverage_rate,
+  };
+}

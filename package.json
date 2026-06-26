@@ -36,6 +36,8 @@
     "process:yesterday": "tsx scripts/runProcessDate.ts yesterday",
     "process:today": "tsx scripts/runProcessDate.ts today",
     "backfill:season": "tsx scripts/runBackfillSeason.ts",
+    "learning:capture": "tsx scripts/learning/captureDay.ts",
+    "learning:capture:yesterday": "tsx scripts/learning/captureDay.ts yesterday",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json"
   },
   "dependencies": {

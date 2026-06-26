@@ -24,7 +24,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import {
   supabase, fetchPlayerIndex, fetchPitcherFormIndex, fetchOddsSnapshots,
+  fetchModelVersions, fetchLearningPredictions, fetchFeatureImportance,
   type GameRow, type HomeRunRow, type HrTargetSnapshotRow,
+  type ModelVersionRow, type LearningPredictionRow, type FeatureImportanceRowDB,
 } from '../lib/supabase';
 import { mlbToday } from '../lib/mlbDate';
 import { useRevalidationKey } from '../lib/useRevalidationKey';
@@ -35,6 +37,7 @@ import {
   backtestParlays,
   computeCoverageScore,
   computeHrTargets,
+  rollupClassifications,
   generateParlays,
   hrTargetToParlayCandidate,
   pitcherHrLeaderboard,
@@ -142,6 +145,13 @@ export default function ParlayLab() {
   const [backtest, setBacktest] = useState<ParlayBacktestResult | null>(null);
   const [missAnalysis, setMissAnalysis] = useState<ParlayMissAnalysis | null>(null);
   const [coverage, setCoverage] = useState<CoverageScore | null>(null);
+
+  // ---- Learning Engine state (migration 013) ----
+  const [modelVersions, setModelVersions] = useState<ModelVersionRow[]>([]);
+  const [learningPreds, setLearningPreds] = useState<LearningPredictionRow[]>([]);
+  const [featureImportance, setFeatureImportance] = useState<FeatureImportanceRowDB[]>([]);
+  const [learningLoading, setLearningLoading] = useState<boolean>(true);
+  const [learningWindow, setLearningWindow] = useState<7 | 14 | 30>(14);
 
   const [loading, setLoading] = useState(true);
   const [bktLoading, setBktLoading] = useState(true);
@@ -325,6 +335,43 @@ export default function ParlayLab() {
     return () => { cancelled = true; };
   }, [targetDate, refreshKey]);
 
+  // ---- Learning Engine fetch: model versions + predictions + feature importance ----
+  useEffect(() => {
+    if (!targetDate) return;
+    let cancelled = false;
+    setLearningLoading(true);
+    (async () => {
+      try {
+        const anchor = addDays(targetDate, -1);
+        const from = addDays(anchor, -(learningWindow - 1));
+        const versions = await fetchModelVersions();
+        if (cancelled) return;
+        setModelVersions(versions);
+        const active = versions.find((v) => v.active) ?? versions[0];
+        if (!active) {
+          setLearningPreds([]);
+          setFeatureImportance([]);
+          return;
+        }
+        const [preds, importance] = await Promise.all([
+          fetchLearningPredictions({ from, to: anchor, model_version: active.version }),
+          fetchFeatureImportance({ model_version: active.version, window_days: learningWindow }),
+        ]);
+        if (cancelled) return;
+        setLearningPreds(preds);
+        setFeatureImportance(importance);
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn('[lab] learning fetch failed:', e);
+        setLearningPreds([]);
+        setFeatureImportance([]);
+      } finally {
+        if (!cancelled) setLearningLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [targetDate, learningWindow, refreshKey]);
+
   // ---- Build today's candidate set ----
   const canonHrs = useMemo(() => applyCanonicalTeams(seasonHrs, playerIndex), [seasonHrs, playerIndex]);
   const elitePowerIds = useMemo(() => {
@@ -449,6 +496,14 @@ export default function ParlayLab() {
           {coverage && <CoveragePanel coverage={coverage} />}
           <BacktestDayTable backtest={backtest} asOf={asOf} />
           {missAnalysis && <MissAnalysisPanelV2 miss={missAnalysis} />}
+          <LearningEnginePanel
+            modelVersions={modelVersions}
+            predictions={learningPreds}
+            featureImportance={featureImportance}
+            loading={learningLoading}
+            windowDays={learningWindow}
+            onWindowChange={setLearningWindow}
+          />
         </>
       )}
 
@@ -963,6 +1018,205 @@ function pct(n: number, d = 1): string {
   return `${(n * 100).toFixed(d)}%`;
 }
 
+// =============================================================================
+//  Learning Engine Panel (migration 013)
+// =============================================================================
+
+function LearningEnginePanel({
+  modelVersions, predictions, featureImportance, loading, windowDays, onWindowChange,
+}: {
+  modelVersions: ModelVersionRow[];
+  predictions: LearningPredictionRow[];
+  featureImportance: FeatureImportanceRowDB[];
+  loading: boolean;
+  windowDays: 7 | 14 | 30;
+  onWindowChange: (w: 7 | 14 | 30) => void;
+}) {
+  // Migration not yet applied → empty state with instructions.
+  const migrationApplied = modelVersions.length > 0;
+  const captured = predictions.filter((p) => p.classification != null);
+  const classCounts = useMemo(
+    () => rollupClassifications(captured.map((p) => ({ classification: p.classification! }))),
+    [captured],
+  );
+  const sortedImportance = useMemo(
+    () => featureImportance.slice().sort((a, b) => b.importance_score - a.importance_score),
+    [featureImportance],
+  );
+
+  if (!loading && !migrationApplied) {
+    return (
+      <div className="lab-panel lab-learning" style={{ marginTop: 14 }}>
+        <h3 style={{ margin: 0, fontSize: 15 }}>🧠 Learning Engine</h3>
+        <p className="subtle" style={{ fontSize: 12, marginTop: 4, lineHeight: 1.5 }}>
+          The learning engine tracks every prediction's outcome and surfaces feature importance
+          over time. <strong>Migration 013 hasn't been applied yet.</strong>
+        </p>
+        <pre className="lab-code-block">
+{`-- In Supabase SQL editor, run:
+supabase/migrations/013_learning_engine.sql
+
+-- Then, after each completed slate:
+npm run learning:capture -- yesterday`}
+        </pre>
+        <p className="subtle" style={{ fontSize: 11, marginTop: 6 }}>
+          Once data is captured, this panel will show TP/FP/FN/TN counts, precision/recall, feature
+          importance rankings, and model-version performance over time.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="lab-panel lab-learning" style={{ marginTop: 14 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+        <h3 style={{ margin: 0, fontSize: 15 }}>🧠 Learning Engine</h3>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 11, opacity: 0.7 }}>Window:</span>
+          {([7, 14, 30] as const).map((w) => (
+            <button
+              key={w}
+              type="button"
+              onClick={() => onWindowChange(w)}
+              style={{
+                background: windowDays === w ? '#2d3a52' : 'var(--panel-2, #14171f)',
+                border: `1px solid ${windowDays === w ? '#4a6fa5' : 'var(--border, #232732)'}`,
+                color: windowDays === w ? '#fff' : '#cfe',
+                padding: '3px 9px', borderRadius: 6, fontSize: 11, cursor: 'pointer',
+              }}
+            >
+              {w}d
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <p className="subtle" style={{ fontSize: 11, marginTop: 4, lineHeight: 1.5 }}>
+        Persistent feedback loop. Each captured day adds rows to <code>learning_predictions</code>,
+        then refreshes <code>feature_importance</code>. Surfacing only — nothing here auto-changes the
+        live weights.
+      </p>
+
+      {loading ? (
+        <div className="subtle" style={{ fontSize: 12, marginTop: 8 }}>Loading…</div>
+      ) : (
+        <>
+          {/* Classification breakdown */}
+          <div className="lab-class-grid">
+            <ClassTile label="True Positives" value={classCounts.TP} color="#6bd482" desc="Top-50 picks that homered" />
+            <ClassTile label="False Positives" value={classCounts.FP} color="#ffb86c" desc="Top-50 picks that didn't" />
+            <ClassTile label="False Negatives" value={classCounts.FN} color="#e07a7a" desc="Outside Top-50 but homered" />
+            <ClassTile label="True Negatives" value={classCounts.TN} color="#aab1c0" desc="Outside Top-50, no HR" />
+          </div>
+
+          <div className="lab-class-stats">
+            <div><span className="lab-class-stat-label">Precision</span><span className="lab-class-stat-value">{pct(classCounts.precision)}</span></div>
+            <div><span className="lab-class-stat-label">Recall</span><span className="lab-class-stat-value">{pct(classCounts.recall)}</span></div>
+            <div><span className="lab-class-stat-label">F1</span><span className="lab-class-stat-value">{pct(classCounts.f1)}</span></div>
+            <div><span className="lab-class-stat-label">Accuracy</span><span className="lab-class-stat-value">{pct(classCounts.accuracy)}</span></div>
+            <div className="subtle" style={{ fontSize: 11, alignSelf: 'center' }}>
+              n = {classCounts.total} player-days captured
+            </div>
+          </div>
+
+          {/* Feature importance */}
+          <h4 style={{ margin: '14px 0 4px', fontSize: 13 }}>📐 Feature Importance ({windowDays}d)</h4>
+          {sortedImportance.length === 0 ? (
+            <p className="subtle" style={{ fontSize: 12 }}>
+              No feature importance computed yet for {windowDays}d window. Run <code>npm run learning:capture -- yesterday</code> to refresh.
+            </p>
+          ) : (
+            <div className="diag-table-wrap" style={{ marginTop: 4 }}>
+              <table className="lab-fi-table">
+                <thead>
+                  <tr>
+                    <th>Signal</th>
+                    <th className="num">Importance</th>
+                    <th className="num">Lift</th>
+                    <th className="num">Present rate</th>
+                    <th className="num">Absent rate</th>
+                    <th className="num">N present</th>
+                    <th>Sample</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedImportance.map((r) => (
+                    <tr key={r.signal_key}>
+                      <td><strong>{r.signal_label}</strong></td>
+                      <td className="num"><strong>{r.importance_score.toFixed(3)}</strong></td>
+                      <td className={`num ${r.lift > 1.15 ? 'lab-pos' : r.lift < 0.85 ? 'lab-neg' : ''}`}>
+                        {r.lift.toFixed(2)}×
+                      </td>
+                      <td className="num">{pct(r.rate_present)}</td>
+                      <td className="num">{pct(r.rate_absent)}</td>
+                      <td className="num">{r.n_present}</td>
+                      <td>
+                        <span className={`lab-quality lab-quality--${r.sample_quality}`}>{r.sample_quality}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <p className="subtle" style={{ fontSize: 10.5, marginTop: 6 }}>
+                Importance = absolute Cohen's h (0 = no effect; ≥ 0.20 small; ≥ 0.50 medium; ≥ 0.80 large).
+                Sorted by importance desc. Tiny-sample features are flagged "low" — treat as directional only.
+              </p>
+            </div>
+          )}
+
+          {/* Model version register */}
+          <h4 style={{ margin: '14px 0 4px', fontSize: 13 }}>🧬 Model Versions</h4>
+          <div className="diag-table-wrap">
+            <table className="lab-mv-table">
+              <thead>
+                <tr>
+                  <th>Version</th>
+                  <th>Name</th>
+                  <th>Created</th>
+                  <th className="num">Per-leg</th>
+                  <th className="num">Pool cov.</th>
+                  <th className="num">Top-10 cov.</th>
+                  <th>Active</th>
+                </tr>
+              </thead>
+              <tbody>
+                {modelVersions.map((v) => (
+                  <tr key={v.version}>
+                    <td><strong>v{v.version}</strong></td>
+                    <td>{v.name}</td>
+                    <td>{v.created_at.slice(0, 10)}</td>
+                    <td className="num">{v.per_leg_hit_rate != null ? pct(v.per_leg_hit_rate, 1) : '—'}</td>
+                    <td className="num">{v.pool_coverage_rate != null ? pct(v.pool_coverage_rate, 1) : '—'}</td>
+                    <td className="num">{v.top10_coverage_rate != null ? pct(v.top10_coverage_rate, 1) : '—'}</td>
+                    <td>
+                      {v.active && <span className="lab-active-chip">active</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="subtle" style={{ fontSize: 10.5, marginTop: 6, lineHeight: 1.5 }}>
+            History is append-only — no version is ever overwritten. <strong>Phase 3 (auto weight optimization)</strong> and
+            <strong> Phase 5 (auto-deploy)</strong> are deferred — Phase 3 needs a schema change to save subscores per snapshot, and Phase 5
+            wants approval gating so the live model never auto-updates from one bad sample. Both are tractable follow-ups.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ClassTile({ label, value, color, desc }: { label: string; value: number; color: string; desc: string }) {
+  return (
+    <div className="lab-class-tile" style={{ borderLeft: `4px solid ${color}` }}>
+      <div className="lab-class-label">{label}</div>
+      <div className="lab-class-value" style={{ color }}>{value.toLocaleString()}</div>
+      <div className="lab-class-desc">{desc}</div>
+    </div>
+  );
+}
+
 function LabStyles() {
   return (
     <style>{`
@@ -1125,6 +1379,59 @@ function LabStyles() {
       @media (max-width: 720px) {
         .lab-cat-grid { grid-template-columns: 1fr; }
         .lab-cat-cols { grid-template-columns: 1fr; }
+      }
+
+      /* Learning Engine panel */
+      .lab-learning { border-left: 3px solid #c084fc; }
+      .lab-code-block {
+        background: #0c0e14; border: 1px solid #1f2330; border-radius: 6px;
+        padding: 8px 12px; font-size: 11.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        margin: 6px 0; overflow-x: auto; line-height: 1.5;
+      }
+      .lab-class-grid {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 6px; margin-top: 8px;
+      }
+      .lab-class-tile {
+        background: var(--panel-2, #14171f);
+        border: 1px solid var(--border, #232732);
+        border-radius: 8px;
+        padding: 6px 10px;
+      }
+      .lab-class-label { font-size: 10.5px; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.05em; }
+      .lab-class-value { font-size: 22px; font-weight: 700; margin-top: 2px; }
+      .lab-class-desc  { font-size: 10px; opacity: 0.6; margin-top: 1px; }
+
+      .lab-class-stats {
+        display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+        margin-top: 8px; padding: 6px 10px;
+        background: var(--panel-2, #14171f);
+        border: 1px solid var(--border, #232732);
+        border-radius: 6px;
+      }
+      .lab-class-stats > div { display: flex; flex-direction: column; }
+      .lab-class-stat-label { font-size: 10px; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.05em; }
+      .lab-class-stat-value { font-size: 16px; font-weight: 700; color: #cfe; }
+
+      .lab-fi-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      .lab-fi-table th, .lab-fi-table td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border, #1f2330); white-space: nowrap; }
+      .lab-fi-table th.num, .lab-fi-table td.num { text-align: right; }
+      .lab-fi-table tbody tr:hover { background: rgba(255,255,255,0.02); }
+      .lab-quality {
+        display: inline-block; padding: 0 6px; border-radius: 999px;
+        font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+      }
+      .lab-quality--high   { background: rgba(64,200,120,0.20); color: #6bd482; }
+      .lab-quality--medium { background: rgba(255,210,140,0.20); color: #ffd28c; }
+      .lab-quality--low    { background: rgba(170,177,192,0.15); color: #aab1c0; }
+
+      .lab-mv-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      .lab-mv-table th, .lab-mv-table td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border, #1f2330); white-space: nowrap; }
+      .lab-mv-table th.num, .lab-mv-table td.num { text-align: right; }
+      .lab-active-chip {
+        display: inline-block; padding: 1px 8px; border-radius: 999px;
+        background: rgba(192,132,252,0.18); color: #c084fc; font-size: 10px; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 0.04em;
       }
     `}</style>
   );
