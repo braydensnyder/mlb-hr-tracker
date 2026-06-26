@@ -5,6 +5,7 @@ import Matchups from './pages/Matchups';
 import HrTargets from './pages/HrTargets';
 import TonightsCard from './pages/TonightsCard';
 import TeamBoard from './pages/TeamBoard';
+import ParlayLab from './pages/ParlayLab';
 import Backtest from './pages/Backtest';
 import Odds from './pages/Odds';
 import ClubhouseMenu from './components/ClubhouseMenu';
@@ -38,6 +39,7 @@ export default function App() {
         <Route path="/matchups" element={<Matchups />} />
         <Route path="/card" element={<TonightsCard />} />
         <Route path="/teams" element={<TeamBoard />} />
+        <Route path="/lab" element={<ParlayLab />} />
         <Route path="/targets" element={<HrTargets />} />
         <Route path="/odds" element={<Odds />} />
         <Route path="/backtest" element={<Backtest />} />

@@ -6352,3 +6352,698 @@ export function computeBackToBackEdge(
     diagnosis,
   };
 }
+
+// =============================================================================
+//  Parlay Lab — generation rules + backtest (task #231-#235)
+// -----------------------------------------------------------------------------
+//  Evolves the HR Tracker from a player-ranking tool into a parlay-rule lab.
+//  Three deterministic styles — Safe / Value / Chaos — each producing a
+//  3-leg parlay from a single day's snapshot + odds. The same functions
+//  run live (today) and historically (backtest), so a "rule that works"
+//  in backtest is the same code the user sees tonight.
+//
+//  STRICT honesty rules:
+//    • Generation is PURE and DETERMINISTIC. Same (snapshot, odds, date)
+//      always produces the same 3 legs. No random sampling. This is what
+//      makes the backtest valid.
+//    • Backtest uses ONLY the saved snapshot + saved odds for each
+//      historical date — pre-game data the model actually had. Never
+//      peeks at outcomes.
+//    • Surfacing only. Nothing here mutates HEAT_SCORE_WEIGHTS.
+// =============================================================================
+
+// Local sigmoid mirroring oddsMath — kept here so stats.ts has no UI
+// dependencies and the backtest is self-contained.
+const PARLAY_CURVE = { floor: 0.005, ceiling: 0.30, midpoint: 55, slope: 10 } as const;
+function heatToProb(heat: number): number {
+  const z = (heat - PARLAY_CURVE.midpoint) / PARLAY_CURVE.slope;
+  const s = 1 / (1 + Math.exp(-z));
+  return PARLAY_CURVE.floor + (PARLAY_CURVE.ceiling - PARLAY_CURVE.floor) * s;
+}
+function americanToDecimal(american: number): number {
+  return american > 0 ? american / 100 + 1 : 100 / Math.abs(american) + 1;
+}
+function americanToImplied(american: number): number {
+  return american > 0 ? 100 / (american + 100) : Math.abs(american) / (Math.abs(american) + 100);
+}
+function decimalToAmerican(decimal: number): number {
+  if (decimal >= 2) return Math.round((decimal - 1) * 100);
+  return Math.round(-100 / (decimal - 1));
+}
+
+/** Snapshot row + odds + signals — the unit the parlay rules consume. */
+export interface ParlayCandidate {
+  player_id: number;
+  player_name: string;
+  team: string;
+  rank: number;
+  heat_score: number;
+  game_pk?: number | null; // for game-diversity preference; optional in backtest
+  signals: Set<SignalKey>;
+  good_chip_count: number;
+  american_odds: number | null;
+  implied_prob: number | null;
+  model_prob: number;
+  edge: number | null;
+}
+
+export type ParlayStyle = 'safe' | 'value' | 'chaos';
+
+export interface ParlayLeg {
+  player_id: number;
+  player_name: string;
+  team: string;
+  heat_score: number;
+  american_odds: number | null;
+  implied_prob: number | null;
+  model_prob: number;
+  edge: number | null;
+}
+
+export interface Parlay {
+  style: ParlayStyle;
+  /** Empty if rules couldn't find 3 qualifying picks. */
+  legs: ParlayLeg[];
+  /** Parlay decimal odds = product of leg decimals (null if any leg has no odds). */
+  parlay_decimal: number | null;
+  parlay_american: number | null;
+  /** Implied probability of all 3 legs hitting = product of leg implied probs.
+   *  Null if any leg has no odds. */
+  parlay_implied: number | null;
+  /** Model's joint probability — product of leg model_probs. Always defined. */
+  parlay_model_prob: number;
+  /** Plain-English rule recap for the UI. */
+  rule_text: string;
+  /** True iff the rules couldn't fill all 3 legs. */
+  incomplete: boolean;
+}
+
+const PARLAY_STYLE_LABEL: Record<ParlayStyle, string> = {
+  safe: 'Safe',
+  value: 'Value',
+  chaos: 'Chaos',
+};
+const PARLAY_STYLE_DESCRIPTION: Record<ParlayStyle, string> = {
+  safe: 'Highest-confidence picks where the book agrees with the model.',
+  value: 'Strong model score with a positive edge over the book\'s price.',
+  chaos: 'Longshots with stacked upside signals — payout variance.',
+};
+
+/** Build a Parlay structure from 3 legs + the style. Pure formatting. */
+function assembleParlay(style: ParlayStyle, legs: ParlayLeg[], ruleText: string): Parlay {
+  if (legs.length < 3) {
+    return {
+      style, legs,
+      parlay_decimal: null, parlay_american: null, parlay_implied: null,
+      parlay_model_prob: legs.reduce((p, l) => p * l.model_prob, 1),
+      rule_text: ruleText, incomplete: true,
+    };
+  }
+  const haveAllOdds = legs.every((l) => l.american_odds != null);
+  let parlayDecimal: number | null = null;
+  let parlayAmerican: number | null = null;
+  let parlayImplied: number | null = null;
+  if (haveAllOdds) {
+    parlayDecimal = legs.reduce((p, l) => p * americanToDecimal(l.american_odds!), 1);
+    parlayAmerican = decimalToAmerican(parlayDecimal);
+    parlayImplied = legs.reduce((p, l) => p * (l.implied_prob ?? americanToImplied(l.american_odds!)), 1);
+  }
+  return {
+    style, legs,
+    parlay_decimal: parlayDecimal,
+    parlay_american: parlayAmerican,
+    parlay_implied: parlayImplied,
+    parlay_model_prob: legs.reduce((p, l) => p * l.model_prob, 1),
+    rule_text: ruleText,
+    incomplete: false,
+  };
+}
+
+function toLeg(c: ParlayCandidate): ParlayLeg {
+  return {
+    player_id: c.player_id, player_name: c.player_name, team: c.team,
+    heat_score: c.heat_score, american_odds: c.american_odds,
+    implied_prob: c.implied_prob, model_prob: c.model_prob, edge: c.edge,
+  };
+}
+
+/**
+ * Pick up to N qualifying candidates, preferring game-diversity. We do a
+ * greedy pass: take the strongest, then for the next pick, prefer one
+ * from a different game when the score is within `tie_band` of the
+ * absolute strongest remaining.
+ */
+function greedyPickWithGameDiversity(
+  ranked: ParlayCandidate[],
+  n: number,
+  scorer: (c: ParlayCandidate) => number,
+  tieBand: number,
+): ParlayCandidate[] {
+  const picked: ParlayCandidate[] = [];
+  const usedGames = new Set<number | null | undefined>();
+  const usedPlayers = new Set<number>();
+  const sortedByScore = ranked.slice().sort((a, b) => scorer(b) - scorer(a));
+  for (let pass = 0; pass < 2 && picked.length < n; pass++) {
+    for (const c of sortedByScore) {
+      if (picked.length >= n) break;
+      if (usedPlayers.has(c.player_id)) continue;
+      // First pass: enforce game diversity. Second pass: relax if we need legs.
+      if (pass === 0 && usedGames.has(c.game_pk)) {
+        // Allow same-game pick if its score is within tieBand of the best unpicked.
+        const bestUnpickedFromOtherGame = sortedByScore.find(
+          (x) => !usedPlayers.has(x.player_id) && !usedGames.has(x.game_pk),
+        );
+        if (bestUnpickedFromOtherGame && scorer(bestUnpickedFromOtherGame) >= scorer(c) - tieBand) {
+          continue;
+        }
+      }
+      picked.push(c);
+      usedPlayers.add(c.player_id);
+      usedGames.add(c.game_pk);
+    }
+  }
+  return picked;
+}
+
+/** Convert a HrTarget + odds row into a ParlayCandidate. Public so the
+ *  Parlay Lab page can pre-build candidates without re-deriving signals. */
+export function hrTargetToParlayCandidate(
+  t: HrTarget,
+  rank: number,
+  odds: { american_odds: number; implied_prob: number } | null,
+): ParlayCandidate {
+  const signals = new Set<SignalKey>();
+  for (const c of t.reason_chips) {
+    if (c.kind === 'hr_pitcher' || c.kind === 'pitcher_weak') signals.add('hr_pitcher');
+    if (c.kind === 'power_park' || c.kind === 'park') signals.add('power_park');
+    if (c.kind === 'wind_out') signals.add('wind_out');
+    if (c.kind === 'wind_in') signals.add('wind_in');
+    if (c.kind === 'warm') signals.add('warm_weather');
+    if (c.kind === 'hot7') signals.add('hot_l7d');
+    if (c.kind === 'platoon' || c.kind === 'hand') signals.add('platoon_edge');
+    if (c.kind === 'cold') signals.add('cold_batter');
+    if (c.kind === 'streak') signals.add('hr_streak');
+    if (c.kind === 'power' && /Elite/i.test(c.label)) signals.add('elite_power');
+    if (c.kind === 'power' && /Mid/i.test(c.label)) signals.add('mid_power');
+    if (c.kind === 'pitcher_dominant') signals.add('pitcher_dominant');
+  }
+  const modelProb = heatToProb(t.heat_score);
+  const implied = odds ? odds.implied_prob : null;
+  return {
+    player_id: t.player_id,
+    player_name: t.player_name,
+    team: t.team,
+    rank,
+    heat_score: t.heat_score,
+    signals,
+    good_chip_count: t.reason_chips.filter((c) => c.tone === 'good').length,
+    american_odds: odds ? odds.american_odds : null,
+    implied_prob: implied,
+    model_prob: modelProb,
+    edge: implied != null ? modelProb - implied : null,
+  };
+}
+
+/** Same conversion but from a saved snapshot row + cached odds. Used by
+ *  the backtest path where we have only the persisted data. */
+export function snapshotToParlayCandidate(
+  snap: RevAnalysisSnapshotRow,
+  odds: number | null,
+): ParlayCandidate {
+  const signals = parseSignalsFromReason(snap.reason);
+  const goodCount =
+    (signals.has('hr_pitcher') ? 1 : 0) +
+    (signals.has('power_park') ? 1 : 0) +
+    (signals.has('wind_out') ? 1 : 0) +
+    (signals.has('warm_weather') ? 1 : 0) +
+    (signals.has('hot_l7d') ? 1 : 0) +
+    (signals.has('platoon_edge') ? 1 : 0) +
+    (signals.has('elite_power') ? 1 : 0) +
+    (signals.has('mid_power') ? 1 : 0) +
+    (signals.has('hr_streak') ? 1 : 0);
+  const modelProb = heatToProb(snap.heat_score);
+  const implied = odds != null ? americanToImplied(odds) : null;
+  return {
+    player_id: snap.player_id,
+    player_name: snap.player_name ?? `#${snap.player_id}`,
+    team: snap.team ?? '',
+    rank: snap.rank,
+    heat_score: snap.heat_score,
+    signals,
+    good_chip_count: goodCount,
+    american_odds: odds,
+    implied_prob: implied,
+    model_prob: modelProb,
+    edge: implied != null ? modelProb - implied : null,
+  };
+}
+
+// -----------------------------------------------------------------------------
+//  Rule definitions — kept as constants so the UI can recap them honestly
+// -----------------------------------------------------------------------------
+
+const SAFE_HEAT_MIN = 55;
+const SAFE_ODDS_MAX = 400;
+const VALUE_HEAT_MIN = 50;
+const VALUE_ODDS_MIN = 250;
+const VALUE_ODDS_MAX = 600;
+const VALUE_EDGE_MIN = 0.02; // 2% positive edge
+const CHAOS_RANK_MAX = 80;
+const CHAOS_ODDS_MIN = 500;
+const CHAOS_CHIP_MIN = 2;
+
+/**
+ * Generate the three daily parlays (Safe / Value / Chaos) from a set of
+ * candidates for a single date. Pure + deterministic.
+ *
+ * Each style's rules are spelled out in the rule_text on the returned
+ * Parlay so the UI can show what fired and what didn't.
+ */
+export function generateParlays(candidates: ParlayCandidate[]): {
+  safe: Parlay; value: Parlay; chaos: Parlay;
+} {
+  // ---- Safe: heat ≥ 55, odds ≤ +400 (or no odds → fall back to heat alone)
+  const safeQual = candidates.filter((c) => {
+    if (c.heat_score < SAFE_HEAT_MIN) return false;
+    if (c.signals.has('cold_batter')) return false;
+    if (c.american_odds != null && c.american_odds > SAFE_ODDS_MAX) return false;
+    return true;
+  });
+  const safePicks = greedyPickWithGameDiversity(safeQual, 3, (c) => c.heat_score, 2);
+  const safe = assembleParlay(
+    'safe',
+    safePicks.map(toLeg),
+    `Heat ≥ ${SAFE_HEAT_MIN}, odds ≤ +${SAFE_ODDS_MAX}, no cold-batter penalty.`,
+  );
+
+  // ---- Value: heat ≥ 50, +250..+600, model edge over book ≥ 2 pct pts
+  const valueQual = candidates.filter((c) => {
+    if (c.american_odds == null || c.edge == null) return false;
+    if (c.heat_score < VALUE_HEAT_MIN) return false;
+    if (c.signals.has('cold_batter')) return false;
+    if (c.american_odds < VALUE_ODDS_MIN) return false;
+    if (c.american_odds > VALUE_ODDS_MAX) return false;
+    if (c.edge < VALUE_EDGE_MIN) return false;
+    return true;
+  });
+  const valuePicks = greedyPickWithGameDiversity(valueQual, 3, (c) => c.edge ?? 0, 0.01);
+  const value = assembleParlay(
+    'value',
+    valuePicks.map(toLeg),
+    `Heat ≥ ${VALUE_HEAT_MIN}, odds +${VALUE_ODDS_MIN} to +${VALUE_ODDS_MAX}, model edge ≥ ${(VALUE_EDGE_MIN * 100).toFixed(0)} pct pts.`,
+  );
+
+  // ---- Chaos: rank ≤ 80, odds ≥ +500, ≥ 2 good chips, not cold
+  const chaosQual = candidates.filter((c) => {
+    if (c.rank > CHAOS_RANK_MAX) return false;
+    if (c.american_odds == null || c.american_odds < CHAOS_ODDS_MIN) return false;
+    if (c.good_chip_count < CHAOS_CHIP_MIN) return false;
+    if (c.signals.has('cold_batter')) return false;
+    if (c.signals.has('pitcher_dominant')) return false;
+    return true;
+  });
+  const chaosScore = (c: ParlayCandidate) => c.good_chip_count * 10 + c.heat_score;
+  const chaosPicks = greedyPickWithGameDiversity(chaosQual, 3, chaosScore, 3);
+  const chaos = assembleParlay(
+    'chaos',
+    chaosPicks.map(toLeg),
+    `Rank ≤ ${CHAOS_RANK_MAX}, odds ≥ +${CHAOS_ODDS_MIN}, ≥ ${CHAOS_CHIP_MIN} good chips, no cold or dominant-pitcher penalty.`,
+  );
+
+  return { safe, value, chaos };
+}
+
+// -----------------------------------------------------------------------------
+//  Backtest
+// -----------------------------------------------------------------------------
+
+export interface ParlayDayResult {
+  date: string;
+  safe: { parlay: Parlay; leg_hits: boolean[]; legs_hit: number; full_hit: boolean; partial_2of3: boolean };
+  value: { parlay: Parlay; leg_hits: boolean[]; legs_hit: number; full_hit: boolean; partial_2of3: boolean };
+  chaos: { parlay: Parlay; leg_hits: boolean[]; legs_hit: number; full_hit: boolean; partial_2of3: boolean };
+}
+
+export interface ParlayStyleSummary {
+  style: ParlayStyle;
+  /** Days where the rules produced a complete 3-leg parlay. */
+  parlays_built: number;
+  /** Days where rules couldn't fill 3 legs. */
+  days_skipped: number;
+  full_hits: number;
+  partial_2of3_hits: number;
+  total_legs: number;
+  legs_hit: number;
+  full_hit_rate: number;
+  partial_2of3_rate: number;
+  per_leg_hit_rate: number;
+  /** Average parlay American odds, when payout data is available. */
+  avg_parlay_american: number | null;
+  /** Average payout on a $1 stake (counts misses as $0). */
+  avg_payout_per_dollar: number | null;
+}
+
+export interface ParlayBacktestResult {
+  anchor: string;
+  window_days: number;
+  days_counted: number;
+  days: ParlayDayResult[];
+  /** Per-style summary computed across all completed parlays in the window. */
+  safe_summary: ParlayStyleSummary;
+  value_summary: ParlayStyleSummary;
+  chaos_summary: ParlayStyleSummary;
+  /** Rolling-window summaries (7d/14d/30d) — useful when window > 30 days. */
+  rolling_7d: { safe: ParlayStyleSummary; value: ParlayStyleSummary; chaos: ParlayStyleSummary };
+  rolling_14d: { safe: ParlayStyleSummary; value: ParlayStyleSummary; chaos: ParlayStyleSummary };
+  rolling_30d: { safe: ParlayStyleSummary; value: ParlayStyleSummary; chaos: ParlayStyleSummary };
+  /** Best performing style by 3/3 hit rate (tiebreaker: 2/3, then per-leg). */
+  best_style: ParlayStyle;
+  best_style_window: '7d' | '14d' | '30d' | 'full';
+  note: string;
+}
+
+function emptyStyleSummary(style: ParlayStyle): ParlayStyleSummary {
+  return {
+    style, parlays_built: 0, days_skipped: 0,
+    full_hits: 0, partial_2of3_hits: 0,
+    total_legs: 0, legs_hit: 0,
+    full_hit_rate: 0, partial_2of3_rate: 0, per_leg_hit_rate: 0,
+    avg_parlay_american: null, avg_payout_per_dollar: null,
+  };
+}
+
+function summarizeStyle(style: ParlayStyle, days: ParlayDayResult[]): ParlayStyleSummary {
+  const s = emptyStyleSummary(style);
+  let americanSum = 0, americanCount = 0;
+  let payoutSum = 0;
+  for (const d of days) {
+    const r = d[style];
+    if (r.parlay.incomplete) { s.days_skipped += 1; continue; }
+    s.parlays_built += 1;
+    s.total_legs += r.parlay.legs.length;
+    s.legs_hit += r.legs_hit;
+    if (r.full_hit) s.full_hits += 1;
+    if (r.partial_2of3 || r.full_hit) s.partial_2of3_hits += 1;
+    if (r.parlay.parlay_american != null) {
+      americanSum += r.parlay.parlay_american;
+      americanCount += 1;
+    }
+    if (r.full_hit && r.parlay.parlay_decimal != null) {
+      payoutSum += r.parlay.parlay_decimal - 1; // profit on $1
+    }
+  }
+  s.full_hit_rate = s.parlays_built > 0 ? s.full_hits / s.parlays_built : 0;
+  s.partial_2of3_rate = s.parlays_built > 0 ? s.partial_2of3_hits / s.parlays_built : 0;
+  s.per_leg_hit_rate = s.total_legs > 0 ? s.legs_hit / s.total_legs : 0;
+  s.avg_parlay_american = americanCount > 0 ? americanSum / americanCount : null;
+  // Avg payout per $1 = (sum of $ won across all parlays - sum of $ lost) / parlays.
+  // We define: win = decimal-1, loss = -1. So total = payoutSum - (parlays_built - full_hits).
+  if (s.parlays_built > 0) {
+    const totalProfit = payoutSum - (s.parlays_built - s.full_hits);
+    s.avg_payout_per_dollar = totalProfit / s.parlays_built;
+  }
+  return s;
+}
+
+function bestStyleOf(s: { safe: ParlayStyleSummary; value: ParlayStyleSummary; chaos: ParlayStyleSummary }): ParlayStyle {
+  const order: ParlayStyle[] = ['safe', 'value', 'chaos'];
+  return order.slice().sort((a, b) => {
+    const A = s[a], B = s[b];
+    if (B.full_hit_rate !== A.full_hit_rate) return B.full_hit_rate - A.full_hit_rate;
+    if (B.partial_2of3_rate !== A.partial_2of3_rate) return B.partial_2of3_rate - A.partial_2of3_rate;
+    if (B.per_leg_hit_rate !== A.per_leg_hit_rate) return B.per_leg_hit_rate - A.per_leg_hit_rate;
+    return 0;
+  })[0];
+}
+
+/**
+ * Backtest the three parlay styles over a historical window.
+ *
+ * For each date in the window, applies the SAME generation rules used
+ * live, against the saved snapshot + saved odds for that date. Compares
+ * legs to actual HR results.
+ *
+ * @param snapshots all snapshot rows in the window
+ * @param hrsByDate game_date → set of HR player_ids
+ * @param oddsAt (target_date, player_id) → american_odds
+ * @param anchor right-edge date
+ * @param windowDays default 14
+ */
+export function backtestParlays(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrsByDate: Map<string, Set<number>>,
+  oddsAt: OddsIndex,
+  anchor: string,
+  windowDays = 30,
+): ParlayBacktestResult {
+  const rangeStart = addDays(anchor, -(windowDays - 1));
+
+  // Index snapshots by date.
+  const byDate = new Map<string, RevAnalysisSnapshotRow[]>();
+  for (const snap of snapshots) {
+    if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
+    const arr = byDate.get(snap.target_date);
+    if (arr) arr.push(snap); else byDate.set(snap.target_date, [snap]);
+  }
+
+  const days: ParlayDayResult[] = [];
+  const sortedDates = Array.from(byDate.keys()).sort();
+  for (const date of sortedDates) {
+    const rows = byDate.get(date)!;
+    const candidates = rows.map((r) => snapshotToParlayCandidate(r, oddsAt.get(`${date}:${r.player_id}`) ?? null));
+    const { safe, value, chaos } = generateParlays(candidates);
+
+    const hrSet = hrsByDate.get(date) ?? new Set<number>();
+    function evalParlay(p: Parlay) {
+      const legHits = p.legs.map((l) => hrSet.has(l.player_id));
+      const hits = legHits.reduce((s, b) => s + (b ? 1 : 0), 0);
+      return {
+        parlay: p,
+        leg_hits: legHits,
+        legs_hit: hits,
+        full_hit: hits === 3 && !p.incomplete,
+        partial_2of3: hits === 2,
+      };
+    }
+    days.push({
+      date,
+      safe: evalParlay(safe),
+      value: evalParlay(value),
+      chaos: evalParlay(chaos),
+    });
+  }
+
+  const safeSum = summarizeStyle('safe', days);
+  const valueSum = summarizeStyle('value', days);
+  const chaosSum = summarizeStyle('chaos', days);
+
+  // Rolling-window summaries (subset by date range).
+  const rolling = (days: ParlayDayResult[], n: number) => {
+    const from = addDays(anchor, -(n - 1));
+    const subset = days.filter((d) => d.date >= from && d.date <= anchor);
+    return {
+      safe: summarizeStyle('safe', subset),
+      value: summarizeStyle('value', subset),
+      chaos: summarizeStyle('chaos', subset),
+    };
+  };
+  const r7 = rolling(days, 7);
+  const r14 = rolling(days, 14);
+  const r30 = rolling(days, 30);
+
+  // Best style — favor longer windows when their sample size is non-trivial.
+  let bestStyle: ParlayStyle;
+  let bestWindow: '7d' | '14d' | '30d' | 'full';
+  const fullSamples = safeSum.parlays_built + valueSum.parlays_built + chaosSum.parlays_built;
+  if (fullSamples >= 30) {
+    bestStyle = bestStyleOf({ safe: safeSum, value: valueSum, chaos: chaosSum });
+    bestWindow = 'full';
+  } else if (r14.safe.parlays_built + r14.value.parlays_built + r14.chaos.parlays_built >= 15) {
+    bestStyle = bestStyleOf(r14);
+    bestWindow = '14d';
+  } else {
+    bestStyle = bestStyleOf(r7);
+    bestWindow = '7d';
+  }
+
+  return {
+    anchor, window_days: windowDays,
+    days_counted: days.length,
+    days,
+    safe_summary: safeSum,
+    value_summary: valueSum,
+    chaos_summary: chaosSum,
+    rolling_7d: r7, rolling_14d: r14, rolling_30d: r30,
+    best_style: bestStyle,
+    best_style_window: bestWindow,
+    note: 'Backtest applies the SAME live generation rules against saved snapshots + saved odds. No outcome peeking. Sample sizes are honest — rules that fail to find 3 qualifying legs are counted as "skipped" rather than artificially padded.',
+  };
+}
+
+// -----------------------------------------------------------------------------
+//  Parlay miss analysis — HR hitters not in any parlay
+// -----------------------------------------------------------------------------
+
+export type ParlayMissReason =
+  | 'not_in_pool'        // no snapshot row at all
+  | 'no_odds'            // in pool but odds were missing
+  | 'cold_penalty'       // cold-batter chip blocked safe/value
+  | 'below_heat_floor'   // heat below safe/value cutoff
+  | 'odds_off_range'     // odds too short for value or too long for safe
+  | 'no_edge'            // book agreed with model — no value
+  | 'thin_signal'        // for chaos: < 2 good chips
+  | 'rank_too_deep'      // for chaos: rank > 80
+  | 'missing_data';      // "Data limited" chip
+
+const PARLAY_MISS_LABEL: Record<ParlayMissReason, string> = {
+  not_in_pool: 'Not in pool',
+  no_odds: 'Odds missing',
+  cold_penalty: 'Cold-batter penalty blocked',
+  below_heat_floor: 'Heat below Safe/Value floor',
+  odds_off_range: 'Odds outside style range',
+  no_edge: 'Book agreed with model (no value)',
+  thin_signal: 'Chaos needs ≥ 2 good chips',
+  rank_too_deep: 'Rank below Chaos cutoff',
+  missing_data: 'Data limited',
+};
+
+export interface ParlayMissedHitter {
+  date: string;
+  player_id: number;
+  player_name: string;
+  team: string;
+  rank: number | null;
+  heat_score: number | null;
+  american_odds: number | null;
+  reasons: ParlayMissReason[];
+}
+
+export interface ParlayMissAnalysis {
+  anchor: string;
+  window_days: number;
+  total_hr_hitters: number;
+  total_missed: number;
+  /** Per-reason aggregate counts. */
+  aggregates: { reason: ParlayMissReason; label: string; count: number; share: number }[];
+  missed: ParlayMissedHitter[];
+}
+
+/** Classify a single HR hitter's exclusion reasons from the parlay set
+ *  built for their date. Multi-cause aware — a player can fail Safe AND
+ *  Value AND Chaos for different reasons. */
+function classifyMissReasons(
+  snap: RevAnalysisSnapshotRow | null,
+  odds: number | null,
+): ParlayMissReason[] {
+  if (!snap) return ['not_in_pool'];
+  const reasons: ParlayMissReason[] = [];
+  const signals = parseSignalsFromReason(snap.reason);
+  const heat = snap.heat_score;
+  const oddsVal = odds;
+  const reasonText = snap.reason ?? '';
+
+  if (signals.has('cold_batter')) reasons.push('cold_penalty');
+  if (/Data limited/i.test(reasonText) || !reasonText) reasons.push('missing_data');
+  if (oddsVal == null) reasons.push('no_odds');
+  if (heat < VALUE_HEAT_MIN) reasons.push('below_heat_floor');
+  if (oddsVal != null && (oddsVal < VALUE_ODDS_MIN || oddsVal > CHAOS_ODDS_MIN * 1.5) && heat >= VALUE_HEAT_MIN) {
+    reasons.push('odds_off_range');
+  }
+  // Edge check — value's specific reason.
+  if (oddsVal != null) {
+    const modelProb = heatToProb(heat);
+    const implied = americanToImplied(oddsVal);
+    if (modelProb - implied < VALUE_EDGE_MIN && heat >= VALUE_HEAT_MIN) reasons.push('no_edge');
+  }
+  // Chaos checks
+  if (snap.rank > CHAOS_RANK_MAX) reasons.push('rank_too_deep');
+  const goodChips =
+    (signals.has('hr_pitcher') ? 1 : 0) + (signals.has('power_park') ? 1 : 0) +
+    (signals.has('wind_out') ? 1 : 0) + (signals.has('warm_weather') ? 1 : 0) +
+    (signals.has('hot_l7d') ? 1 : 0) + (signals.has('platoon_edge') ? 1 : 0) +
+    (signals.has('elite_power') ? 1 : 0) + (signals.has('mid_power') ? 1 : 0);
+  if (goodChips < CHAOS_CHIP_MIN) reasons.push('thin_signal');
+
+  if (reasons.length === 0) reasons.push('below_heat_floor'); // fallback
+  return reasons;
+}
+
+/**
+ * For each HR hitter NOT in any parlay across the window, classify why
+ * the rules excluded them.
+ */
+export function analyzeParlayMisses(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrsByDate: Map<string, Set<number>>,
+  oddsAt: OddsIndex,
+  hrPlayerInfo: Map<number, { player_name: string; team: string }>,
+  parlayDays: ParlayDayResult[],
+  anchor: string,
+  windowDays = 30,
+): ParlayMissAnalysis {
+  const rangeStart = addDays(anchor, -(windowDays - 1));
+  // Index snapshots by (date, player).
+  const snapByDayPlayer = new Map<string, RevAnalysisSnapshotRow>();
+  for (const snap of snapshots) {
+    if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
+    snapByDayPlayer.set(`${snap.target_date}:${snap.player_id}`, snap);
+  }
+  // Index parlay legs by date.
+  const legsByDate = new Map<string, Set<number>>();
+  for (const day of parlayDays) {
+    const set = new Set<number>();
+    for (const leg of day.safe.parlay.legs) set.add(leg.player_id);
+    for (const leg of day.value.parlay.legs) set.add(leg.player_id);
+    for (const leg of day.chaos.parlay.legs) set.add(leg.player_id);
+    legsByDate.set(day.date, set);
+  }
+
+  const missed: ParlayMissedHitter[] = [];
+  const reasonCounts = new Map<ParlayMissReason, number>();
+  let totalHr = 0, totalMissed = 0;
+
+  for (const [date, hrSet] of hrsByDate) {
+    if (date < rangeStart || date > anchor) continue;
+    const onParlay = legsByDate.get(date) ?? new Set<number>();
+    for (const pid of hrSet) {
+      totalHr += 1;
+      if (onParlay.has(pid)) continue;
+      totalMissed += 1;
+      const snap = snapByDayPlayer.get(`${date}:${pid}`) ?? null;
+      const odds = oddsAt.get(`${date}:${pid}`) ?? null;
+      const info = hrPlayerInfo.get(pid) ?? { player_name: `#${pid}`, team: '' };
+      const reasons = classifyMissReasons(snap, odds);
+      missed.push({
+        date, player_id: pid,
+        player_name: snap?.player_name ?? info.player_name,
+        team: snap?.team ?? info.team,
+        rank: snap?.rank ?? null,
+        heat_score: snap?.heat_score ?? null,
+        american_odds: odds,
+        reasons,
+      });
+      for (const r of reasons) reasonCounts.set(r, (reasonCounts.get(r) ?? 0) + 1);
+    }
+  }
+
+  const aggregates = Array.from(reasonCounts.entries()).map(([reason, count]) => ({
+    reason, label: PARLAY_MISS_LABEL[reason],
+    count, share: totalMissed > 0 ? count / totalMissed : 0,
+  })).sort((a, b) => b.count - a.count);
+
+  // Sort missed by date desc, then heat desc.
+  missed.sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (b.heat_score ?? 0) - (a.heat_score ?? 0));
+
+  return {
+    anchor, window_days: windowDays,
+    total_hr_hitters: totalHr,
+    total_missed: totalMissed,
+    aggregates,
+    missed,
+  };
+}
+
+// Re-export labels for the UI
+export const PARLAY_STYLE_LABELS = PARLAY_STYLE_LABEL;
+export const PARLAY_STYLE_DESCRIPTIONS = PARLAY_STYLE_DESCRIPTION;
+export const PARLAY_MISS_LABELS = PARLAY_MISS_LABEL;
