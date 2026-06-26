@@ -114,6 +114,7 @@ export default function LearningDashboard() {
           >{w}d</button>
         ))}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 12 }}>
+          <Link to="/learning/research" style={{ fontSize: 13 }}>🔬 Research →</Link>
           <Link to="/lab" style={{ fontSize: 13 }}>Open Parlay Lab →</Link>
         </div>
       </div>
@@ -186,20 +187,35 @@ export default function LearningDashboard() {
                 <tbody>
                   {versions.map((v) => (
                     <tr key={v.version}>
-                      <td><strong>v{v.version}</strong></td>
-                      <td>{v.name}</td>
+                      <td>
+                        <Link to={`/learning/model/${v.version}`} style={{ color: '#cfe', textDecoration: 'none' }}>
+                          <strong>v{v.version}</strong>
+                        </Link>
+                      </td>
+                      <td>
+                        <Link to={`/learning/model/${v.version}`} style={{ color: '#cfe', textDecoration: 'none' }}>
+                          {v.name}
+                        </Link>
+                      </td>
                       <td>{v.created_at.slice(0, 10)}</td>
                       <td>{v.last_evaluated_for ?? '—'}</td>
                       <td className="num">{v.per_leg_hit_rate != null ? pct(v.per_leg_hit_rate) : '—'}</td>
                       <td className="num">{v.pool_coverage_rate != null ? pct(v.pool_coverage_rate) : '—'}</td>
                       <td className="num">{v.top10_coverage_rate != null ? pct(v.top10_coverage_rate) : '—'}</td>
-                      <td>{v.active && <span className="ld-active">active</span>}</td>
+                      <td>
+                        {v.active && <span className="ld-active">active</span>}
+                        {v.retired && <span className="ld-retired" style={{ marginLeft: 4 }}>retired</span>}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           </div>
+
+          {/* Champion banner — the leader from the comparison panel,
+              promoted to the top of the page with deep links. */}
+          <ChampionBanner comparison={comparison} windowDays={windowDays} />
 
           {/* Multi-model comparison */}
           <ModelComparisonPanel comparison={comparison} windowDays={windowDays} />
@@ -228,8 +244,16 @@ export default function LearningDashboard() {
                   <tbody>
                     {captures.map((c) => (
                       <tr key={`${c.date}-${c.model_version}`}>
-                        <td><strong>{c.date}</strong></td>
-                        <td>v{c.model_version}</td>
+                        <td>
+                          <Link to={`/learning/day/${c.date}`} style={{ color: '#cfe', textDecoration: 'none' }}>
+                            <strong>{c.date}</strong>
+                          </Link>
+                        </td>
+                        <td>
+                          <Link to={`/learning/model/${c.model_version}`} style={{ color: '#cfe', textDecoration: 'none' }}>
+                            v{c.model_version}
+                          </Link>
+                        </td>
                         <td className="num">{c.player_count}</td>
                         <td className="num">{c.hr_hitter_count}</td>
                         <td className="num ld-pos">{c.tp}</td>
@@ -285,6 +309,65 @@ export default function LearningDashboard() {
 
       <DashStyles />
     </>
+  );
+}
+
+// =============================================================================
+//  Champion Banner — current best model, surfaced prominently
+// =============================================================================
+function ChampionBanner({ comparison, windowDays }: { comparison: ModelComparisonRow[]; windowDays: number }) {
+  const ranked = useMemo(() => {
+    return comparison
+      .slice()
+      .filter((r) => r.days_tested > 0)
+      .sort((a, b) => {
+        if (b.parlay_full_hit_rate !== a.parlay_full_hit_rate) return b.parlay_full_hit_rate - a.parlay_full_hit_rate;
+        if (b.parlay_2of3_hit_rate !== a.parlay_2of3_hit_rate) return b.parlay_2of3_hit_rate - a.parlay_2of3_hit_rate;
+        if (b.avg_legs_hit_per_parlay !== a.avg_legs_hit_per_parlay) return b.avg_legs_hit_per_parlay - a.avg_legs_hit_per_parlay;
+        return b.top10_coverage - a.top10_coverage;
+      });
+  }, [comparison]);
+  const champion = ranked[0];
+  const runnerUp = ranked[1];
+  if (!champion) return null;
+
+  return (
+    <div className="ld-champion" style={{ marginTop: 12 }}>
+      <div style={{ fontSize: 11, opacity: 0.7, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+        🏆 Current Champion ({windowDays}d)
+      </div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginTop: 6, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 28, fontWeight: 700, color: '#c084fc' }}>
+          v{champion.version}
+        </span>
+        <span style={{ fontSize: 16, fontWeight: 600 }}>{champion.name}</span>
+        {champion.is_active && <span className="ld-active">active</span>}
+        <Link to={`/learning/model/${champion.version}`} style={{ fontSize: 13, marginLeft: 'auto' }}>
+          See picks →
+        </Link>
+      </div>
+      <div className="ld-champ-stats" style={{ marginTop: 8 }}>
+        <Pill label="3/3 hit rate" value={`${(champion.parlay_full_hit_rate * 100).toFixed(1)}%`} />
+        <Pill label="2/3 hit rate" value={`${(champion.parlay_2of3_hit_rate * 100).toFixed(1)}%`} />
+        <Pill label="Avg legs hit" value={champion.avg_legs_hit_per_parlay.toFixed(2)} />
+        <Pill label="Top 10 cov" value={`${(champion.top10_coverage * 100).toFixed(1)}%`} />
+        <Pill label="Days tested" value={champion.days_tested.toString()} />
+      </div>
+      {runnerUp && (
+        <div className="subtle" style={{ fontSize: 11, marginTop: 6 }}>
+          Runner-up: <strong>v{runnerUp.version} {runnerUp.name}</strong> ({(runnerUp.parlay_full_hit_rate * 100).toFixed(1)}% 3/3)
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Pill({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="ld-pill">
+      <span style={{ fontSize: 10, opacity: 0.7, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</span>
+      <span style={{ fontSize: 14, fontWeight: 700, marginLeft: 6 }}>{value}</span>
+    </div>
   );
 }
 
@@ -509,6 +592,24 @@ function DashStyles() {
         padding: 8px 12px; font-size: 12px;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         margin: 6px 0 0; overflow-x: auto; line-height: 1.5;
+      }
+
+      .ld-champion {
+        background: linear-gradient(180deg, rgba(192,132,252,0.10), rgba(192,132,252,0.03));
+        border: 1px solid rgba(192,132,252,0.4);
+        border-radius: 10px;
+        padding: 14px 16px;
+      }
+      .ld-champ-stats { display: flex; gap: 8px; flex-wrap: wrap; }
+      .ld-pill {
+        display: inline-flex; align-items: baseline;
+        padding: 4px 10px; border-radius: 999px;
+        background: rgba(255,255,255,0.04); border: 1px solid var(--border, #232732);
+      }
+      .ld-retired {
+        display: inline-block; padding: 1px 7px; border-radius: 999px;
+        background: rgba(224,122,122,0.18); color: #e07a7a;
+        font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
       }
     `}</style>
   );

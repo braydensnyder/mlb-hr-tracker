@@ -7,6 +7,10 @@ import TonightsCard from './pages/TonightsCard';
 import TeamBoard from './pages/TeamBoard';
 import ParlayLab from './pages/ParlayLab';
 import LearningDashboard from './pages/LearningDashboard';
+import ModelCardPage from './pages/learning/ModelCard';
+import HistoricalDayPage from './pages/learning/HistoricalDay';
+import CompareModelsPage from './pages/learning/CompareModels';
+import ResearchPage from './pages/learning/Research';
 import Backtest from './pages/Backtest';
 import Odds from './pages/Odds';
 import ClubhouseMenu from './components/ClubhouseMenu';
@@ -42,6 +46,10 @@ export default function App() {
         <Route path="/teams" element={<TeamBoard />} />
         <Route path="/lab" element={<ParlayLab />} />
         <Route path="/learning" element={<LearningDashboard />} />
+        <Route path="/learning/research" element={<ResearchPage />} />
+        <Route path="/learning/model/:version" element={<ModelCardPage />} />
+        <Route path="/learning/day/:date" element={<HistoricalDayPage />} />
+        <Route path="/learning/compare/:date" element={<CompareModelsPage />} />
         <Route path="/targets" element={<HrTargets />} />
         <Route path="/odds" element={<Odds />} />
         <Route path="/backtest" element={<Backtest />} />

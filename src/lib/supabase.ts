@@ -578,6 +578,11 @@ export interface ModelVersionRow {
   pool_coverage_rate: number | null;
   top10_coverage_rate: number | null;
   last_evaluated_for: string | null;
+  /** Migration 015 — manually marked retired so it's hidden from
+   *  comparisons. Historical rows are preserved. */
+  retired?: boolean;
+  retired_at?: string | null;
+  retired_reason?: string | null;
 }
 
 export interface LearningPredictionRow {
@@ -989,4 +994,315 @@ export async function fetchFeatureImportance(opts: {
   // anchor; this query already filtered window_days, so they're all the same date).
   const mostRecent = rows[0].computed_for;
   return rows.filter((r) => r.computed_for === mostRecent);
+}
+
+// =============================================================================
+//  Research / Champion / Model Drill-Down fetchers (Phase: Champion System)
+// =============================================================================
+
+/** All learning_predictions rows for a single (date, version) — used by
+ *  the ModelCard's "today/historical" drill-down. */
+export async function fetchLearningForDateVersion(opts: {
+  date: string; model_version: number;
+}): Promise<LearningPredictionRow[]> {
+  const PAGE_SIZE = 1000;
+  const all: LearningPredictionRow[] = [];
+  for (let page = 0; page < 10; page++) {
+    const { data, error } = await supabase
+      .from('learning_predictions')
+      .select('*')
+      .eq('target_date', opts.date)
+      .eq('model_version', opts.model_version)
+      .order('rank', { ascending: true, nullsFirst: false })
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return [];
+      throw new Error(error.message);
+    }
+    const rows = (data ?? []) as LearningPredictionRow[];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+  return all;
+}
+
+/** All learning_predictions for a single date across ALL model versions —
+ *  used by the HistoricalDay + CompareModels pages. */
+export async function fetchAllVersionsForDate(date: string): Promise<LearningPredictionRow[]> {
+  const PAGE_SIZE = 1000;
+  const all: LearningPredictionRow[] = [];
+  for (let page = 0; page < 30; page++) {
+    const { data, error } = await supabase
+      .from('learning_predictions')
+      .select('*')
+      .eq('target_date', date)
+      .order('model_version', { ascending: true })
+      .order('rank', { ascending: true, nullsFirst: false })
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return [];
+      throw new Error(error.message);
+    }
+    const rows = (data ?? []) as LearningPredictionRow[];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+  return all;
+}
+
+// -----------------------------------------------------------------------------
+//  Research segmentation — joins learning_predictions with games
+// -----------------------------------------------------------------------------
+
+export type ResearchSegment =
+  | 'pitcher_hand'      // RHP vs LHP
+  | 'slate_size'        // <6 / 6-9 / 10+ games
+  | 'temperature'       // hot ≥85F / warm 70-85F / cool <70F
+  | 'wind'              // out / in / neutral
+  | 'park_factor';      // hitter-friendly / neutral / pitcher-friendly (proxied by venue_l14d_rank when available)
+
+export interface ResearchSegmentBucket {
+  /** Bucket label: 'RHP', 'Large (10+ games)', 'Hot (≥85°F)', etc. */
+  label: string;
+  /** Per-version performance inside this bucket. */
+  per_version: Array<{
+    version: number;
+    name: string;
+    total_player_days: number;
+    tp: number; fp: number; fn: number; tn: number;
+    /** TP / (TP + FN) — recall. */
+    recall: number;
+    /** TP / (TP + FP) — precision. */
+    precision: number;
+    /** F1 over the bucket. */
+    f1: number;
+    /** HRs captured in Top 10 / total HRs in bucket. */
+    top10_coverage: number;
+    total_hrs_in_bucket: number;
+    hrs_in_top10: number;
+  }>;
+}
+
+export interface ResearchSegmentResult {
+  segment: ResearchSegment;
+  buckets: ResearchSegmentBucket[];
+  /** Total games / player-days the segmentation could classify. */
+  total_player_days_classified: number;
+  /** Player-days that couldn't be classified (missing game data, etc.). */
+  unclassified: number;
+  note: string;
+}
+
+interface GameRowLite {
+  game_pk: number;
+  game_date: string;
+  home_team: string;
+  away_team: string;
+  home_probable_pitcher_hand: string | null;
+  away_probable_pitcher_hand: string | null;
+  weather_temp_f: number | null;
+  weather_wind_mph: number | null;
+  weather_wind_dir: string | null;
+  venue_name: string | null;
+}
+
+/** Load games for a date range (used by research join). Returns empty
+ *  on missing tables. */
+async function fetchGamesForRange(from: string, to: string): Promise<Map<number, GameRowLite>> {
+  const out = new Map<number, GameRowLite>();
+  const PAGE_SIZE = 1000;
+  for (let page = 0; page < 10; page++) {
+    const { data, error } = await supabase
+      .from('games')
+      .select('game_pk, game_date, home_team, away_team, ' +
+        'home_probable_pitcher_hand, away_probable_pitcher_hand, ' +
+        'weather_temp_f, weather_wind_mph, weather_wind_dir, venue_name')
+      .gte('game_date', from)
+      .lte('game_date', to)
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return out;
+      throw new Error(error.message);
+    }
+    const rows = (data ?? []) as unknown as GameRowLite[];
+    for (const g of rows) out.set(g.game_pk, g);
+    if (rows.length < PAGE_SIZE) break;
+  }
+  return out;
+}
+
+/** Compute per-segment, per-version performance over a window.
+ *  Joins learning_predictions with games on game_pk + uses the player's
+ *  team to determine which side they bat on (and thus which pitcher they
+ *  face). */
+export async function fetchResearchSegmentation(opts: {
+  from: string; to: string; segment: ResearchSegment;
+}): Promise<ResearchSegmentResult> {
+  const versions = await fetchModelVersions();
+  const games = await fetchGamesForRange(opts.from, opts.to);
+
+  // Pull learning_predictions in the window.
+  const PAGE_SIZE = 1000;
+  const preds: LearningPredictionRow[] = [];
+  for (let page = 0; page < 50; page++) {
+    const { data, error } = await supabase
+      .from('learning_predictions')
+      .select('*')
+      .gte('target_date', opts.from)
+      .lte('target_date', opts.to)
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) {
+        return { segment: opts.segment, buckets: [], total_player_days_classified: 0, unclassified: 0, note: 'learning_predictions missing — apply migrations 013/014.' };
+      }
+      throw new Error(error.message);
+    }
+    const rows = (data ?? []) as LearningPredictionRow[];
+    preds.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+
+  // For slate_size we need games-per-date.
+  const gamesPerDate = new Map<string, number>();
+  for (const g of games.values()) {
+    gamesPerDate.set(g.game_date, (gamesPerDate.get(g.game_date) ?? 0) + 1);
+  }
+
+  // Bucket helper — returns label or null if unclassifiable.
+  function bucketize(row: LearningPredictionRow): string | null {
+    const game = row.game_pk != null ? games.get(row.game_pk) : null;
+
+    switch (opts.segment) {
+      case 'pitcher_hand': {
+        if (!game) return null;
+        // Player faces the OPPOSING pitcher. Determine which team the
+        // player is on, then take the other side's pitcher hand.
+        const isHome = game.home_team === row.team;
+        const isAway = game.away_team === row.team;
+        if (!isHome && !isAway) return null;
+        const pitcherHand = isHome ? game.away_probable_pitcher_hand : game.home_probable_pitcher_hand;
+        if (pitcherHand === 'R') return 'vs RHP';
+        if (pitcherHand === 'L') return 'vs LHP';
+        return null;
+      }
+      case 'slate_size': {
+        const n = gamesPerDate.get(row.target_date) ?? 0;
+        if (n === 0) return null;
+        if (n <= 5) return 'Small (≤5 games)';
+        if (n <= 9) return 'Medium (6–9 games)';
+        return 'Large (10+ games)';
+      }
+      case 'temperature': {
+        if (!game || game.weather_temp_f == null) return null;
+        if (game.weather_temp_f >= 85) return 'Hot (≥85°F)';
+        if (game.weather_temp_f >= 70) return 'Warm (70–85°F)';
+        return 'Cool (<70°F)';
+      }
+      case 'wind': {
+        if (!game || game.weather_wind_dir == null || game.weather_wind_mph == null) return null;
+        const dir = game.weather_wind_dir.toLowerCase();
+        if (game.weather_wind_mph >= 10 && /out/.test(dir)) return 'Wind out (10+ mph)';
+        if (game.weather_wind_mph >= 10 && /in/.test(dir)) return 'Wind in (10+ mph)';
+        return 'Neutral wind';
+      }
+      case 'park_factor': {
+        // We don't have ballpark factor stored. Heuristic: known hitter-
+        // friendly parks vs known pitcher-friendly vs neutral. Same list
+        // used elsewhere in the project would be ideal; here we lean on
+        // venue name keywords — best we can do without venue_factor data.
+        if (!game || !game.venue_name) return null;
+        const v = game.venue_name.toLowerCase();
+        if (/coors|fenway|camden|cincinnati|great american|yankee stadium|globe life|citizens bank/.test(v)) return 'Hitter-friendly';
+        if (/petco|oracle|t-mobile|tropicana|comerica|kauffman/.test(v)) return 'Pitcher-friendly';
+        return 'Neutral';
+      }
+    }
+    return null;
+  }
+
+  // Aggregate per (bucket, version).
+  const bucketsMap = new Map<string, Map<number, {
+    total: number; tp: number; fp: number; fn: number; tn: number;
+    hr_seen: Set<number>; hr_in_top10: number;
+  }>>();
+  let totalClassified = 0;
+  let unclassified = 0;
+
+  for (const row of preds) {
+    const label = bucketize(row);
+    if (!label) { unclassified += 1; continue; }
+    totalClassified += 1;
+    let byVer = bucketsMap.get(label);
+    if (!byVer) { byVer = new Map(); bucketsMap.set(label, byVer); }
+    let cell = byVer.get(row.model_version);
+    if (!cell) {
+      cell = { total: 0, tp: 0, fp: 0, fn: 0, tn: 0, hr_seen: new Set(), hr_in_top10: 0 };
+      byVer.set(row.model_version, cell);
+    }
+    cell.total += 1;
+    if (row.classification === 'TP') cell.tp += 1;
+    else if (row.classification === 'FP') cell.fp += 1;
+    else if (row.classification === 'FN') cell.fn += 1;
+    else if (row.classification === 'TN') cell.tn += 1;
+    if (row.homered === true && !cell.hr_seen.has(row.player_id)) {
+      cell.hr_seen.add(row.player_id);
+      if (row.rank != null && row.rank <= 10) cell.hr_in_top10 += 1;
+    }
+  }
+
+  const buckets: ResearchSegmentBucket[] = Array.from(bucketsMap.entries())
+    .map(([label, byVer]) => ({
+      label,
+      per_version: versions.map((v) => {
+        const cell = byVer.get(v.version) ?? { total: 0, tp: 0, fp: 0, fn: 0, tn: 0, hr_seen: new Set<number>(), hr_in_top10: 0 };
+        const recall = cell.tp + cell.fn > 0 ? cell.tp / (cell.tp + cell.fn) : 0;
+        const precision = cell.tp + cell.fp > 0 ? cell.tp / (cell.tp + cell.fp) : 0;
+        const f1 = precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
+        return {
+          version: v.version, name: v.name,
+          total_player_days: cell.total,
+          tp: cell.tp, fp: cell.fp, fn: cell.fn, tn: cell.tn,
+          recall, precision, f1,
+          top10_coverage: cell.hr_seen.size > 0 ? cell.hr_in_top10 / cell.hr_seen.size : 0,
+          total_hrs_in_bucket: cell.hr_seen.size,
+          hrs_in_top10: cell.hr_in_top10,
+        };
+      }),
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+
+  return {
+    segment: opts.segment,
+    buckets,
+    total_player_days_classified: totalClassified,
+    unclassified,
+    note: opts.segment === 'park_factor'
+      ? 'Park factor uses a hand-coded venue keyword list (no quantitative park-factor ingest yet). Treat as directional only.'
+      : opts.segment === 'pitcher_hand'
+        ? 'Player\'s team determines side; pitcher_hand comes from the opposing probable pitcher. Skipped rows: probable pitcher TBD.'
+        : 'Joined with games table on game_pk. Skipped rows: game missing or weather not yet enriched.',
+  };
+}
+
+/** Captured dates available in learning_predictions — useful for the
+ *  HistoricalDay page's date picker. */
+export async function fetchCapturedDates(opts: { limit?: number } = {}): Promise<string[]> {
+  const PAGE_SIZE = 1000;
+  const dates = new Set<string>();
+  for (let page = 0; page < 20; page++) {
+    const { data, error } = await supabase
+      .from('learning_predictions')
+      .select('target_date')
+      .order('target_date', { ascending: false })
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return [];
+      throw new Error(error.message);
+    }
+    const rows = (data ?? []) as { target_date: string }[];
+    for (const r of rows) dates.add(r.target_date);
+    if (rows.length < PAGE_SIZE) break;
+  }
+  const sorted = Array.from(dates).sort().reverse();
+  return opts.limit ? sorted.slice(0, opts.limit) : sorted;
 }
