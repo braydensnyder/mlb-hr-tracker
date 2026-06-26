@@ -6881,41 +6881,105 @@ export function backtestParlays(
 }
 
 // -----------------------------------------------------------------------------
-//  Parlay miss analysis — HR hitters not in any parlay
+//  Parlay miss analysis — DATA vs MODEL taxonomy (task #237)
+//
+//  Goal: separate "bad pick" (model problem — had data, judged the player low)
+//  from "missing data" (coverage problem — couldn't even consider them). The
+//  reason enum below is split into two categories so the UI can tell the user
+//  which fix to chase: more data sources or different scoring weights.
 // -----------------------------------------------------------------------------
 
 export type ParlayMissReason =
-  | 'not_in_pool'        // no snapshot row at all
-  | 'no_odds'            // in pool but odds were missing
-  | 'cold_penalty'       // cold-batter chip blocked safe/value
-  | 'below_heat_floor'   // heat below safe/value cutoff
-  | 'odds_off_range'     // odds too short for value or too long for safe
-  | 'no_edge'            // book agreed with model — no value
-  | 'thin_signal'        // for chaos: < 2 good chips
-  | 'rank_too_deep'      // for chaos: rank > 80
-  | 'missing_data';      // "Data limited" chip
+  // --- DATA problems (coverage / pipeline gaps) ---
+  | 'team_game_not_processed'    // game row missing or marked unprocessed
+  | 'no_probable_pitcher'        // pitcher TBD on both sides
+  | 'lineup_not_confirmed'       // lineup_confirmed=false on the date's game
+  | 'missing_from_pool'          // no snapshot row at all (data coverage gap)
+  | 'insufficient_recent_data'   // snapshot row exists but model emitted "Data limited"
+  // --- MODEL problems (had data, judged player low) ---
+  | 'low_model_score'            // heat_score below model's actionable floor
+  | 'outside_top_50'             // ranked but rank > 50 (depth issue)
+  | 'failed_eligibility_filter'; // ranked + scored OK but blocked by parlay rules (cold / no edge / etc.)
+
+export type ParlayMissCategory = 'data' | 'model';
+
+const PARLAY_MISS_CATEGORY: Record<ParlayMissReason, ParlayMissCategory> = {
+  team_game_not_processed: 'data',
+  no_probable_pitcher: 'data',
+  lineup_not_confirmed: 'data',
+  missing_from_pool: 'data',
+  insufficient_recent_data: 'data',
+  low_model_score: 'model',
+  outside_top_50: 'model',
+  failed_eligibility_filter: 'model',
+};
 
 const PARLAY_MISS_LABEL: Record<ParlayMissReason, string> = {
-  not_in_pool: 'Not in pool',
-  no_odds: 'Odds missing',
-  cold_penalty: 'Cold-batter penalty blocked',
-  below_heat_floor: 'Heat below Safe/Value floor',
-  odds_off_range: 'Odds outside style range',
-  no_edge: 'Book agreed with model (no value)',
-  thin_signal: 'Chaos needs ≥ 2 good chips',
-  rank_too_deep: 'Rank below Chaos cutoff',
-  missing_data: 'Data limited',
+  team_game_not_processed: 'Team/game not processed',
+  no_probable_pitcher: 'No probable pitcher',
+  lineup_not_confirmed: 'Lineup not confirmed',
+  missing_from_pool: 'Missing from model pool',
+  insufficient_recent_data: 'Insufficient recent data',
+  low_model_score: 'Low model score',
+  outside_top_50: 'Outside Top 50',
+  failed_eligibility_filter: 'Failed eligibility filter',
 };
+
+const TOP_RANK_FLOOR = 50;
+const LOW_HEAT_THRESHOLD_MISS = 40;
+
+/** Game metadata needed to classify a miss as a data problem. */
+export interface MissGameInfo {
+  game_pk: number;
+  game_date: string;
+  home_team: string;
+  away_team: string;
+  status: string | null;
+  processed: boolean | null;
+  home_probable_pitcher_id: number | null;
+  away_probable_pitcher_id: number | null;
+  lineups_confirmed: boolean | null;
+  home_lineup: number[] | null;
+  away_lineup: number[] | null;
+}
+
+/** Per-HR-row info used by the miss classifier (game_pk lets us look up
+ *  team/game state without re-joining). */
+export interface MissHrRow {
+  date: string;
+  player_id: number;
+  player_name: string;
+  team: string;
+  opponent: string;
+  game_pk: number;
+  /** How many HRs the player hit that day. */
+  hr_count: number;
+}
 
 export interface ParlayMissedHitter {
   date: string;
   player_id: number;
   player_name: string;
   team: string;
+  opponent: string;
+  hr_count: number;
   rank: number | null;
   heat_score: number | null;
   american_odds: number | null;
+  /** Single primary reason — the most-specific cause the classifier could pin down. */
+  primary_reason: ParlayMissReason;
+  /** All applicable reasons in priority order. */
   reasons: ParlayMissReason[];
+  /** Convenience: 'data' or 'model'. */
+  category: ParlayMissCategory;
+}
+
+export interface ParlayMissAggregate {
+  reason: ParlayMissReason;
+  category: ParlayMissCategory;
+  label: string;
+  count: number;
+  share: number;
 }
 
 export interface ParlayMissAnalysis {
@@ -6923,72 +6987,112 @@ export interface ParlayMissAnalysis {
   window_days: number;
   total_hr_hitters: number;
   total_missed: number;
-  /** Per-reason aggregate counts. */
-  aggregates: { reason: ParlayMissReason; label: string; count: number; share: number }[];
+  /** Sum of misses categorized as data problems. */
+  data_problems: number;
+  /** Sum of misses categorized as model problems. */
+  model_problems: number;
+  aggregates: ParlayMissAggregate[];
   missed: ParlayMissedHitter[];
 }
 
-/** Classify a single HR hitter's exclusion reasons from the parlay set
- *  built for their date. Multi-cause aware — a player can fail Safe AND
- *  Value AND Chaos for different reasons. */
+/**
+ * Classify the primary reason a single missed HR hitter was excluded.
+ * Priority order (most-specific data problem first → model judgment last):
+ *
+ *   1. team_game_not_processed   — no game row OR game.processed=false
+ *   2. no_probable_pitcher       — both probable pitcher ids null
+ *   3. lineup_not_confirmed      — lineups_confirmed=false
+ *   4. missing_from_pool         — no snapshot row at all
+ *   5. insufficient_recent_data  — snapshot exists with "Data limited" chip
+ *   6. low_model_score           — heat < LOW_HEAT_THRESHOLD_MISS
+ *   7. outside_top_50            — rank > TOP_RANK_FLOOR
+ *   8. failed_eligibility_filter — anything else (cold/no-edge/thin-signal)
+ *
+ * Returns the primary reason + the full ordered list of applicable reasons.
+ */
 function classifyMissReasons(
   snap: RevAnalysisSnapshotRow | null,
-  odds: number | null,
-): ParlayMissReason[] {
-  if (!snap) return ['not_in_pool'];
+  game: MissGameInfo | null,
+): { primary: ParlayMissReason; all: ParlayMissReason[] } {
   const reasons: ParlayMissReason[] = [];
-  const signals = parseSignalsFromReason(snap.reason);
-  const heat = snap.heat_score;
-  const oddsVal = odds;
-  const reasonText = snap.reason ?? '';
 
-  if (signals.has('cold_batter')) reasons.push('cold_penalty');
-  if (/Data limited/i.test(reasonText) || !reasonText) reasons.push('missing_data');
-  if (oddsVal == null) reasons.push('no_odds');
-  if (heat < VALUE_HEAT_MIN) reasons.push('below_heat_floor');
-  if (oddsVal != null && (oddsVal < VALUE_ODDS_MIN || oddsVal > CHAOS_ODDS_MIN * 1.5) && heat >= VALUE_HEAT_MIN) {
-    reasons.push('odds_off_range');
+  // 1. Pipeline gap: game wasn't processed (or doesn't exist) — no model
+  //    output is possible for this date. Catches early-morning windows
+  //    where the cron hadn't run yet, plus any backfill gaps.
+  if (!game || game.processed === false) {
+    reasons.push('team_game_not_processed');
+  } else {
+    // 2. Probable pitcher missing on both sides — model can't grade
+    //    pitcher_l14d_allowed / starts; many chips suppress.
+    if (game.home_probable_pitcher_id == null && game.away_probable_pitcher_id == null) {
+      reasons.push('no_probable_pitcher');
+    }
+    // 3. Lineup not posted — model can apply uncertainty penalty but
+    //    confirmed/pending filters block downstream pool entry.
+    if (game.lineups_confirmed === false) {
+      reasons.push('lineup_not_confirmed');
+    }
   }
-  // Edge check — value's specific reason.
-  if (oddsVal != null) {
-    const modelProb = heatToProb(heat);
-    const implied = americanToImplied(oddsVal);
-    if (modelProb - implied < VALUE_EDGE_MIN && heat >= VALUE_HEAT_MIN) reasons.push('no_edge');
-  }
-  // Chaos checks
-  if (snap.rank > CHAOS_RANK_MAX) reasons.push('rank_too_deep');
-  const goodChips =
-    (signals.has('hr_pitcher') ? 1 : 0) + (signals.has('power_park') ? 1 : 0) +
-    (signals.has('wind_out') ? 1 : 0) + (signals.has('warm_weather') ? 1 : 0) +
-    (signals.has('hot_l7d') ? 1 : 0) + (signals.has('platoon_edge') ? 1 : 0) +
-    (signals.has('elite_power') ? 1 : 0) + (signals.has('mid_power') ? 1 : 0);
-  if (goodChips < CHAOS_CHIP_MIN) reasons.push('thin_signal');
 
-  if (reasons.length === 0) reasons.push('below_heat_floor'); // fallback
-  return reasons;
+  // 4. Pool gap — no snapshot row for this player at all.
+  if (!snap) {
+    reasons.push('missing_from_pool');
+  } else {
+    // 5. "Data limited" chip — snapshot exists but model self-reported thin inputs.
+    const reasonText = snap.reason ?? '';
+    if (/Data limited/i.test(reasonText)) {
+      reasons.push('insufficient_recent_data');
+    }
+    // 6. Heat too low — clear "model said no"
+    if (snap.heat_score < LOW_HEAT_THRESHOLD_MISS) {
+      reasons.push('low_model_score');
+    }
+    // 7. Outside Top 50 — depth issue, even if heat is moderate
+    if (snap.rank > TOP_RANK_FLOOR) {
+      reasons.push('outside_top_50');
+    }
+  }
+
+  // Catchall: snapshot exists, heat is decent, but the parlay rules
+  // filtered them out (cold / no edge / thin signal).
+  if (snap && reasons.length === 0) {
+    reasons.push('failed_eligibility_filter');
+  } else if (snap && !reasons.some((r) => PARLAY_MISS_CATEGORY[r] === 'model')) {
+    // We collected only data reasons but the snapshot is fine — append
+    // model reason so the UI surfaces it explicitly.
+    if (snap.heat_score >= LOW_HEAT_THRESHOLD_MISS && snap.rank <= TOP_RANK_FLOOR) {
+      reasons.push('failed_eligibility_filter');
+    }
+  }
+  if (reasons.length === 0) reasons.push('missing_from_pool');
+
+  return { primary: reasons[0], all: reasons };
 }
 
 /**
- * For each HR hitter NOT in any parlay across the window, classify why
- * the rules excluded them.
+ * Replace the old miss analyzer with the data-vs-model taxonomy. Takes a
+ * pre-built MissContext so the call site can populate it from whatever
+ * sources are available (we deliberately don't fetch in stats.ts).
  */
 export function analyzeParlayMisses(
   snapshots: RevAnalysisSnapshotRow[],
-  hrsByDate: Map<string, Set<number>>,
+  hrRows: MissHrRow[],
   oddsAt: OddsIndex,
-  hrPlayerInfo: Map<number, { player_name: string; team: string }>,
+  gamesByPk: Map<number, MissGameInfo>,
   parlayDays: ParlayDayResult[],
   anchor: string,
   windowDays = 30,
 ): ParlayMissAnalysis {
   const rangeStart = addDays(anchor, -(windowDays - 1));
+
   // Index snapshots by (date, player).
   const snapByDayPlayer = new Map<string, RevAnalysisSnapshotRow>();
   for (const snap of snapshots) {
     if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
     snapByDayPlayer.set(`${snap.target_date}:${snap.player_id}`, snap);
   }
-  // Index parlay legs by date.
+
+  // Parlay legs per date.
   const legsByDate = new Map<string, Set<number>>();
   for (const day of parlayDays) {
     const set = new Set<number>();
@@ -7000,46 +7104,177 @@ export function analyzeParlayMisses(
 
   const missed: ParlayMissedHitter[] = [];
   const reasonCounts = new Map<ParlayMissReason, number>();
-  let totalHr = 0, totalMissed = 0;
+  let totalHr = 0;
+  let totalMissed = 0;
+  let dataProblems = 0;
+  let modelProblems = 0;
+  const seenForDay = new Set<string>(); // dedup multi-HR same-day rows
 
-  for (const [date, hrSet] of hrsByDate) {
-    if (date < rangeStart || date > anchor) continue;
-    const onParlay = legsByDate.get(date) ?? new Set<number>();
-    for (const pid of hrSet) {
-      totalHr += 1;
-      if (onParlay.has(pid)) continue;
-      totalMissed += 1;
-      const snap = snapByDayPlayer.get(`${date}:${pid}`) ?? null;
-      const odds = oddsAt.get(`${date}:${pid}`) ?? null;
-      const info = hrPlayerInfo.get(pid) ?? { player_name: `#${pid}`, team: '' };
-      const reasons = classifyMissReasons(snap, odds);
-      missed.push({
-        date, player_id: pid,
-        player_name: snap?.player_name ?? info.player_name,
-        team: snap?.team ?? info.team,
-        rank: snap?.rank ?? null,
-        heat_score: snap?.heat_score ?? null,
-        american_odds: odds,
-        reasons,
-      });
-      for (const r of reasons) reasonCounts.set(r, (reasonCounts.get(r) ?? 0) + 1);
-    }
+  for (const hr of hrRows) {
+    if (hr.date < rangeStart || hr.date > anchor) continue;
+    const dayKey = `${hr.date}:${hr.player_id}`;
+    if (seenForDay.has(dayKey)) continue;
+    seenForDay.add(dayKey);
+    totalHr += 1;
+
+    const onParlay = legsByDate.get(hr.date) ?? new Set<number>();
+    if (onParlay.has(hr.player_id)) continue;
+    totalMissed += 1;
+
+    const snap = snapByDayPlayer.get(dayKey) ?? null;
+    const game = gamesByPk.get(hr.game_pk) ?? null;
+    const odds = oddsAt.get(dayKey) ?? null;
+    const { primary, all } = classifyMissReasons(snap, game);
+    const category = PARLAY_MISS_CATEGORY[primary];
+    if (category === 'data') dataProblems += 1; else modelProblems += 1;
+
+    missed.push({
+      date: hr.date,
+      player_id: hr.player_id,
+      player_name: snap?.player_name ?? hr.player_name,
+      team: snap?.team ?? hr.team,
+      opponent: hr.opponent,
+      hr_count: hr.hr_count,
+      rank: snap?.rank ?? null,
+      heat_score: snap?.heat_score ?? null,
+      american_odds: odds,
+      primary_reason: primary,
+      reasons: all,
+      category,
+    });
+    reasonCounts.set(primary, (reasonCounts.get(primary) ?? 0) + 1);
   }
 
-  const aggregates = Array.from(reasonCounts.entries()).map(([reason, count]) => ({
-    reason, label: PARLAY_MISS_LABEL[reason],
-    count, share: totalMissed > 0 ? count / totalMissed : 0,
-  })).sort((a, b) => b.count - a.count);
+  const aggregates: ParlayMissAggregate[] = Array.from(reasonCounts.entries())
+    .map(([reason, count]) => ({
+      reason,
+      category: PARLAY_MISS_CATEGORY[reason],
+      label: PARLAY_MISS_LABEL[reason],
+      count,
+      share: totalMissed > 0 ? count / totalMissed : 0,
+    }))
+    .sort((a, b) => b.count - a.count);
 
-  // Sort missed by date desc, then heat desc.
-  missed.sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (b.heat_score ?? 0) - (a.heat_score ?? 0));
+  missed.sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (b.hr_count - a.hr_count));
 
   return {
     anchor, window_days: windowDays,
     total_hr_hitters: totalHr,
     total_missed: totalMissed,
-    aggregates,
-    missed,
+    data_problems: dataProblems,
+    model_problems: modelProblems,
+    aggregates, missed,
+  };
+}
+
+// -----------------------------------------------------------------------------
+//  Coverage Score — per-day + window aggregate
+//  Total HR hitters / In pool / In Top 10 / In parlays / Coverage %
+// -----------------------------------------------------------------------------
+
+export interface CoverageDay {
+  date: string;
+  total_hr_hitters: number;
+  in_pool: number;        // HR hitters with a snapshot row of any rank
+  in_top_10: number;      // HR hitters with rank ≤ 10
+  in_parlays: number;     // HR hitters appearing in any parlay leg
+  pool_coverage: number;
+  top10_coverage: number;
+  parlay_coverage: number;
+}
+
+export interface CoverageScore {
+  anchor: string;
+  window_days: number;
+  days: CoverageDay[];
+  /** Window aggregates. */
+  total_hr_hitters: number;
+  total_in_pool: number;
+  total_in_top_10: number;
+  total_in_parlays: number;
+  pool_coverage_rate: number;
+  top10_coverage_rate: number;
+  parlay_coverage_rate: number;
+}
+
+/**
+ * Compute coverage breakdown per-day + window aggregate. Counts HR hitters
+ * (not HR events — a player who hits 2 HRs in a day counts once).
+ */
+export function computeCoverageScore(
+  snapshots: RevAnalysisSnapshotRow[],
+  hrsByDate: Map<string, Set<number>>,
+  parlayDays: ParlayDayResult[],
+  anchor: string,
+  windowDays = 30,
+): CoverageScore {
+  const rangeStart = addDays(anchor, -(windowDays - 1));
+
+  // Build per-(date,player) snapshot index + per-date Top 10 set.
+  const snapByDayPlayer = new Map<string, RevAnalysisSnapshotRow>();
+  const top10ByDate = new Map<string, Set<number>>();
+  for (const snap of snapshots) {
+    if (snap.target_date < rangeStart || snap.target_date > anchor) continue;
+    snapByDayPlayer.set(`${snap.target_date}:${snap.player_id}`, snap);
+    if (snap.rank <= 10) {
+      const set = top10ByDate.get(snap.target_date) ?? new Set<number>();
+      set.add(snap.player_id);
+      top10ByDate.set(snap.target_date, set);
+    }
+  }
+  const legsByDate = new Map<string, Set<number>>();
+  for (const day of parlayDays) {
+    const set = new Set<number>();
+    for (const leg of day.safe.parlay.legs) set.add(leg.player_id);
+    for (const leg of day.value.parlay.legs) set.add(leg.player_id);
+    for (const leg of day.chaos.parlay.legs) set.add(leg.player_id);
+    legsByDate.set(day.date, set);
+  }
+
+  const days: CoverageDay[] = [];
+  let totalHr = 0, totalPool = 0, totalTop10 = 0, totalParlay = 0;
+
+  const allDates = new Set<string>();
+  for (const d of hrsByDate.keys()) if (d >= rangeStart && d <= anchor) allDates.add(d);
+  const sortedDates = Array.from(allDates).sort();
+
+  for (const date of sortedDates) {
+    const hrSet = hrsByDate.get(date) ?? new Set<number>();
+    if (hrSet.size === 0) continue;
+    const top10 = top10ByDate.get(date) ?? new Set<number>();
+    const legs = legsByDate.get(date) ?? new Set<number>();
+    let inPool = 0, inTop10 = 0, inParlay = 0;
+    for (const pid of hrSet) {
+      if (snapByDayPlayer.has(`${date}:${pid}`)) inPool += 1;
+      if (top10.has(pid)) inTop10 += 1;
+      if (legs.has(pid)) inParlay += 1;
+    }
+    days.push({
+      date,
+      total_hr_hitters: hrSet.size,
+      in_pool: inPool,
+      in_top_10: inTop10,
+      in_parlays: inParlay,
+      pool_coverage: hrSet.size > 0 ? inPool / hrSet.size : 0,
+      top10_coverage: hrSet.size > 0 ? inTop10 / hrSet.size : 0,
+      parlay_coverage: hrSet.size > 0 ? inParlay / hrSet.size : 0,
+    });
+    totalHr += hrSet.size;
+    totalPool += inPool;
+    totalTop10 += inTop10;
+    totalParlay += inParlay;
+  }
+
+  return {
+    anchor, window_days: windowDays,
+    days,
+    total_hr_hitters: totalHr,
+    total_in_pool: totalPool,
+    total_in_top_10: totalTop10,
+    total_in_parlays: totalParlay,
+    pool_coverage_rate: totalHr > 0 ? totalPool / totalHr : 0,
+    top10_coverage_rate: totalHr > 0 ? totalTop10 / totalHr : 0,
+    parlay_coverage_rate: totalHr > 0 ? totalParlay / totalHr : 0,
   };
 }
 
@@ -7047,3 +7282,4 @@ export function analyzeParlayMisses(
 export const PARLAY_STYLE_LABELS = PARLAY_STYLE_LABEL;
 export const PARLAY_STYLE_DESCRIPTIONS = PARLAY_STYLE_DESCRIPTION;
 export const PARLAY_MISS_LABELS = PARLAY_MISS_LABEL;
+export const PARLAY_MISS_CATEGORIES = PARLAY_MISS_CATEGORY;

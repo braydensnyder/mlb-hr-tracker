@@ -33,6 +33,7 @@ import {
   analyzeParlayMisses,
   applyCanonicalTeams,
   backtestParlays,
+  computeCoverageScore,
   computeHrTargets,
   generateParlays,
   hrTargetToParlayCandidate,
@@ -42,12 +43,17 @@ import {
   ELITE_POWER_NAMES,
   PARLAY_STYLE_LABELS,
   PARLAY_STYLE_DESCRIPTIONS,
+  type CoverageScore,
   type HrTargetGame,
+  type MissGameInfo,
+  type MissHrRow,
   type OddsIndex,
   type Parlay,
   type ParlayBacktestResult,
   type ParlayCandidate,
   type ParlayMissAnalysis,
+  type ParlayMissedHitter,
+  type ParlayMissCategory,
   type ParlayStyle,
   type ParlayStyleSummary,
   type PitcherFormLite,
@@ -135,6 +141,7 @@ export default function ParlayLab() {
   // ---- Backtest data ----
   const [backtest, setBacktest] = useState<ParlayBacktestResult | null>(null);
   const [missAnalysis, setMissAnalysis] = useState<ParlayMissAnalysis | null>(null);
+  const [coverage, setCoverage] = useState<CoverageScore | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [bktLoading, setBktLoading] = useState(true);
@@ -212,7 +219,7 @@ export default function ParlayLab() {
     return () => { cancelled = true; };
   }, [asOf, targetDate, refreshKey]);
 
-  // ---- Historical fetch: 30 days for backtest + miss analysis ----
+  // ---- Historical fetch: 30 days for backtest + miss analysis + coverage ----
   useEffect(() => {
     if (!targetDate) return;
     let cancelled = false;
@@ -226,20 +233,42 @@ export default function ParlayLab() {
           fetchHrsRange(from30, anchor),
         ]);
         if (cancelled) return;
+
+        // ---- Build per-date HR set + per-(date,player) HR row info ----
         const hrByDate = new Map<string, Set<number>>();
-        const hrInfo = new Map<number, { player_name: string; team: string }>();
+        const hrRows: MissHrRow[] = [];
+        // Aggregate HRs to player-day (a player who hits 2 HR same day = 1 row, hr_count=2)
+        const seen = new Map<string, MissHrRow>();
         for (const r of hrs) {
+          const key = `${r.game_date}:${r.player_id}`;
+          const existing = seen.get(key);
+          if (existing) {
+            existing.hr_count += 1;
+            continue;
+          }
+          const row: MissHrRow = {
+            date: r.game_date,
+            player_id: r.player_id,
+            player_name: r.player_name,
+            team: r.team,
+            opponent: r.opponent,
+            game_pk: r.game_pk,
+            hr_count: 1,
+          };
+          seen.set(key, row);
+          hrRows.push(row);
           let s = hrByDate.get(r.game_date);
           if (!s) { s = new Set<number>(); hrByDate.set(r.game_date, s); }
           s.add(r.player_id);
-          if (!hrInfo.has(r.player_id)) hrInfo.set(r.player_id, { player_name: r.player_name, team: r.team });
         }
+
         const minimal: RevAnalysisSnapshotRow[] = snaps.map((r) => ({
           target_date: r.target_date, player_id: r.player_id,
           player_name: r.player_name, team: r.team,
           rank: r.rank, heat_score: r.heat_score, reason: r.reason,
         }));
-        // Historical odds index
+
+        // ---- Historical odds index ----
         const oddsIdx: OddsIndex = new Map();
         try {
           for (let page = 0; page < 30; page++) {
@@ -259,15 +288,36 @@ export default function ParlayLab() {
           }
         } catch { /* graceful */ }
 
+        // ---- Historical games index — powers the data-vs-model miss classification ----
+        const gamesByPk = new Map<number, MissGameInfo>();
+        try {
+          for (let page = 0; page < 10; page++) {
+            const { data, error } = await supabase
+              .from('games')
+              .select('game_pk, game_date, home_team, away_team, status, processed, ' +
+                'home_probable_pitcher_id, away_probable_pitcher_id, ' +
+                'lineups_confirmed, home_lineup, away_lineup')
+              .gte('game_date', from30).lte('game_date', anchor)
+              .range(page * PAGE, page * PAGE + PAGE - 1);
+            if (error) break;
+            const rows = (data ?? []) as unknown as MissGameInfo[];
+            for (const g of rows) gamesByPk.set(g.game_pk, g);
+            if (rows.length < PAGE) break;
+          }
+        } catch { /* graceful — missing games table degrades to "missing_from_pool" classification */ }
+
         const bkt = backtestParlays(minimal, hrByDate, oddsIdx, anchor, 30);
-        const miss = analyzeParlayMisses(minimal, hrByDate, oddsIdx, hrInfo, bkt.days, anchor, 30);
+        const miss = analyzeParlayMisses(minimal, hrRows, oddsIdx, gamesByPk, bkt.days, anchor, 30);
+        const cov = computeCoverageScore(minimal, hrByDate, bkt.days, anchor, 30);
         setBacktest(bkt);
         setMissAnalysis(miss);
+        setCoverage(cov);
       } catch (e) {
         // eslint-disable-next-line no-console
         console.warn('[lab] backtest fetch failed:', e);
         setBacktest(null);
         setMissAnalysis(null);
+        setCoverage(null);
       } finally {
         if (!cancelled) setBktLoading(false);
       }
@@ -396,8 +446,9 @@ export default function ParlayLab() {
         <>
           <BestStyleCard backtest={backtest} />
           <SummaryGrid backtest={backtest} />
+          {coverage && <CoveragePanel coverage={coverage} />}
           <BacktestDayTable backtest={backtest} asOf={asOf} />
-          {missAnalysis && <MissAnalysisPanel miss={missAnalysis} />}
+          {missAnalysis && <MissAnalysisPanelV2 miss={missAnalysis} />}
         </>
       )}
 
@@ -688,54 +739,51 @@ function FocusedParlay({ r, accent }: {
   );
 }
 
-function MissAnalysisPanel({ miss }: { miss: ParlayMissAnalysis }) {
+// =============================================================================
+//  Coverage Panel — total HRs / in pool / in Top 10 / in parlays / coverage %
+// =============================================================================
+function CoveragePanel({ coverage }: { coverage: CoverageScore }) {
+  const poolColor = coverage.pool_coverage_rate >= 0.7 ? '#6bd482' : coverage.pool_coverage_rate >= 0.5 ? '#ffd28c' : '#e07a7a';
+  const top10Color = coverage.top10_coverage_rate >= 0.20 ? '#6bd482' : coverage.top10_coverage_rate >= 0.12 ? '#ffd28c' : '#e07a7a';
+  const parlayColor = coverage.parlay_coverage_rate >= 0.10 ? '#6bd482' : coverage.parlay_coverage_rate >= 0.05 ? '#ffd28c' : '#e07a7a';
   return (
     <div className="lab-panel" style={{ marginTop: 14 }}>
-      <h3 style={{ margin: 0, fontSize: 15 }}>🔎 HRs not in any parlay ({miss.total_missed} of {miss.total_hr_hitters})</h3>
+      <h3 style={{ margin: 0, fontSize: 15 }}>📊 Coverage Score ({coverage.window_days}d)</h3>
       <p className="subtle" style={{ fontSize: 11, marginTop: 2 }}>
-        For HR hitters the model didn't include in Safe, Value, or Chaos — why the rules excluded them.
+        How many actual HR hitters the model considered, ranked highly, and surfaced in parlays.
       </p>
-      <div className="lab-miss-grid" style={{ marginTop: 8 }}>
-        {miss.aggregates.map((a) => (
-          <div key={a.reason} className="lab-miss-tile">
-            <div className="lab-miss-count">{a.count}</div>
-            <div className="lab-miss-label">{a.label}</div>
-            <div className="lab-miss-share">{pct(a.share, 0)}</div>
-          </div>
-        ))}
+      <div className="lab-coverage-grid" style={{ marginTop: 8 }}>
+        <CoverageTile label="Total HR hitters" value={coverage.total_hr_hitters} sub="across all dates" color="#aab1c0" />
+        <CoverageTile label="In model pool" value={coverage.total_in_pool} sub={`${(coverage.pool_coverage_rate * 100).toFixed(1)}% of HRs`} color={poolColor} />
+        <CoverageTile label="In Top 10" value={coverage.total_in_top_10} sub={`${(coverage.top10_coverage_rate * 100).toFixed(1)}% of HRs`} color={top10Color} />
+        <CoverageTile label="In parlays" value={coverage.total_in_parlays} sub={`${(coverage.parlay_coverage_rate * 100).toFixed(1)}% of HRs`} color={parlayColor} />
       </div>
       <details style={{ marginTop: 10 }}>
         <summary style={{ cursor: 'pointer', fontSize: 12, opacity: 0.75 }}>
-          Per-player miss list ({miss.missed.length})
+          Per-day coverage breakdown ({coverage.days.length} days)
         </summary>
         <div className="diag-table-wrap" style={{ marginTop: 6 }}>
           <table className="lab-miss-table">
             <thead>
               <tr>
                 <th>Date</th>
-                <th>Player</th>
-                <th>Team</th>
-                <th className="num">Rank</th>
-                <th className="num">Heat</th>
-                <th className="num">Odds</th>
-                <th>Reasons</th>
+                <th className="num">Total HRs</th>
+                <th className="num">In pool</th>
+                <th className="num">In Top 10</th>
+                <th className="num">In parlays</th>
+                <th className="num">Pool %</th>
               </tr>
             </thead>
             <tbody>
-              {miss.missed.slice(0, 100).map((m) => (
-                <tr key={`${m.date}-${m.player_id}`}>
-                  <td>{m.date}</td>
-                  <td>{m.player_name}</td>
-                  <td>{m.team || '—'}</td>
-                  <td className="num">{m.rank ?? '—'}</td>
-                  <td className="num">{m.heat_score?.toFixed(0) ?? '—'}</td>
-                  <td className="num">{m.american_odds != null ? `${m.american_odds > 0 ? '+' : ''}${m.american_odds}` : '—'}</td>
-                  <td>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
-                      {m.reasons.map((r) => (
-                        <span key={r} className="lab-miss-chip">{r.replace(/_/g, ' ')}</span>
-                      ))}
-                    </div>
+              {coverage.days.slice().reverse().map((d) => (
+                <tr key={d.date}>
+                  <td>{d.date}</td>
+                  <td className="num">{d.total_hr_hitters}</td>
+                  <td className="num">{d.in_pool}</td>
+                  <td className="num">{d.in_top_10}</td>
+                  <td className="num">{d.in_parlays}</td>
+                  <td className={`num ${d.pool_coverage >= 0.7 ? 'lab-pos' : d.pool_coverage >= 0.5 ? '' : 'lab-neg'}`}>
+                    {(d.pool_coverage * 100).toFixed(0)}%
                   </td>
                 </tr>
               ))}
@@ -745,6 +793,170 @@ function MissAnalysisPanel({ miss }: { miss: ParlayMissAnalysis }) {
       </details>
     </div>
   );
+}
+
+function CoverageTile({ label, value, sub, color }: { label: string; value: number; sub: string; color: string }) {
+  return (
+    <div className="lab-coverage-tile" style={{ borderLeft: `3px solid ${color}` }}>
+      <div className="lab-coverage-label">{label}</div>
+      <div className="lab-coverage-value" style={{ color }}>{value.toLocaleString()}</div>
+      <div className="lab-coverage-sub">{sub}</div>
+    </div>
+  );
+}
+
+// =============================================================================
+//  Miss Analysis V2 — data vs model taxonomy
+// =============================================================================
+function MissAnalysisPanelV2({ miss }: { miss: ParlayMissAnalysis }) {
+  const dataAggregates = miss.aggregates.filter((a) => a.category === 'data');
+  const modelAggregates = miss.aggregates.filter((a) => a.category === 'model');
+  const [filterCat, setFilterCat] = useState<'all' | 'data' | 'model'>('all');
+  const visibleMisses = miss.missed.filter((m) => filterCat === 'all' || m.category === filterCat);
+
+  return (
+    <div className="lab-panel" style={{ marginTop: 14 }}>
+      <h3 style={{ margin: 0, fontSize: 15 }}>
+        🔎 HRs not in any parlay — {miss.total_missed} of {miss.total_hr_hitters}
+      </h3>
+      <p className="subtle" style={{ fontSize: 11, marginTop: 2 }}>
+        Split by category so you can tell <strong>data problems</strong> (we never saw them) from
+        <strong> model problems</strong> (we had the data, ranked them low).
+      </p>
+
+      {/* Category split summary */}
+      <div className="lab-cat-grid" style={{ marginTop: 8 }}>
+        <div className="lab-cat-tile lab-cat-tile--data">
+          <div className="lab-cat-label">DATA PROBLEMS</div>
+          <div className="lab-cat-value">{miss.data_problems}</div>
+          <div className="lab-cat-share">
+            {miss.total_missed > 0 ? `${((miss.data_problems / miss.total_missed) * 100).toFixed(0)}% of misses` : '—'}
+          </div>
+          <div className="lab-cat-sub">missing lineup, no pitcher, not in pool, unprocessed</div>
+        </div>
+        <div className="lab-cat-tile lab-cat-tile--model">
+          <div className="lab-cat-label">MODEL PROBLEMS</div>
+          <div className="lab-cat-value">{miss.model_problems}</div>
+          <div className="lab-cat-share">
+            {miss.total_missed > 0 ? `${((miss.model_problems / miss.total_missed) * 100).toFixed(0)}% of misses` : '—'}
+          </div>
+          <div className="lab-cat-sub">low score, outside Top 50, blocked by filter</div>
+        </div>
+      </div>
+
+      {/* Per-reason breakdown, grouped by category */}
+      <div className="lab-cat-cols" style={{ marginTop: 12 }}>
+        <ReasonBreakdown title="Data problems" reasons={dataAggregates} accent="#4cc7ff" />
+        <ReasonBreakdown title="Model problems" reasons={modelAggregates} accent="#ffb86c" />
+      </div>
+
+      {/* Per-player table */}
+      <details style={{ marginTop: 10 }}>
+        <summary style={{ cursor: 'pointer', fontSize: 12, opacity: 0.75 }}>
+          Per-player miss table ({miss.missed.length} entries)
+        </summary>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', margin: '6px 0', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 11, opacity: 0.7 }}>Filter:</span>
+          <FilterBtn active={filterCat === 'all'} onClick={() => setFilterCat('all')}>All ({miss.missed.length})</FilterBtn>
+          <FilterBtn active={filterCat === 'data'} onClick={() => setFilterCat('data')}>Data ({miss.data_problems})</FilterBtn>
+          <FilterBtn active={filterCat === 'model'} onClick={() => setFilterCat('model')}>Model ({miss.model_problems})</FilterBtn>
+        </div>
+        <div className="diag-table-wrap">
+          <table className="lab-miss-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Player</th>
+                <th>Team</th>
+                <th>Opp</th>
+                <th className="num">HRs</th>
+                <th>Reason missed</th>
+                <th className="num">Heat</th>
+                <th className="num">Rank</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleMisses.slice(0, 150).map((m) => (
+                <tr key={`${m.date}-${m.player_id}`}>
+                  <td>{m.date}</td>
+                  <td>{m.player_name}</td>
+                  <td>{m.team || '—'}</td>
+                  <td>{m.opponent || '—'}</td>
+                  <td className="num">{m.hr_count}</td>
+                  <td>
+                    <span className={`lab-cat-chip lab-cat-chip--${m.category}`}>
+                      {prettyReason(m.primary_reason)}
+                    </span>
+                  </td>
+                  <td className="num">{m.heat_score != null ? m.heat_score.toFixed(0) : '—'}</td>
+                  <td className="num">{m.rank ?? '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {visibleMisses.length > 150 && (
+            <p className="subtle" style={{ fontSize: 11, marginTop: 6, textAlign: 'right' }}>
+              Showing 150 of {visibleMisses.length}
+            </p>
+          )}
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function ReasonBreakdown({ title, reasons, accent }: {
+  title: string;
+  reasons: { reason: string; label: string; count: number; share: number }[];
+  accent: string;
+}) {
+  if (reasons.length === 0) {
+    return (
+      <div className="lab-reason-col" style={{ borderTop: `3px solid ${accent}` }}>
+        <h4 style={{ margin: 0, fontSize: 13, color: accent }}>{title}</h4>
+        <p className="subtle" style={{ fontSize: 11, marginTop: 6 }}>None.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="lab-reason-col" style={{ borderTop: `3px solid ${accent}` }}>
+      <h4 style={{ margin: 0, fontSize: 13, color: accent }}>{title}</h4>
+      <ul style={{ listStyle: 'none', padding: 0, margin: '6px 0 0' }}>
+        {reasons.map((r) => (
+          <li key={r.reason} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', padding: '4px 0', borderBottom: '1px solid var(--border, #1f2330)' }}>
+            <span style={{ fontSize: 12 }}>{r.label}</span>
+            <span style={{ fontSize: 13, fontWeight: 700 }}>
+              {r.count} <span className="subtle" style={{ fontSize: 10, fontWeight: 400 }}>({(r.share * 100).toFixed(0)}%)</span>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function FilterBtn({ children, active, onClick }: { children: React.ReactNode; active: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        background: active ? '#2d3a52' : 'var(--panel-2, #14171f)',
+        border: `1px solid ${active ? '#4a6fa5' : 'var(--border, #232732)'}`,
+        color: active ? '#fff' : '#cfe',
+        padding: '3px 9px',
+        borderRadius: 6,
+        fontSize: 11,
+        cursor: 'pointer',
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function prettyReason(r: string): string {
+  return r.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function pct(n: number, d = 1): string {
@@ -856,6 +1068,63 @@ function LabStyles() {
         font-size: 9.5px; font-weight: 600;
         background: rgba(192,132,252,0.12); color: #c084fc; border: 1px solid rgba(192,132,252,0.35);
         text-transform: capitalize;
+      }
+
+      /* Coverage tiles */
+      .lab-coverage-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 6px;
+      }
+      .lab-coverage-tile {
+        background: var(--panel-2, #14171f);
+        border: 1px solid var(--border, #232732);
+        border-radius: 8px;
+        padding: 8px 12px;
+      }
+      .lab-coverage-label { font-size: 11px; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.05em; }
+      .lab-coverage-value { font-size: 22px; font-weight: 700; margin-top: 2px; }
+      .lab-coverage-sub { font-size: 10.5px; opacity: 0.65; margin-top: 1px; }
+
+      /* Miss category split tiles */
+      .lab-cat-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .lab-cat-tile {
+        background: var(--panel-2, #14171f);
+        border: 1px solid var(--border, #232732);
+        border-radius: 8px;
+        padding: 10px 12px;
+      }
+      .lab-cat-tile--data  { border-left: 4px solid #4cc7ff; }
+      .lab-cat-tile--model { border-left: 4px solid #ffb86c; }
+      .lab-cat-label { font-size: 10.5px; opacity: 0.75; letter-spacing: 0.06em; font-weight: 700; }
+      .lab-cat-value { font-size: 26px; font-weight: 700; color: #cfe; margin-top: 2px; }
+      .lab-cat-share { font-size: 11px; opacity: 0.7; }
+      .lab-cat-sub   { font-size: 10.5px; opacity: 0.6; margin-top: 2px; line-height: 1.35; }
+      .lab-cat-cols {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .lab-reason-col {
+        background: var(--panel-2, #14171f);
+        border: 1px solid var(--border, #232732);
+        border-radius: 8px;
+        padding: 8px 12px;
+      }
+      .lab-cat-chip {
+        display: inline-block; padding: 1px 7px; border-radius: 999px;
+        font-size: 10px; font-weight: 600; white-space: nowrap;
+      }
+      .lab-cat-chip--data  { background: rgba(76,199,255,0.14); color: #4cc7ff; border: 1px solid rgba(76,199,255,0.4); }
+      .lab-cat-chip--model { background: rgba(255,184,108,0.14); color: #ffb86c; border: 1px solid rgba(255,184,108,0.4); }
+
+      @media (max-width: 720px) {
+        .lab-cat-grid { grid-template-columns: 1fr; }
+        .lab-cat-cols { grid-template-columns: 1fr; }
       }
     `}</style>
   );
