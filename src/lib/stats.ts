@@ -6599,18 +6599,57 @@ export function snapshotToParlayCandidate(
 }
 
 // -----------------------------------------------------------------------------
-//  Rule definitions — kept as constants so the UI can recap them honestly
+//  Rule definitions — parameterized so different model versions can use
+//  different cutoffs without forking generateParlays.
 // -----------------------------------------------------------------------------
 
-const SAFE_HEAT_MIN = 55;
-const SAFE_ODDS_MAX = 400;
-const VALUE_HEAT_MIN = 50;
-const VALUE_ODDS_MIN = 250;
-const VALUE_ODDS_MAX = 600;
-const VALUE_EDGE_MIN = 0.02; // 2% positive edge
-const CHAOS_RANK_MAX = 80;
-const CHAOS_ODDS_MIN = 500;
-const CHAOS_CHIP_MIN = 2;
+/** Cutoffs that distinguish Safe/Value/Chaos eligibility. Defaults match
+ *  v1's live constants below. Different model versions can override any
+ *  subset of these (see DEFAULT_PARLAY_RULES + Object.assign in callers). */
+export interface ParlayRules {
+  /** Safe: heat_score floor. */
+  safe_heat_min: number;
+  /** Safe: max American odds (lower = book agrees). */
+  safe_odds_max: number;
+  /** Value: heat_score floor. */
+  value_heat_min: number;
+  /** Value: min American odds. */
+  value_odds_min: number;
+  /** Value: max American odds. */
+  value_odds_max: number;
+  /** Value: min positive edge (modelProb − impliedProb). */
+  value_edge_min: number;
+  /** Chaos: max rank still eligible. */
+  chaos_rank_max: number;
+  /** Chaos: min American odds (longshots only). */
+  chaos_odds_min: number;
+  /** Chaos: min good-chip count for a stacked-signal candidate. */
+  chaos_chip_min: number;
+}
+
+export const DEFAULT_PARLAY_RULES: ParlayRules = {
+  safe_heat_min: 55,
+  safe_odds_max: 400,
+  value_heat_min: 50,
+  value_odds_min: 250,
+  value_odds_max: 600,
+  value_edge_min: 0.02,
+  chaos_rank_max: 80,
+  chaos_odds_min: 500,
+  chaos_chip_min: 2,
+};
+
+// Legacy constants kept for backward compat with the existing callers that
+// import them directly. Same values as DEFAULT_PARLAY_RULES.
+const SAFE_HEAT_MIN = DEFAULT_PARLAY_RULES.safe_heat_min;
+const SAFE_ODDS_MAX = DEFAULT_PARLAY_RULES.safe_odds_max;
+const VALUE_HEAT_MIN = DEFAULT_PARLAY_RULES.value_heat_min;
+const VALUE_ODDS_MIN = DEFAULT_PARLAY_RULES.value_odds_min;
+const VALUE_ODDS_MAX = DEFAULT_PARLAY_RULES.value_odds_max;
+const VALUE_EDGE_MIN = DEFAULT_PARLAY_RULES.value_edge_min;
+const CHAOS_RANK_MAX = DEFAULT_PARLAY_RULES.chaos_rank_max;
+const CHAOS_ODDS_MIN = DEFAULT_PARLAY_RULES.chaos_odds_min;
+const CHAOS_CHIP_MIN = DEFAULT_PARLAY_RULES.chaos_chip_min;
 
 /**
  * Generate the three daily parlays (Safe / Value / Chaos) from a set of
@@ -6618,46 +6657,52 @@ const CHAOS_CHIP_MIN = 2;
  *
  * Each style's rules are spelled out in the rule_text on the returned
  * Parlay so the UI can show what fired and what didn't.
+ *
+ * @param rules optional per-model cutoffs. Defaults to v1's live rules.
  */
-export function generateParlays(candidates: ParlayCandidate[]): {
+export function generateParlays(
+  candidates: ParlayCandidate[],
+  rules: ParlayRules = DEFAULT_PARLAY_RULES,
+): {
   safe: Parlay; value: Parlay; chaos: Parlay;
 } {
-  // ---- Safe: heat ≥ 55, odds ≤ +400 (or no odds → fall back to heat alone)
+  const R = rules;
+  // ---- Safe ----
   const safeQual = candidates.filter((c) => {
-    if (c.heat_score < SAFE_HEAT_MIN) return false;
+    if (c.heat_score < R.safe_heat_min) return false;
     if (c.signals.has('cold_batter')) return false;
-    if (c.american_odds != null && c.american_odds > SAFE_ODDS_MAX) return false;
+    if (c.american_odds != null && c.american_odds > R.safe_odds_max) return false;
     return true;
   });
   const safePicks = greedyPickWithGameDiversity(safeQual, 3, (c) => c.heat_score, 2);
   const safe = assembleParlay(
     'safe',
     safePicks.map(toLeg),
-    `Heat ≥ ${SAFE_HEAT_MIN}, odds ≤ +${SAFE_ODDS_MAX}, no cold-batter penalty.`,
+    `Heat ≥ ${R.safe_heat_min}, odds ≤ +${R.safe_odds_max}, no cold-batter penalty.`,
   );
 
-  // ---- Value: heat ≥ 50, +250..+600, model edge over book ≥ 2 pct pts
+  // ---- Value ----
   const valueQual = candidates.filter((c) => {
     if (c.american_odds == null || c.edge == null) return false;
-    if (c.heat_score < VALUE_HEAT_MIN) return false;
+    if (c.heat_score < R.value_heat_min) return false;
     if (c.signals.has('cold_batter')) return false;
-    if (c.american_odds < VALUE_ODDS_MIN) return false;
-    if (c.american_odds > VALUE_ODDS_MAX) return false;
-    if (c.edge < VALUE_EDGE_MIN) return false;
+    if (c.american_odds < R.value_odds_min) return false;
+    if (c.american_odds > R.value_odds_max) return false;
+    if (c.edge < R.value_edge_min) return false;
     return true;
   });
   const valuePicks = greedyPickWithGameDiversity(valueQual, 3, (c) => c.edge ?? 0, 0.01);
   const value = assembleParlay(
     'value',
     valuePicks.map(toLeg),
-    `Heat ≥ ${VALUE_HEAT_MIN}, odds +${VALUE_ODDS_MIN} to +${VALUE_ODDS_MAX}, model edge ≥ ${(VALUE_EDGE_MIN * 100).toFixed(0)} pct pts.`,
+    `Heat ≥ ${R.value_heat_min}, odds +${R.value_odds_min} to +${R.value_odds_max}, model edge ≥ ${(R.value_edge_min * 100).toFixed(1)} pct pts.`,
   );
 
-  // ---- Chaos: rank ≤ 80, odds ≥ +500, ≥ 2 good chips, not cold
+  // ---- Chaos ----
   const chaosQual = candidates.filter((c) => {
-    if (c.rank > CHAOS_RANK_MAX) return false;
-    if (c.american_odds == null || c.american_odds < CHAOS_ODDS_MIN) return false;
-    if (c.good_chip_count < CHAOS_CHIP_MIN) return false;
+    if (c.rank > R.chaos_rank_max) return false;
+    if (c.american_odds == null || c.american_odds < R.chaos_odds_min) return false;
+    if (c.good_chip_count < R.chaos_chip_min) return false;
     if (c.signals.has('cold_batter')) return false;
     if (c.signals.has('pitcher_dominant')) return false;
     return true;
@@ -6667,7 +6712,7 @@ export function generateParlays(candidates: ParlayCandidate[]): {
   const chaos = assembleParlay(
     'chaos',
     chaosPicks.map(toLeg),
-    `Rank ≤ ${CHAOS_RANK_MAX}, odds ≥ +${CHAOS_ODDS_MIN}, ≥ ${CHAOS_CHIP_MIN} good chips, no cold or dominant-pitcher penalty.`,
+    `Rank ≤ ${R.chaos_rank_max}, odds ≥ +${R.chaos_odds_min}, ≥ ${R.chaos_chip_min} good chips, no cold or dominant-pitcher penalty.`,
   );
 
   return { safe, value, chaos };
@@ -7589,5 +7634,159 @@ export function computeModelVersionMetrics(
     per_leg_hit_rate: totalLegs > 0 ? totalLegsHit / totalLegs : 0,
     pool_coverage_rate: coverage.pool_coverage_rate,
     top10_coverage_rate: coverage.top10_coverage_rate,
+  };
+}
+
+// =============================================================================
+//  Multi-model replay (task #257)
+// -----------------------------------------------------------------------------
+//  Replay v1's saved snapshot data through an alternative model
+//  configuration (different signal-weight bonuses + parlay rules).
+//
+//  IMPORTANT — honest scope: this is "signal-based replay," not a full
+//  re-run of the scoring pipeline. We take v1's saved heat_score and add
+//  per-signal bonuses based on the chip presence stored in
+//  snapshot.reason. The full subscore breakdown isn't persisted, so a
+//  pure reweight would need either (a) a schema change to save subscores
+//  per snapshot or (b) re-running computeHrTargets from raw data per
+//  date per model. We chose (c): post-hoc additive signal adjustments.
+//  The same approach is used by the grid search in the Reverse Analysis
+//  layer — it's a legitimate sensitivity test, but the UI must say so.
+// =============================================================================
+
+/** Per-signal additive bonus to a player's heat_score for one model
+ *  version. Missing keys default to 0. Negative values are allowed and
+ *  represent a model that penalizes a signal more aggressively than v1. */
+export type ModelSignalWeights = Partial<Record<SignalKey, number>>;
+
+/** The full config for one model version. Stored in
+ *  model_versions.weights_json. */
+export interface ModelConfig {
+  version: number;
+  name: string;
+  /** Per-signal additive bonus. v1 has all zeros (baseline). */
+  signal_weights: ModelSignalWeights;
+  /** Parlay rule overrides. Falls back to DEFAULT_PARLAY_RULES per key. */
+  parlay_rules: Partial<ParlayRules>;
+  /** Optional plain-English description for the UI. */
+  description?: string;
+}
+
+/** Resolve a partial ParlayRules into the full struct, filling defaults. */
+export function mergeParlayRules(overrides: Partial<ParlayRules> | undefined): ParlayRules {
+  return { ...DEFAULT_PARLAY_RULES, ...(overrides ?? {}) };
+}
+
+/** Build the v1 baseline config — all zero signal bonuses, default rules. */
+export function buildBaselineModelConfig(version = 1, name = 'v1 baseline'): ModelConfig {
+  return { version, name, signal_weights: {}, parlay_rules: {} };
+}
+
+/** Apply one model's signal weights to a snapshot row → modified candidate.
+ *  Pure: returns a new object, never mutates. */
+export function applyModelToSnapshot(
+  snap: RevAnalysisSnapshotRow,
+  odds: number | null,
+  config: ModelConfig,
+): ParlayCandidate & { original_heat: number; original_rank: number } {
+  const base = snapshotToParlayCandidate(snap, odds);
+  let modifiedHeat = base.heat_score;
+  for (const key of Object.keys(config.signal_weights) as SignalKey[]) {
+    const w = config.signal_weights[key] ?? 0;
+    if (w === 0) continue;
+    if (base.signals.has(key)) modifiedHeat += w;
+  }
+  // Recompute model_prob from modified heat (so the parlay's joint
+  // probability matches the new ranking).
+  const modProb = heatToProb(modifiedHeat);
+  const implied = base.implied_prob;
+  return {
+    ...base,
+    heat_score: modifiedHeat,
+    model_prob: modProb,
+    edge: implied != null ? modProb - implied : null,
+    original_heat: base.heat_score,
+    original_rank: base.rank,
+  };
+}
+
+/** Single-date replay: take v1's snapshot + odds, apply a model config,
+ *  re-rank, generate parlays, build learning-prediction records. */
+export interface ReplayResult {
+  date: string;
+  model_version: number;
+  candidates: Array<ParlayCandidate & { original_heat: number; original_rank: number }>;
+  safe: Parlay;
+  value: Parlay;
+  chaos: Parlay;
+  records: LearningPredictionRecord[];
+}
+
+export function replayDateUnderModel(opts: {
+  date: string;
+  snapshots: RevAnalysisSnapshotRow[];
+  odds: Map<number, number>;
+  hr_player_ids: Set<number>;
+  hr_count_by_player: Map<number, number>;
+  opponent_by_player: Map<number, string>;
+  game_pk_by_player: Map<number, number>;
+  config: ModelConfig;
+}): ReplayResult {
+  // 1. Apply signal weights to every candidate.
+  const candidates = opts.snapshots.map((snap) =>
+    applyModelToSnapshot(snap, opts.odds.get(snap.player_id) ?? null, opts.config),
+  );
+
+  // 2. Re-rank by modified heat_score (descending).
+  candidates.sort((a, b) => b.heat_score - a.heat_score);
+  for (let i = 0; i < candidates.length; i++) candidates[i].rank = i + 1;
+
+  // 3. Generate parlays under this model's rules.
+  const rules = mergeParlayRules(opts.config.parlay_rules);
+  const { safe, value, chaos } = generateParlays(candidates, rules);
+
+  // 4. Build learning-prediction records, one per snapshot row.
+  const inSafe = new Set(safe.legs.map((l) => l.player_id));
+  const inValue = new Set(value.legs.map((l) => l.player_id));
+  const inChaos = new Set(chaos.legs.map((l) => l.player_id));
+
+  const records: LearningPredictionRecord[] = candidates.map((c) => {
+    // Find the original snapshot row to preserve player_name/team/reason.
+    const snap = opts.snapshots.find((s) => s.player_id === c.player_id)!;
+    const homered = opts.hr_player_ids.has(c.player_id);
+    const hrCount = opts.hr_count_by_player.get(c.player_id) ?? 0;
+    // Build a "synthetic" snapshot with the modified heat/rank for the
+    // learning record. This keeps the rest of the record builder honest:
+    // it sees the rank the alternative model produced.
+    const syntheticSnap: RevAnalysisSnapshotRow = {
+      target_date: snap.target_date,
+      player_id: snap.player_id,
+      player_name: snap.player_name,
+      team: snap.team,
+      rank: c.rank,
+      heat_score: c.heat_score,
+      reason: snap.reason,
+    };
+    return buildLearningPredictionRecord({
+      snapshot: syntheticSnap,
+      model_version: opts.config.version,
+      opponent: opts.opponent_by_player.get(c.player_id) ?? null,
+      game_pk: opts.game_pk_by_player.get(c.player_id) ?? null,
+      in_safe: inSafe.has(c.player_id),
+      in_value: inValue.has(c.player_id),
+      in_chaos: inChaos.has(c.player_id),
+      homered,
+      hr_count: hrCount,
+    });
+  });
+
+  return {
+    date: opts.date,
+    model_version: opts.config.version,
+    candidates,
+    safe,
+    value,
+    chaos,
+    records,
   };
 }

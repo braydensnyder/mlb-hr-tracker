@@ -17,8 +17,10 @@ import { Link } from 'react-router-dom';
 import {
   fetchModelVersions,
   fetchLearningCaptureSummary,
+  fetchModelComparison,
   type ModelVersionRow,
   type LearningCaptureDay,
+  type ModelComparisonRow,
 } from '../lib/supabase';
 import { mlbToday } from '../lib/mlbDate';
 import { addDays } from '../lib/stats';
@@ -28,9 +30,10 @@ const todayISO = mlbToday;
 export default function LearningDashboard() {
   const [versions, setVersions] = useState<ModelVersionRow[]>([]);
   const [captures, setCaptures] = useState<LearningCaptureDay[]>([]);
+  const [comparison, setComparison] = useState<ModelComparisonRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [windowDays, setWindowDays] = useState<14 | 30 | 60>(30);
+  const [windowDays, setWindowDays] = useState<7 | 14 | 30 | 60>(30);
 
   useEffect(() => {
     let cancelled = false;
@@ -40,13 +43,15 @@ export default function LearningDashboard() {
       try {
         const anchor = addDays(todayISO(), -1);
         const from = addDays(anchor, -(windowDays - 1));
-        const [vs, caps] = await Promise.all([
+        const [vs, caps, comp] = await Promise.all([
           fetchModelVersions(),
           fetchLearningCaptureSummary({ from, to: anchor }),
+          fetchModelComparison({ from, to: anchor }),
         ]);
         if (cancelled) return;
         setVersions(vs);
         setCaptures(caps);
+        setComparison(comp);
       } catch (e) {
         if (cancelled) return;
         setError(e instanceof Error ? e.message : String(e));
@@ -94,7 +99,7 @@ export default function LearningDashboard() {
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
         <span style={{ fontSize: 12, opacity: 0.7 }}>Window:</span>
-        {([14, 30, 60] as const).map((w) => (
+        {([7, 14, 30, 60] as const).map((w) => (
           <button
             key={w}
             type="button"
@@ -196,6 +201,9 @@ export default function LearningDashboard() {
             </div>
           </div>
 
+          {/* Multi-model comparison */}
+          <ModelComparisonPanel comparison={comparison} windowDays={windowDays} />
+
           {/* Captures table */}
           <div className="ld-panel" style={{ marginTop: 12 }}>
             <h3 style={{ margin: 0, fontSize: 14 }}>📅 Captures ({captures.length})</h3>
@@ -277,6 +285,112 @@ export default function LearningDashboard() {
 
       <DashStyles />
     </>
+  );
+}
+
+// =============================================================================
+//  Model Comparison Panel — performance per model_version over the window
+// =============================================================================
+function ModelComparisonPanel({ comparison, windowDays }: { comparison: ModelComparisonRow[]; windowDays: number }) {
+  // Rank by full hit rate, tiebreaker 2/3, then per-leg.
+  const ranked = useMemo(() => {
+    return comparison
+      .slice()
+      .sort((a, b) => {
+        if (b.parlay_full_hit_rate !== a.parlay_full_hit_rate) return b.parlay_full_hit_rate - a.parlay_full_hit_rate;
+        if (b.parlay_2of3_hit_rate !== a.parlay_2of3_hit_rate) return b.parlay_2of3_hit_rate - a.parlay_2of3_hit_rate;
+        if (b.avg_legs_hit_per_parlay !== a.avg_legs_hit_per_parlay) return b.avg_legs_hit_per_parlay - a.avg_legs_hit_per_parlay;
+        return b.top10_coverage - a.top10_coverage;
+      });
+  }, [comparison]);
+
+  const winner = ranked.find((r) => r.days_tested > 0) ?? null;
+  if (comparison.length === 0) return null;
+
+  return (
+    <div className="ld-panel" style={{ marginTop: 12, borderLeft: '3px solid #c084fc' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+        <h3 style={{ margin: 0, fontSize: 14 }}>🥇 Model Comparison — {windowDays}d</h3>
+        {winner && (
+          <span style={{ fontSize: 11, opacity: 0.85 }}>
+            Best: <strong style={{ color: '#c084fc' }}>v{winner.version} {winner.name}</strong>
+            {' '}({(winner.parlay_full_hit_rate * 100).toFixed(1)}% 3/3, {(winner.parlay_2of3_hit_rate * 100).toFixed(1)}% 2/3)
+          </span>
+        )}
+      </div>
+      <p className="subtle" style={{ fontSize: 11, marginTop: 4, lineHeight: 1.5 }}>
+        Each version replayed against the same saved snapshots over the {windowDays}-day window. Ranked by Full 3/3
+        hit rate (tiebreaker: 2/3, then avg legs hit, then Top-10 coverage). Run{' '}
+        <code>npm run learning:replay-models</code> to populate v2-v6.
+      </p>
+
+      <div className="ld-table-wrap" style={{ marginTop: 6 }}>
+        <table className="ld-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Version</th>
+              <th className="num">Days</th>
+              <th className="num">HRs</th>
+              <th className="num">Top 3</th>
+              <th className="num">Top 10</th>
+              <th className="num">3/3</th>
+              <th className="num">2/3</th>
+              <th className="num">Avg legs</th>
+              <th className="num">Missed HR</th>
+              <th>Best day</th>
+              <th>Worst day</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ranked.map((r, i) => (
+              <tr key={r.version}>
+                <td>
+                  {i === 0 && r.days_tested > 0 && <span style={{ color: '#c084fc', fontWeight: 700 }}>🥇</span>}
+                  {i === 1 && r.days_tested > 0 && <span>🥈</span>}
+                  {i === 2 && r.days_tested > 0 && <span>🥉</span>}
+                </td>
+                <td>
+                  <strong>v{r.version}</strong> {r.name}
+                  {r.is_active && <span className="ld-active" style={{ marginLeft: 6 }}>active</span>}
+                </td>
+                <td className="num">{r.days_tested}</td>
+                <td className="num">{r.total_hr_hitters}</td>
+                <td className="num">
+                  {r.total_hr_hitters > 0 ? `${r.hr_in_top3}/${r.total_hr_hitters} (${(r.top3_coverage * 100).toFixed(0)}%)` : '—'}
+                </td>
+                <td className="num">
+                  {r.total_hr_hitters > 0 ? `${r.hr_in_top10}/${r.total_hr_hitters} (${(r.top10_coverage * 100).toFixed(0)}%)` : '—'}
+                </td>
+                <td className={`num ${r.parlay_full_hit_rate >= 0.10 ? 'ld-pos' : r.parlay_full_hit_rate >= 0.05 ? 'ld-warn' : 'ld-neg'}`}>
+                  {r.days_tested > 0 ? `${(r.parlay_full_hit_rate * 100).toFixed(1)}%` : '—'}
+                </td>
+                <td className="num">
+                  {r.days_tested > 0 ? `${(r.parlay_2of3_hit_rate * 100).toFixed(1)}%` : '—'}
+                </td>
+                <td className="num">
+                  {r.days_tested > 0 ? r.avg_legs_hit_per_parlay.toFixed(2) : '—'}
+                </td>
+                <td className={`num ${r.missed_hr_count > 0 ? 'ld-neg' : ''}`}>{r.missed_hr_count}</td>
+                <td className="subtle" style={{ fontSize: 11 }}>
+                  {r.best_day ? `${r.best_day.date} (${r.best_day.full_parlays_hit}× 3/3, ${r.best_day.legs_hit} legs)` : '—'}
+                </td>
+                <td className="subtle" style={{ fontSize: 11 }}>
+                  {r.worst_day ? `${r.worst_day.date} (${r.worst_day.legs_hit} legs hit, ${r.worst_day.hr_hitters} HRs)` : '—'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="subtle" style={{ fontSize: 10.5, marginTop: 8, lineHeight: 1.5 }}>
+        <strong>Honest scope:</strong> v2–v6 use signal-based replay — they apply per-chip additive bonuses
+        to v1's saved heat scores, then re-rank. They do <em>not</em> re-run the full scoring pipeline from
+        raw inputs (that would need a schema change to save subscores per snapshot). v6 in particular is
+        a degraded proxy — we don't have team-implied-runs in snapshots yet. Treat these as sensitivity tests, not pure backtests.
+      </p>
+    </div>
   );
 }
 

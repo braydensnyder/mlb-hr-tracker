@@ -744,6 +744,229 @@ export async function fetchLearningCaptureSummary(opts: {
   return summaries;
 }
 
+/** Per-version performance metrics across a window. Used by the
+ *  Learning Dashboard's Model Comparison panel. */
+export interface ModelComparisonRow {
+  version: number;
+  name: string;
+  is_active: boolean;
+  days_tested: number;
+  /** Distinct dates covered. */
+  dates: string[];
+  total_players_scored: number;
+  total_hr_hitters: number;
+  /** HR hitters with rank ≤ 10. */
+  hr_in_top10: number;
+  /** HR hitters with rank ≤ 3. */
+  hr_in_top3: number;
+  /** Top 10 coverage = hr_in_top10 / total_hr_hitters. */
+  top10_coverage: number;
+  /** Top 3 coverage = hr_in_top3 / total_hr_hitters. */
+  top3_coverage: number;
+  /** Days where at least one full 3/3 parlay hit. Best estimate from
+   *  the saved in_safe/in_value/in_chaos + homered flags. */
+  parlay_full_3of3_hits: number;
+  parlay_2of3_hits: number;
+  /** Total legs hit across all parlays in the window. */
+  total_legs_hit: number;
+  /** Total legs placed (parlays_built × 3). */
+  total_legs_placed: number;
+  parlay_full_hit_rate: number;
+  parlay_2of3_hit_rate: number;
+  avg_legs_hit_per_parlay: number;
+  /** Days where parlays missed every HR hitter. */
+  worst_day: { date: string; hr_hitters: number; legs_hit: number } | null;
+  /** Day with best 3/3 hit. */
+  best_day: { date: string; legs_hit: number; full_parlays_hit: number } | null;
+  missed_hr_count: number;
+  /** Classification breakdown. */
+  tp: number; fp: number; fn: number; tn: number;
+}
+
+/** Build per-version comparison metrics from learning_predictions over
+ *  a [from, to] date window. Aggregates client-side (no server SQL needed). */
+export async function fetchModelComparison(opts: {
+  from: string; to: string;
+}): Promise<ModelComparisonRow[]> {
+  const PAGE_SIZE = 1000;
+  // 1. Load all versions for name lookup.
+  const versions = await fetchModelVersions();
+  if (versions.length === 0) return [];
+
+  // 2. Stream learning_predictions in pages.
+  type R = {
+    target_date: string; player_id: number; model_version: number;
+    rank: number | null; homered: boolean | null;
+    in_safe: boolean; in_value: boolean; in_chaos: boolean;
+    classification: 'TP' | 'FP' | 'FN' | 'TN' | null;
+  };
+  const all: R[] = [];
+  for (let page = 0; page < 50; page++) {
+    const { data, error } = await supabase
+      .from('learning_predictions')
+      .select('target_date, player_id, model_version, rank, homered, in_safe, in_value, in_chaos, classification')
+      .gte('target_date', opts.from)
+      .lte('target_date', opts.to)
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return [];
+      throw new Error(error.message);
+    }
+    const rows = (data ?? []) as R[];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+
+  // 3. Group by (version, date) for per-day parlay tally.
+  type DayAccum = {
+    hr_count: number;            // distinct HR hitters
+    hr_in_top10: number;
+    hr_in_top3: number;
+    safe_legs_hit: number; safe_full: boolean; safe_2of3: boolean; safe_complete: boolean;
+    value_legs_hit: number; value_full: boolean; value_2of3: boolean; value_complete: boolean;
+    chaos_legs_hit: number; chaos_full: boolean; chaos_2of3: boolean; chaos_complete: boolean;
+    hr_seen: Set<number>;
+    safe_count: number; value_count: number; chaos_count: number;
+  };
+  const dayByVer = new Map<string, DayAccum>(); // key = `${version}:${date}`
+
+  for (const r of all) {
+    const key = `${r.model_version}:${r.target_date}`;
+    let day = dayByVer.get(key);
+    if (!day) {
+      day = {
+        hr_count: 0, hr_in_top10: 0, hr_in_top3: 0,
+        safe_legs_hit: 0, safe_full: false, safe_2of3: false, safe_complete: false,
+        value_legs_hit: 0, value_full: false, value_2of3: false, value_complete: false,
+        chaos_legs_hit: 0, chaos_full: false, chaos_2of3: false, chaos_complete: false,
+        hr_seen: new Set<number>(),
+        safe_count: 0, value_count: 0, chaos_count: 0,
+      };
+      dayByVer.set(key, day);
+    }
+    if (r.homered === true && !day.hr_seen.has(r.player_id)) {
+      day.hr_seen.add(r.player_id);
+      day.hr_count += 1;
+      if (r.rank != null && r.rank <= 10) day.hr_in_top10 += 1;
+      if (r.rank != null && r.rank <= 3) day.hr_in_top3 += 1;
+    }
+    if (r.in_safe) {
+      day.safe_count += 1;
+      if (r.homered === true) day.safe_legs_hit += 1;
+    }
+    if (r.in_value) {
+      day.value_count += 1;
+      if (r.homered === true) day.value_legs_hit += 1;
+    }
+    if (r.in_chaos) {
+      day.chaos_count += 1;
+      if (r.homered === true) day.chaos_legs_hit += 1;
+    }
+  }
+
+  // Decide parlay completion + hit status per day-version.
+  for (const day of dayByVer.values()) {
+    day.safe_complete = day.safe_count === 3;
+    day.value_complete = day.value_count === 3;
+    day.chaos_complete = day.chaos_count === 3;
+    if (day.safe_complete && day.safe_legs_hit === 3) day.safe_full = true;
+    else if (day.safe_complete && day.safe_legs_hit === 2) day.safe_2of3 = true;
+    if (day.value_complete && day.value_legs_hit === 3) day.value_full = true;
+    else if (day.value_complete && day.value_legs_hit === 2) day.value_2of3 = true;
+    if (day.chaos_complete && day.chaos_legs_hit === 3) day.chaos_full = true;
+    else if (day.chaos_complete && day.chaos_legs_hit === 2) day.chaos_2of3 = true;
+  }
+
+  // 4. Roll up per version.
+  const out: ModelComparisonRow[] = [];
+  for (const v of versions) {
+    const days = Array.from(dayByVer.entries())
+      .filter(([k]) => k.startsWith(`${v.version}:`))
+      .map(([k, day]) => ({ date: k.split(':')[1], day }));
+    if (days.length === 0) {
+      out.push({
+        version: v.version, name: v.name, is_active: v.active,
+        days_tested: 0, dates: [],
+        total_players_scored: 0,
+        total_hr_hitters: 0,
+        hr_in_top10: 0, hr_in_top3: 0,
+        top10_coverage: 0, top3_coverage: 0,
+        parlay_full_3of3_hits: 0, parlay_2of3_hits: 0,
+        total_legs_hit: 0, total_legs_placed: 0,
+        parlay_full_hit_rate: 0, parlay_2of3_hit_rate: 0, avg_legs_hit_per_parlay: 0,
+        worst_day: null, best_day: null,
+        missed_hr_count: 0,
+        tp: 0, fp: 0, fn: 0, tn: 0,
+      });
+      continue;
+    }
+
+    // Total players scored = all rows for this version (not deduped — different days).
+    const totalPlayers = all.filter((r) => r.model_version === v.version).length;
+    let totalHr = 0, top10 = 0, top3 = 0;
+    let fullHits = 0, twoOfThree = 0;
+    let legsHit = 0, legsPlaced = 0;
+    let bestDay: ModelComparisonRow['best_day'] = null;
+    let worstDay: ModelComparisonRow['worst_day'] = null;
+    let parlaysBuilt = 0;
+
+    for (const { date, day } of days) {
+      totalHr += day.hr_count;
+      top10 += day.hr_in_top10;
+      top3 += day.hr_in_top3;
+      const dayLegsHit = day.safe_legs_hit + day.value_legs_hit + day.chaos_legs_hit;
+      const dayLegsPlaced = (day.safe_complete ? 3 : 0) + (day.value_complete ? 3 : 0) + (day.chaos_complete ? 3 : 0);
+      const dayFull = (day.safe_full ? 1 : 0) + (day.value_full ? 1 : 0) + (day.chaos_full ? 1 : 0);
+      const dayPartial = (day.safe_2of3 ? 1 : 0) + (day.value_2of3 ? 1 : 0) + (day.chaos_2of3 ? 1 : 0);
+      const dayParlays = (day.safe_complete ? 1 : 0) + (day.value_complete ? 1 : 0) + (day.chaos_complete ? 1 : 0);
+      legsHit += dayLegsHit;
+      legsPlaced += dayLegsPlaced;
+      fullHits += dayFull;
+      twoOfThree += dayPartial;
+      parlaysBuilt += dayParlays;
+
+      if (!bestDay || dayFull > bestDay.full_parlays_hit ||
+          (dayFull === bestDay.full_parlays_hit && dayLegsHit > bestDay.legs_hit)) {
+        bestDay = { date, legs_hit: dayLegsHit, full_parlays_hit: dayFull };
+      }
+      if (!worstDay || (day.hr_count > 0 && dayLegsHit < (worstDay.legs_hit ?? 0))) {
+        worstDay = { date, hr_hitters: day.hr_count, legs_hit: dayLegsHit };
+      }
+    }
+
+    const versionRows = all.filter((r) => r.model_version === v.version);
+    const tp = versionRows.filter((r) => r.classification === 'TP').length;
+    const fp = versionRows.filter((r) => r.classification === 'FP').length;
+    const fn = versionRows.filter((r) => r.classification === 'FN').length;
+    const tn = versionRows.filter((r) => r.classification === 'TN').length;
+
+    out.push({
+      version: v.version, name: v.name, is_active: v.active,
+      days_tested: days.length,
+      dates: days.map((d) => d.date).sort(),
+      total_players_scored: totalPlayers,
+      total_hr_hitters: totalHr,
+      hr_in_top10: top10,
+      hr_in_top3: top3,
+      top10_coverage: totalHr > 0 ? top10 / totalHr : 0,
+      top3_coverage: totalHr > 0 ? top3 / totalHr : 0,
+      parlay_full_3of3_hits: fullHits,
+      parlay_2of3_hits: twoOfThree,
+      total_legs_hit: legsHit,
+      total_legs_placed: legsPlaced,
+      parlay_full_hit_rate: parlaysBuilt > 0 ? fullHits / parlaysBuilt : 0,
+      parlay_2of3_hit_rate: parlaysBuilt > 0 ? twoOfThree / parlaysBuilt : 0,
+      avg_legs_hit_per_parlay: parlaysBuilt > 0 ? legsHit / parlaysBuilt : 0,
+      worst_day: worstDay,
+      best_day: bestDay,
+      missed_hr_count: fn,
+      tp, fp, fn, tn,
+    });
+  }
+
+  return out.sort((a, b) => a.version - b.version);
+}
+
 /** Most-recent feature_importance row per signal_key for a window. */
 export async function fetchFeatureImportance(opts: {
   model_version: number; window_days: number;
