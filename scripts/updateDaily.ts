@@ -41,6 +41,8 @@ import { enrichWeather, type EnrichWeatherResult } from './enrichWeather.js';
 import { enrichLineups, type EnrichLineupsResult } from './enrichLineups.js';
 import { rebuildPlayerSummaries } from './rebuildPlayerSummaries.js';
 import { snapshotHrTargets, type SnapshotResult } from './snapshotHrTargets.js';
+import { captureDay } from './learning/captureDay.js';
+import { replayDateForVersions, type DayModelOutcome } from './learning/replayModels.js';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
 import {
   mlbToday,
@@ -183,6 +185,17 @@ export interface RunSummary {
   snapshotsSkipped: number;
   /** Freshest home_runs.created_at seen this run (latest actual HR). */
   lastUpdatedAt: string | null;
+  /** Learning phase — only fires on night/daily tiers. null when skipped. */
+  learning?: {
+    ran: boolean;
+    date_captured: string | null;
+    v1_records_written: number;
+    v1_classifications: { TP: number; FP: number; FN: number; TN: number } | null;
+    other_versions: Array<{ version: number; status: string; records_written?: number }>;
+    /** Wall-clock timestamp the capture finished. */
+    captured_at: string | null;
+    error?: string;
+  } | null;
 }
 
 export interface UpdateDailyResult {
@@ -496,7 +509,93 @@ export async function updateDaily(
     snapshotsCreated,
     snapshotsSkipped,
     lastUpdatedAt: latestUpdated,
+    learning: null, // filled below when the learning phase runs
   };
+
+  // ─────────────────────────────────────────────────────────────────────
+  //  Phase 6 — Learning Engine capture (Champion System)
+  //
+  //  Runs ONLY on the night tier (post-game finalization) — and on the
+  //  legacy `daily` mode for back-compat. We need yesterday's games to be
+  //  final before classifying predictions, so morning/light/full tiers
+  //  skip this phase deliberately.
+  //
+  //  The phase is fully isolated — failures here never fail the run.
+  //  Steps:
+  //    1. captureDay(yesterday) — writes v1 learning_predictions
+  //    2. replayDateForVersions(yesterday) — writes v2..v6 rows
+  //
+  //  Skip-existing semantics: captureDay overwrites via upsert (always
+  //  refreshes the latest classification). replayDateForVersions also
+  //  upserts, so re-running the night phase on the same date is safe.
+  // ─────────────────────────────────────────────────────────────────────
+  if (mode === 'night' || mode === 'daily') {
+    console.log(`\n▶ 6) Learning phase — capturing yesterday's predictions`);
+    const learningStartedAt = Date.now();
+    try {
+      // 6a. captureDay for v1 (the active model)
+      const captureResult = await captureDay(yesterday, [7, 14, 30]);
+      console.log(
+        `  ✓ captureDay v${captureResult.model_version}: ${captureResult.predictions_written} predictions written ` +
+          `(TP=${captureResult.tp} FP=${captureResult.fp} FN=${captureResult.fn} TN=${captureResult.tn})`,
+      );
+
+      // 6b. replayDateForVersions for v2..v6 (alternative models)
+      const replayResults = await replayDateForVersions(yesterday, {});
+      const successCount = replayResults.filter((r) => r.status === 'success').length;
+      const failCount = replayResults.filter((r) => r.status === 'failed').length;
+      console.log(
+        `  ✓ replayed ${successCount} alternative model version(s); ${failCount} failed`,
+      );
+      for (const r of replayResults) {
+        if (r.status === 'success') {
+          console.log(
+            `    v${r.version}: ${r.records_written} rows (TP=${r.tp} FP=${r.fp} FN=${r.fn} TN=${r.tn}, ` +
+              `parlays: 3/3=${r.full_3of3} 2/3=${r.partial_2of3} legs=${r.legs_hit}/9)`,
+          );
+        } else if (r.status === 'failed') {
+          console.log(`    v${r.version}: FAILED — ${r.error}`);
+        }
+      }
+
+      summary.learning = {
+        ran: true,
+        date_captured: yesterday,
+        v1_records_written: captureResult.predictions_written,
+        v1_classifications: { TP: captureResult.tp, FP: captureResult.fp, FN: captureResult.fn, TN: captureResult.tn },
+        other_versions: replayResults.map((r) => ({ version: r.version, status: r.status, records_written: r.records_written })),
+        captured_at: new Date().toISOString(),
+      };
+
+      steps.push({
+        step: 'learning:capture+replay',
+        durationMs: Date.now() - learningStartedAt,
+        ok: true,
+        detail: summary.learning,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`  ⚠ Learning phase FAILED (non-fatal): ${msg}`);
+      summary.learning = {
+        ran: false,
+        date_captured: yesterday,
+        v1_records_written: 0,
+        v1_classifications: null,
+        other_versions: [],
+        captured_at: null,
+        error: msg,
+      };
+      steps.push({
+        step: 'learning:capture+replay',
+        durationMs: Date.now() - learningStartedAt,
+        ok: false,
+        detail: msg,
+      });
+      // Deliberately NOT pushed to failures[] — Learning is best-effort.
+    }
+  } else {
+    console.log(`\n▶ 6) Learning phase — skipped on '${mode}' tier (runs on night + daily only)`);
+  }
 
   console.log(`\n████████████████████████████████████████████████████`);
   console.log(`  active mode: ${mode}`);

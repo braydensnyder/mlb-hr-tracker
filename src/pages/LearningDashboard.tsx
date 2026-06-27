@@ -66,6 +66,23 @@ export default function LearningDashboard() {
   const activeVersion = versions.find((v) => v.active) ?? versions[0] ?? null;
   const latestCapture = captures[0] ?? null;
   const earliestCapture = captures[captures.length - 1] ?? null;
+
+  // Freshness: the most recent captured_at across all (date, version)
+  // rows. This is what the night-cron's learning phase updates each run.
+  const mostRecentCapturedAt = useMemo(() => {
+    let latest: string | null = null;
+    for (const c of captures) {
+      if (c.last_captured_at && (!latest || c.last_captured_at > latest)) latest = c.last_captured_at;
+    }
+    return latest;
+  }, [captures]);
+  const captureFreshness = useMemo((): { tone: 'fresh' | 'stale' | 'unknown'; label: string } => {
+    if (!mostRecentCapturedAt) return { tone: 'unknown', label: 'No captures yet' };
+    const ageMs = Date.now() - new Date(mostRecentCapturedAt).getTime();
+    const hours = ageMs / 1000 / 60 / 60;
+    if (hours <= 30) return { tone: 'fresh', label: `Auto-capture ran ${formatRelative(ageMs)} ago` };
+    return { tone: 'stale', label: `Last capture was ${formatRelative(ageMs)} ago — check the night-cron logs` };
+  }, [mostRecentCapturedAt]);
   const totalPlayerDays = useMemo(() => captures.reduce((s, c) => s + c.player_count, 0), [captures]);
   const totalHrs = useMemo(() => captures.reduce((s, c) => s + c.hr_hitter_count, 0), [captures]);
   const totalTp = useMemo(() => captures.reduce((s, c) => s + c.tp, 0), [captures]);
@@ -121,6 +138,23 @@ export default function LearningDashboard() {
 
       {loading && <div className="subtle" style={{ marginBottom: 12 }}>Loading…</div>}
       {error && <div className="error" style={{ marginBottom: 12 }}>{error}</div>}
+
+      {/* Automation freshness — surfaces whether the night-cron is running */}
+      {!loading && migrationApplied && (
+        <div className={`ld-fresh ld-fresh--${captureFreshness.tone}`} style={{ marginBottom: 12 }}>
+          <span style={{ fontSize: 11, opacity: 0.7, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            🤖 Automation
+          </span>
+          <span style={{ fontSize: 13, marginLeft: 8 }}>
+            {captureFreshness.label}
+            {mostRecentCapturedAt && (
+              <span className="subtle" style={{ marginLeft: 8, fontSize: 11 }}>
+                (last write: {formatTs(mostRecentCapturedAt)})
+              </span>
+            )}
+          </span>
+        </div>
+      )}
 
       {!loading && !migrationApplied && <MigrationNotApplied />}
 
@@ -536,6 +570,13 @@ function formatTs(iso: string): string {
     return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   } catch { return iso; }
 }
+function formatRelative(ms: number): string {
+  const mins = ms / 1000 / 60;
+  if (mins < 60) return `${Math.round(mins)} min`;
+  const hours = mins / 60;
+  if (hours < 48) return `${hours.toFixed(1)} h`;
+  return `${Math.round(hours / 24)} d`;
+}
 
 function DashStyles() {
   return (
@@ -611,6 +652,16 @@ function DashStyles() {
         background: rgba(224,122,122,0.18); color: #e07a7a;
         font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
       }
+
+      .ld-fresh {
+        padding: 8px 12px; border-radius: 8px;
+        border: 1px solid var(--border, #232732);
+        background: var(--panel-2, #14171f);
+        display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap;
+      }
+      .ld-fresh--fresh   { border-left: 3px solid #6bd482; }
+      .ld-fresh--stale   { border-left: 3px solid #e07a7a; background: rgba(224,122,122,0.05); }
+      .ld-fresh--unknown { border-left: 3px solid #aab1c0; }
     `}</style>
   );
 }

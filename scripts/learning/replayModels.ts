@@ -210,7 +210,7 @@ async function existingCount(date: string, version: number): Promise<number> {
   return count ?? 0;
 }
 
-interface DayModelOutcome {
+export interface DayModelOutcome {
   date: string;
   version: number;
   status: 'success' | 'skipped' | 'failed';
@@ -220,6 +220,108 @@ interface DayModelOutcome {
   partial_2of3?: number;       // 0/1
   legs_hit?: number;           // 0..9
   error?: string;
+}
+
+/**
+ * Programmatic API used by updateDaily's learning phase.
+ *
+ * Replays all eligible non-v1 model versions against a single date and
+ * upserts the per-(date, player, version) rows into learning_predictions.
+ *
+ * Skipped behavior: when skipExisting=true, dates already covered for a
+ * given version are left alone — so this is safe to call from the cron
+ * even after a manual backfill has already populated rows.
+ */
+export async function replayDateForVersions(date: string, opts: {
+  versions?: number[];
+  skipExisting?: boolean;
+} = {}): Promise<DayModelOutcome[]> {
+  const allRows = await loadModelVersions();
+  const allConfigs = allRows.map(toModelConfig);
+  const targets = opts.versions
+    ? allConfigs.filter((c) => opts.versions!.includes(c.version))
+    : allConfigs.filter((c) => c.version !== 1);
+
+  if (targets.length === 0) return [];
+
+  const [snapshots, hrs, odds] = await Promise.all([
+    loadSnapshots(date),
+    loadHrs(date),
+    loadOdds(date),
+  ]);
+  if (snapshots.length === 0) {
+    return targets.map((t) => ({ date, version: t.version, status: 'failed' as const, error: 'no snapshot for date' }));
+  }
+
+  const hrIds = new Set(hrs.map((h) => h.player_id));
+  const hrCount = new Map<number, number>();
+  const oppByPlayer = new Map<number, string>();
+  const gamePkByPlayer = new Map<number, number>();
+  for (const h of hrs) {
+    hrCount.set(h.player_id, (hrCount.get(h.player_id) ?? 0) + 1);
+    oppByPlayer.set(h.player_id, h.opponent);
+    gamePkByPlayer.set(h.player_id, h.game_pk);
+  }
+
+  const outcomes: DayModelOutcome[] = [];
+  for (const config of targets) {
+    try {
+      if (opts.skipExisting) {
+        const ex = await existingCount(date, config.version);
+        if (ex > 0) {
+          outcomes.push({ date, version: config.version, status: 'skipped', records_written: ex });
+          continue;
+        }
+      }
+      const result = replayDateUnderModel({
+        date, snapshots, odds,
+        hr_player_ids: hrIds, hr_count_by_player: hrCount,
+        opponent_by_player: oppByPlayer, game_pk_by_player: gamePkByPlayer,
+        config,
+      });
+      let tp = 0, fp = 0, fn = 0, tn = 0;
+      for (const r of result.records) {
+        if (r.classification === 'TP') tp++;
+        else if (r.classification === 'FP') fp++;
+        else if (r.classification === 'FN') fn++;
+        else if (r.classification === 'TN') tn++;
+      }
+      const legsAll = [...result.safe.legs, ...result.value.legs, ...result.chaos.legs];
+      const legsHitToday = legsAll.reduce((s, l) => s + (hrIds.has(l.player_id) ? 1 : 0), 0);
+      const safeHit = result.safe.legs.length === 3 && result.safe.legs.every((l) => hrIds.has(l.player_id));
+      const valueHit = result.value.legs.length === 3 && result.value.legs.every((l) => hrIds.has(l.player_id));
+      const chaosHit = result.chaos.legs.length === 3 && result.chaos.legs.every((l) => hrIds.has(l.player_id));
+      const full3of3 = (safeHit ? 1 : 0) + (valueHit ? 1 : 0) + (chaosHit ? 1 : 0);
+      const safe2of3 = result.safe.legs.length === 3 && result.safe.legs.filter((l) => hrIds.has(l.player_id)).length === 2;
+      const value2of3 = result.value.legs.length === 3 && result.value.legs.filter((l) => hrIds.has(l.player_id)).length === 2;
+      const chaos2of3 = result.chaos.legs.length === 3 && result.chaos.legs.filter((l) => hrIds.has(l.player_id)).length === 2;
+      const partial2of3 = (safe2of3 ? 1 : 0) + (value2of3 ? 1 : 0) + (chaos2of3 ? 1 : 0);
+
+      const now = new Date().toISOString();
+      const upsertRows = result.records.map((r) => ({ ...r, captured_at: now }));
+      const BATCH = 500;
+      let written = 0;
+      for (let j = 0; j < upsertRows.length; j += BATCH) {
+        const chunk = upsertRows.slice(j, j + BATCH);
+        const { error: upErr, count } = await supabaseAdmin
+          .from('learning_predictions')
+          .upsert(chunk, { onConflict: 'target_date,player_id,model_version', count: 'exact' });
+        if (upErr) throw new Error(upErr.message);
+        written += count ?? chunk.length;
+      }
+      outcomes.push({
+        date, version: config.version, status: 'success',
+        records_written: written,
+        tp, fp, fn, tn,
+        full_3of3: full3of3, partial_2of3: partial2of3,
+        legs_hit: legsHitToday,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      outcomes.push({ date, version: config.version, status: 'failed', error: msg });
+    }
+  }
+  return outcomes;
 }
 
 async function main() {

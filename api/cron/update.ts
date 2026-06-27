@@ -309,6 +309,10 @@ export default async function handler(req: VercelReqLike, res: VercelResLike): P
         unmatchedPlayers: oddsAttempt.result?.unmatched_players ?? 0,
         error: oddsAttempt.error ?? null,
       },
+      // ---- Learning Engine block (Champion System) ------------------
+      // Populated when the night/daily tier ran the learning phase.
+      // null when the tier skipped it (light/full/morning/live).
+      learning: s.learning ?? null,
       actualResults: {
         today: summarizeProcess(result.actualResults.today),
         yesterday: summarizeProcess(result.actualResults.yesterday),
