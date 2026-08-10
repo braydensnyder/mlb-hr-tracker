@@ -11,6 +11,7 @@ import ModelCardPage from './pages/learning/ModelCard';
 import HistoricalDayPage from './pages/learning/HistoricalDay';
 import CompareModelsPage from './pages/learning/CompareModels';
 import ResearchPage from './pages/learning/Research';
+import VersionCalendarPage from './pages/learning/VersionCalendar';
 import Backtest from './pages/Backtest';
 import Odds from './pages/Odds';
 import ClubhouseMenu from './components/ClubhouseMenu';
@@ -47,6 +48,7 @@ export default function App() {
         <Route path="/lab" element={<ParlayLab />} />
         <Route path="/learning" element={<LearningDashboard />} />
         <Route path="/learning/research" element={<ResearchPage />} />
+        <Route path="/learning/calendar" element={<VersionCalendarPage />} />
         <Route path="/learning/model/:version" element={<ModelCardPage />} />
         <Route path="/learning/day/:date" element={<HistoricalDayPage />} />
         <Route path="/learning/compare/:date" element={<CompareModelsPage />} />

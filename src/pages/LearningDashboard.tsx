@@ -131,6 +131,7 @@ export default function LearningDashboard() {
           >{w}d</button>
         ))}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 12 }}>
+          <Link to="/learning/calendar" style={{ fontSize: 13 }}>📆 Calendar →</Link>
           <Link to="/learning/research" style={{ fontSize: 13 }}>🔬 Research →</Link>
           <Link to="/lab" style={{ fontSize: 13 }}>Open Parlay Lab →</Link>
         </div>

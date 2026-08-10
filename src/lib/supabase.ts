@@ -1306,3 +1306,205 @@ export async function fetchCapturedDates(opts: { limit?: number } = {}): Promise
   const sorted = Array.from(dates).sort().reverse();
   return opts.limit ? sorted.slice(0, opts.limit) : sorted;
 }
+
+// =============================================================================
+//  Version Performance Calendar (Priority 1)
+// =============================================================================
+
+/** Simple per-(date, version) row for the calendar's headline table.
+ *  Counts distinct HR hitters, then how many landed in each Top-N slice. */
+export interface CalendarVersionRow {
+  version: number;
+  name: string;
+  is_active: boolean;
+  is_retired: boolean;
+  top3_hits: number;
+  top5_hits: number;
+  top10_hits: number;
+  top25_hits: number;
+  /** Snapshot rows recorded for this version this date (proxy for "did it run"). */
+  players_scored: number;
+}
+
+export interface CalendarDayResult {
+  date: string;
+  total_hr_hitters: number;
+  versions: CalendarVersionRow[];
+  /** Full learning_predictions rows for the date — used to power the
+   *  expandable per-version pick list. Keyed by version. */
+  picks_by_version: Map<number, LearningPredictionRow[]>;
+}
+
+/** Load per-date, per-version calendar summary + the underlying picks
+ *  for expandable rows. One page-side aggregation over
+ *  learning_predictions + model_versions. */
+export async function fetchVersionCalendar(date: string): Promise<CalendarDayResult> {
+  const [versions, preds] = await Promise.all([
+    fetchModelVersions(),
+    fetchAllVersionsForDate(date),
+  ]);
+
+  // Distinct HR hitters that day (dedup across versions — same underlying HR list).
+  const distinctHrIds = new Set<number>();
+  for (const p of preds) {
+    if (p.homered === true) distinctHrIds.add(p.player_id);
+  }
+
+  // For each (version), tally hit counts in each Top-N bucket.
+  const picksByVer = new Map<number, LearningPredictionRow[]>();
+  for (const p of preds) {
+    const arr = picksByVer.get(p.model_version) ?? [];
+    arr.push(p);
+    picksByVer.set(p.model_version, arr);
+  }
+
+  const rows: CalendarVersionRow[] = versions.map((v) => {
+    const list = picksByVer.get(v.version) ?? [];
+    let t3 = 0, t5 = 0, t10 = 0, t25 = 0;
+    for (const p of list) {
+      if (p.homered !== true || p.rank == null) continue;
+      if (p.rank <= 3) t3 += 1;
+      if (p.rank <= 5) t5 += 1;
+      if (p.rank <= 10) t10 += 1;
+      if (p.rank <= 25) t25 += 1;
+    }
+    return {
+      version: v.version, name: v.name,
+      is_active: v.active, is_retired: !!v.retired,
+      top3_hits: t3, top5_hits: t5, top10_hits: t10, top25_hits: t25,
+      players_scored: list.length,
+    };
+  });
+
+  return {
+    date,
+    total_hr_hitters: distinctHrIds.size,
+    versions: rows,
+    picks_by_version: picksByVer,
+  };
+}
+
+/** Rolling-window per-version summary. */
+export interface CalendarRollingRow {
+  version: number;
+  name: string;
+  is_active: boolean;
+  is_retired: boolean;
+  days_tested: number;
+  avg_top3: number;
+  avg_top5: number;
+  avg_top10: number;
+  avg_top25: number;
+  best_day: { date: string; top10_hits: number } | null;
+  worst_day: { date: string; top10_hits: number; hr_hitters: number } | null;
+  /** Days this version had strictly more Top-10 hits than the reference
+   *  version (v1 by default). */
+  days_beating_core: number;
+  /** Days both were tested and could be compared. */
+  days_compared: number;
+}
+
+/** Rolling-window per-version rollup + comparison to a "core" version. */
+export async function fetchVersionRolling(opts: {
+  from: string; to: string; coreVersion?: number;
+}): Promise<CalendarRollingRow[]> {
+  const coreVersion = opts.coreVersion ?? 1;
+  const versions = await fetchModelVersions();
+
+  // Stream learning_predictions in the window.
+  const PAGE_SIZE = 1000;
+  const all: LearningPredictionRow[] = [];
+  for (let page = 0; page < 50; page++) {
+    const { data, error } = await supabase
+      .from('learning_predictions')
+      .select('target_date, player_id, model_version, rank, homered')
+      .gte('target_date', opts.from)
+      .lte('target_date', opts.to)
+      .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return [];
+      throw new Error(error.message);
+    }
+    const rows = (data ?? []) as LearningPredictionRow[];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) break;
+  }
+
+  // Group by (version, date).
+  type DayCell = { top3: number; top5: number; top10: number; top25: number; hr_hitters: Set<number> };
+  const byVerDate = new Map<string, DayCell>();
+  for (const p of all) {
+    const key = `${p.model_version}:${p.target_date}`;
+    let cell = byVerDate.get(key);
+    if (!cell) {
+      cell = { top3: 0, top5: 0, top10: 0, top25: 0, hr_hitters: new Set() };
+      byVerDate.set(key, cell);
+    }
+    if (p.homered === true) {
+      cell.hr_hitters.add(p.player_id);
+      if (p.rank != null) {
+        if (p.rank <= 3) cell.top3 += 1;
+        if (p.rank <= 5) cell.top5 += 1;
+        if (p.rank <= 10) cell.top10 += 1;
+        if (p.rank <= 25) cell.top25 += 1;
+      }
+    }
+  }
+
+  // Roll up per version.
+  return versions.map((v) => {
+    const days = Array.from(byVerDate.entries())
+      .filter(([k]) => k.startsWith(`${v.version}:`))
+      .map(([k, cell]) => ({ date: k.split(':')[1], cell }));
+
+    if (days.length === 0) {
+      return {
+        version: v.version, name: v.name,
+        is_active: v.active, is_retired: !!v.retired,
+        days_tested: 0,
+        avg_top3: 0, avg_top5: 0, avg_top10: 0, avg_top25: 0,
+        best_day: null, worst_day: null,
+        days_beating_core: 0, days_compared: 0,
+      };
+    }
+
+    const sum3 = days.reduce((s, d) => s + d.cell.top3, 0);
+    const sum5 = days.reduce((s, d) => s + d.cell.top5, 0);
+    const sum10 = days.reduce((s, d) => s + d.cell.top10, 0);
+    const sum25 = days.reduce((s, d) => s + d.cell.top25, 0);
+
+    let bestDay: CalendarRollingRow['best_day'] = null;
+    let worstDay: CalendarRollingRow['worst_day'] = null;
+    for (const { date, cell } of days) {
+      if (!bestDay || cell.top10 > bestDay.top10_hits) {
+        bestDay = { date, top10_hits: cell.top10 };
+      }
+      if (cell.hr_hitters.size >= 5 && (!worstDay || cell.top10 < worstDay.top10_hits)) {
+        worstDay = { date, top10_hits: cell.top10, hr_hitters: cell.hr_hitters.size };
+      }
+    }
+
+    // Days beating core (default v1).
+    let daysBeating = 0, daysCompared = 0;
+    for (const { date, cell } of days) {
+      const coreCell = byVerDate.get(`${coreVersion}:${date}`);
+      if (!coreCell) continue;
+      daysCompared += 1;
+      if (cell.top10 > coreCell.top10) daysBeating += 1;
+    }
+
+    return {
+      version: v.version, name: v.name,
+      is_active: v.active, is_retired: !!v.retired,
+      days_tested: days.length,
+      avg_top3: sum3 / days.length,
+      avg_top5: sum5 / days.length,
+      avg_top10: sum10 / days.length,
+      avg_top25: sum25 / days.length,
+      best_day: bestDay,
+      worst_day: worstDay,
+      days_beating_core: daysBeating,
+      days_compared: daysCompared,
+    };
+  });
+}
