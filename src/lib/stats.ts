@@ -6380,6 +6380,9 @@ function heatToProb(heat: number): number {
   const s = 1 / (1 + Math.exp(-z));
   return PARLAY_CURVE.floor + (PARLAY_CURVE.ceiling - PARLAY_CURVE.floor) * s;
 }
+/** Public alias so scripts + pages can compute model_prob without
+ *  reaching into oddsMath.ts. Same curve as PARLAY_CURVE above. */
+export function heatToProbLocal(heat: number): number { return heatToProb(heat); }
 function americanToDecimal(american: number): number {
   return american > 0 ? american / 100 + 1 : 100 / Math.abs(american) + 1;
 }
@@ -7634,6 +7637,287 @@ export function computeModelVersionMetrics(
     per_leg_hit_rate: totalLegs > 0 ? totalLegsHit / totalLegs : 0,
     pool_coverage_rate: coverage.pool_coverage_rate,
     top10_coverage_rate: coverage.top10_coverage_rate,
+  };
+}
+
+// =============================================================================
+//  AI Picks Ensemble (Priority 3 — meta-model that weights v1..v6 by
+//  rolling historical performance)
+// -----------------------------------------------------------------------------
+//  vAI (v7) is a DETERMINISTIC meta-model. For every player it computes an
+//  ensemble score:
+//
+//    score(player) = Σ  ( versionWeight_V × rankValue(playerRank_V) )
+//                       for V in [1..6] where the player appears in V's Top 50
+//
+//  versionWeight_V uses ONLY historical data from BEFORE the target date
+//  (hindsight-safe) and is shrunk toward a neutral prior so a version with
+//  3 hot days can't dominate.
+//
+//  This is not an LLM. Nothing here calls an API. It replays exactly the
+//  same on the same inputs, forever. That's the requirement.
+// =============================================================================
+
+/** Constants for the ensemble. Kept as module-level so tests can import. */
+export const AI_ENSEMBLE_CONFIG = {
+  /** Window (days before target date) used to weight each version. */
+  performanceWindowDays: 30,
+  /** Neutral prior for shrinkage — roughly the population Top-10 coverage. */
+  neutralPrior: 0.15,
+  /** Weight of the prior in the shrinkage (equivalent to N "fake" average days). */
+  priorSampleWeight: 20,
+  /** Consider only picks with rank ≤ this from each version. */
+  rankCutoff: 50,
+  /** Rank-value decay softness. Bigger = slower decay. See rankValueCurve(). */
+  rankValueSoftness: 20,
+  /** Only players with score above this get an "AI pick" label. Below → the
+   *  Top 25 tail. */
+  scoreCutoffForActionable: 0.05,
+} as const;
+
+export type AiEnsembleConfig = typeof AI_ENSEMBLE_CONFIG;
+
+/**
+ * Convert a version's raw performance metric into a shrunk value using a
+ * neutral prior. Small-sample versions collapse toward the prior; large
+ * samples get their raw metric weighted heavily.
+ *
+ *   shrunk = (metric × days + prior × priorWeight) / (days + priorWeight)
+ *
+ * Example (with prior=0.15, priorWeight=20):
+ *   3 days at 40% coverage  → (0.40*3 + 0.15*20) / 23  = 0.183
+ *   30 days at 25% coverage → (0.25*30 + 0.15*20) / 50 = 0.210
+ *
+ * The 30-day version at 25% beats the 3-day version at 40%. Correct.
+ */
+export function shrinkVersionPerformance(
+  rawMetric: number,
+  daysTested: number,
+  cfg: AiEnsembleConfig = AI_ENSEMBLE_CONFIG,
+): number {
+  return (rawMetric * daysTested + cfg.neutralPrior * cfg.priorSampleWeight) / (daysTested + cfg.priorSampleWeight);
+}
+
+/**
+ * Rank-value curve. Player at rank 1 in a version scores 1.0; the value
+ * decays smoothly. Cuts off at rankCutoff. Higher softness = slower decay.
+ *
+ *   rankValue(r) = 1 / (1 + (r - 1) / softness)   for r ≤ rankCutoff, else 0
+ *
+ * With softness=20: rank 1 = 1.00, rank 5 = 0.83, rank 10 = 0.69,
+ * rank 25 = 0.45, rank 50 = 0.29.
+ */
+export function rankValueCurve(rank: number, cfg: AiEnsembleConfig = AI_ENSEMBLE_CONFIG): number {
+  if (rank == null || rank < 1 || rank > cfg.rankCutoff) return 0;
+  return 1 / (1 + (rank - 1) / cfg.rankValueSoftness);
+}
+
+/** Compact per-version performance snapshot fed into the ensemble.
+ *  The caller (script or backtest) is responsible for filling this from
+ *  a window that ENDS before the target date. */
+export interface VersionPerformanceForWindow {
+  version: number;
+  days_tested: number;
+  total_hr_hitters: number;
+  hrs_in_top10: number;
+  /** hrs_in_top10 / total_hr_hitters — pre-shrinkage. */
+  raw_top10_coverage: number;
+}
+
+export interface EnsembleVersionWeight {
+  version: number;
+  days_tested: number;
+  raw_top10_coverage: number;
+  shrunk_perf: number;
+  /** Normalized so all versions' weights sum to 1. */
+  weight: number;
+}
+
+/** One version's contribution to a single player's ensemble score. */
+export interface EnsembleContribution {
+  version: number;
+  rank: number;
+  version_weight: number;
+  rank_value: number;
+  /** version_weight × rank_value. */
+  contribution: number;
+}
+
+/** Full per-player breakdown ready to write into learning_predictions. */
+export interface AiEnsemblePick {
+  player_id: number;
+  player_name: string;
+  team: string;
+  ensemble_rank: number;
+  ensemble_score: number;
+  versions_agreeing: number;
+  average_rank: number;
+  strongest_version: number;
+  contributions: EnsembleContribution[];
+  reasoning: string;
+}
+
+export interface AiEnsembleResult {
+  target_date: string;
+  performance_window: { from: string; to: string; days: number };
+  version_weights: EnsembleVersionWeight[];
+  picks: AiEnsemblePick[];
+  /** Whether the hindsight-safe window contained any prior data. When false,
+   *  all versions get pure-prior weight (equal) — early days of the season. */
+  had_prior_data: boolean;
+  note: string;
+}
+
+/**
+ * Normalize a list of shrunk performances into weights that sum to 1.
+ * Handles the edge case of all-zero performance by returning equal weights.
+ */
+function normalizeVersionWeights(shrunkPerfs: Array<{ version: number; shrunk: number; days_tested: number; raw: number }>): EnsembleVersionWeight[] {
+  const total = shrunkPerfs.reduce((s, x) => s + x.shrunk, 0);
+  if (total <= 0) {
+    // Degenerate — all zero. Fall back to equal weights.
+    const equal = shrunkPerfs.length > 0 ? 1 / shrunkPerfs.length : 0;
+    return shrunkPerfs.map((x) => ({
+      version: x.version,
+      days_tested: x.days_tested,
+      raw_top10_coverage: x.raw,
+      shrunk_perf: x.shrunk,
+      weight: equal,
+    }));
+  }
+  return shrunkPerfs.map((x) => ({
+    version: x.version,
+    days_tested: x.days_tested,
+    raw_top10_coverage: x.raw,
+    shrunk_perf: x.shrunk,
+    weight: x.shrunk / total,
+  }));
+}
+
+/**
+ * Compute ensemble version weights from a performance-window snapshot.
+ * Exposed separately so tests can verify shrinkage/normalization without
+ * building the full pick list.
+ */
+export function computeEnsembleWeights(
+  perf: VersionPerformanceForWindow[],
+  cfg: AiEnsembleConfig = AI_ENSEMBLE_CONFIG,
+): EnsembleVersionWeight[] {
+  const shrunk = perf.map((p) => ({
+    version: p.version,
+    days_tested: p.days_tested,
+    raw: p.raw_top10_coverage,
+    shrunk: shrinkVersionPerformance(p.raw_top10_coverage, p.days_tested, cfg),
+  }));
+  return normalizeVersionWeights(shrunk);
+}
+
+/** One version's ranked picks for a target date — the raw input to the ensemble. */
+export interface VersionRankedPick {
+  player_id: number;
+  player_name: string;
+  team: string;
+  rank: number;
+}
+
+/**
+ * Core ensemble computation. Pure, deterministic.
+ *
+ * @param picksByVersion  Map<version, list of ranked picks for target date>
+ * @param performance     Version performance from BEFORE target date (hindsight-safe)
+ * @param targetDate      For inclusion in the result (not read for math)
+ * @param windowRange     For inclusion in the result (not read for math)
+ * @param cfg             Optional config override
+ */
+export function computeAiEnsembleRankings(
+  picksByVersion: Map<number, VersionRankedPick[]>,
+  performance: VersionPerformanceForWindow[],
+  targetDate: string,
+  windowRange: { from: string; to: string },
+  cfg: AiEnsembleConfig = AI_ENSEMBLE_CONFIG,
+): AiEnsembleResult {
+  const hadPriorData = performance.some((p) => p.days_tested > 0);
+  const versionWeights = computeEnsembleWeights(performance, cfg);
+  const weightByVersion = new Map<number, number>();
+  for (const w of versionWeights) weightByVersion.set(w.version, w.weight);
+
+  // Aggregate contributions per player.
+  const perPlayer = new Map<number, {
+    player_name: string;
+    team: string;
+    contributions: EnsembleContribution[];
+  }>();
+
+  for (const [version, picks] of picksByVersion) {
+    const versionWeight = weightByVersion.get(version) ?? 0;
+    if (versionWeight === 0) continue;
+    for (const pick of picks) {
+      if (pick.rank > cfg.rankCutoff) continue;
+      const rv = rankValueCurve(pick.rank, cfg);
+      if (rv === 0) continue;
+      let entry = perPlayer.get(pick.player_id);
+      if (!entry) {
+        entry = { player_name: pick.player_name, team: pick.team, contributions: [] };
+        perPlayer.set(pick.player_id, entry);
+      }
+      entry.contributions.push({
+        version,
+        rank: pick.rank,
+        version_weight: versionWeight,
+        rank_value: rv,
+        contribution: versionWeight * rv,
+      });
+    }
+  }
+
+  // Build AiEnsemblePick list.
+  const raw: Array<Omit<AiEnsemblePick, 'ensemble_rank'>> = [];
+  for (const [pid, entry] of perPlayer) {
+    const contributions = entry.contributions.slice().sort((a, b) => b.contribution - a.contribution);
+    const ensembleScore = contributions.reduce((s, c) => s + c.contribution, 0);
+    const versionsAgreeing = contributions.length;
+    const averageRank = contributions.reduce((s, c) => s + c.rank, 0) / versionsAgreeing;
+    const strongestVersion = contributions[0].version;
+    const strongest = contributions[0];
+    const reasoning =
+      `Selected by ${versionsAgreeing}/${picksByVersion.size} models. ` +
+      `Strongest support: v${strongest.version} (weight ${(strongest.version_weight * 100).toFixed(1)}%, rank ${strongest.rank}). ` +
+      `Avg rank: ${averageRank.toFixed(1)}. Ensemble score: ${ensembleScore.toFixed(3)}.`;
+    raw.push({
+      player_id: pid,
+      player_name: entry.player_name,
+      team: entry.team,
+      ensemble_score: ensembleScore,
+      versions_agreeing: versionsAgreeing,
+      average_rank: averageRank,
+      strongest_version: strongestVersion,
+      contributions,
+      reasoning,
+    });
+  }
+
+  // Sort by ensemble score desc, tie-break by more-versions-agreeing then avg rank asc.
+  raw.sort((a, b) => {
+    if (b.ensemble_score !== a.ensemble_score) return b.ensemble_score - a.ensemble_score;
+    if (b.versions_agreeing !== a.versions_agreeing) return b.versions_agreeing - a.versions_agreeing;
+    return a.average_rank - b.average_rank;
+  });
+
+  const picks: AiEnsemblePick[] = raw.map((p, i) => ({ ...p, ensemble_rank: i + 1 }));
+
+  return {
+    target_date: targetDate,
+    performance_window: {
+      from: windowRange.from,
+      to: windowRange.to,
+      days: performance.reduce((max, p) => Math.max(max, p.days_tested), 0),
+    },
+    version_weights: versionWeights,
+    picks,
+    had_prior_data: hadPriorData,
+    note: hadPriorData
+      ? `Ensemble weights derived from the ${cfg.performanceWindowDays}-day rolling window ending on ${windowRange.to} (strictly BEFORE the target date). Neutral prior with weight ${cfg.priorSampleWeight} keeps small-sample versions honest.`
+      : `No prior data in the ensemble window. All versions weighted equally (pure neutral prior). AI Picks will improve as more days are captured.`,
   };
 }
 

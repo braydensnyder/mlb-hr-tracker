@@ -40,6 +40,8 @@
     "learning:capture:yesterday": "tsx scripts/learning/captureDay.ts yesterday",
     "learning:capture-range": "tsx scripts/learning/captureRange.ts",
     "learning:replay-models": "tsx scripts/learning/replayModels.ts",
+    "learning:capture-changes": "tsx scripts/learning/captureChanges.ts",
+    "learning:ai-picks": "tsx scripts/learning/computeAiPicks.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json"
   },
   "dependencies": {

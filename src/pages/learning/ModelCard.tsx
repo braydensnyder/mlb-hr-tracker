@@ -246,7 +246,12 @@ export default function ModelCardPage() {
     }));
   }, [boards, targetDate]);
 
+  // Live-replay is for signal-based versions (v1-v6). v7 (AI Picks) is
+  // a meta-model — it needs ALL versions' picks as input, which we don't
+  // compute here. It surfaces via the historical panel + Version Calendar.
+  const isAiEnsemble = (me?.weights_json as { kind?: string })?.kind === 'ai_ensemble';
   const liveReplay = useMemo(() => {
+    if (isAiEnsemble) return null;
     if (!config || liveSnapshots.length === 0) return null;
     return replayDateUnderModel({
       date: targetDate,
@@ -258,7 +263,7 @@ export default function ModelCardPage() {
       game_pk_by_player: new Map(),
       config,
     });
-  }, [config, liveSnapshots, oddsByPlayer, targetDate]);
+  }, [config, liveSnapshots, oddsByPlayer, targetDate, isAiEnsemble]);
 
   // Historical performance roll-up
   const histPerf = useMemo(() => {
@@ -308,21 +313,57 @@ export default function ModelCardPage() {
               {config.description ?? (me.notes ?? 'No description provided.')}
             </p>
 
-            <h3 style={{ margin: '12px 0 6px', fontSize: 13 }}>Signal weight bonuses</h3>
-            {Object.keys(config.signal_weights).length === 0 ? (
-              <p className="subtle" style={{ fontSize: 12 }}>None — baseline.</p>
-            ) : (
-              <div className="mc-weight-grid">
-                {Object.entries(config.signal_weights).map(([k, w]) => (
-                  <div key={k} className="mc-weight-tile">
-                    <div className="mc-weight-signal">{k.replace(/_/g, ' ')}</div>
-                    <div className={`mc-weight-value ${(w ?? 0) > 0 ? 'mc-pos' : (w ?? 0) < 0 ? 'mc-neg' : ''}`}>
-                      {(w ?? 0) >= 0 ? '+' : ''}{w}
+            {(() => {
+              const wjKind = (me.weights_json as { kind?: string })?.kind;
+              const isAiEnsemble = wjKind === 'ai_ensemble';
+              const wjConfig = (me.weights_json as { config?: Record<string, number | string> })?.config;
+              if (isAiEnsemble) {
+                return (
+                  <>
+                    <h3 style={{ margin: '12px 0 6px', fontSize: 13 }}>🤖 Ensemble configuration</h3>
+                    <p className="subtle" style={{ fontSize: 11, marginBottom: 6 }}>
+                      This is a META-MODEL. It doesn't score raw signals — it weights v1–v6 by their rolling historical performance
+                      (hindsight-safe) and combines them.
+                    </p>
+                    {wjConfig ? (
+                      <div className="mc-weight-grid">
+                        {Object.entries(wjConfig).map(([k, v]) => (
+                          <div key={k} className="mc-weight-tile">
+                            <div className="mc-weight-signal">{k.replace(/([A-Z])/g, ' $1').toLowerCase()}</div>
+                            <div className="mc-weight-value">{String(v)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="subtle" style={{ fontSize: 12 }}>Config missing — see stats.ts AI_ENSEMBLE_CONFIG.</p>
+                    )}
+                    <p className="subtle" style={{ fontSize: 10.5, marginTop: 8, lineHeight: 1.5 }}>
+                      For each pick, the historical panel below shows the per-version ensemble weights that drove the ranking
+                      — click "Dates captured" to inspect any past day.
+                    </p>
+                  </>
+                );
+              }
+              return (
+                <>
+                  <h3 style={{ margin: '12px 0 6px', fontSize: 13 }}>Signal weight bonuses</h3>
+                  {Object.keys(config.signal_weights).length === 0 ? (
+                    <p className="subtle" style={{ fontSize: 12 }}>None — baseline.</p>
+                  ) : (
+                    <div className="mc-weight-grid">
+                      {Object.entries(config.signal_weights).map(([k, w]) => (
+                        <div key={k} className="mc-weight-tile">
+                          <div className="mc-weight-signal">{k.replace(/_/g, ' ')}</div>
+                          <div className={`mc-weight-value ${(w ?? 0) > 0 ? 'mc-pos' : (w ?? 0) < 0 ? 'mc-neg' : ''}`}>
+                            {(w ?? 0) >= 0 ? '+' : ''}{w}
+                          </div>
+                        </div>
+                      ))}
                     </div>
-                  </div>
-                ))}
-              </div>
-            )}
+                  )}
+                </>
+              );
+            })()}
 
             {Object.keys(config.parlay_rules).length > 0 && (
               <>
@@ -343,11 +384,15 @@ export default function ModelCardPage() {
           <div className="mc-panel" style={{ marginTop: 12 }}>
             <h2 style={{ margin: 0, fontSize: 16 }}>🎯 Tonight's Top 10 under {me.name}</h2>
             <p className="subtle" style={{ fontSize: 11, marginTop: 2 }}>
-              Live computed: v1's heat scores + this model's signal-weight bonuses, re-ranked.
+              {isAiEnsemble
+                ? 'AI Picks are computed nightly after v1–v6 finalize (Phase 7 of the cron). See the historical panel below to inspect any captured day.'
+                : 'Live computed: v1\'s heat scores + this model\'s signal-weight bonuses, re-ranked.'}
             </p>
             {!liveReplay ? (
               <p className="subtle" style={{ fontSize: 12, marginTop: 6 }}>
-                Waiting for today's snapshot data…
+                {isAiEnsemble
+                  ? 'For today\'s AI Picks preview, open /learning/calendar — it will show them as soon as tonight\'s cron writes v7 rows for today.'
+                  : 'Waiting for today\'s snapshot data…'}
               </p>
             ) : (
               <>

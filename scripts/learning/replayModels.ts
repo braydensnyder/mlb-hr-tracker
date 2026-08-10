@@ -238,9 +238,19 @@ export async function replayDateForVersions(date: string, opts: {
 } = {}): Promise<DayModelOutcome[]> {
   const allRows = await loadModelVersions();
   const allConfigs = allRows.map(toModelConfig);
+
+  // v7 (AI Picks) is a meta-model — it doesn't use signal-based replay.
+  // It has its own pipeline in scripts/learning/computeAiPicks.ts and is
+  // run separately by the cron. Filter it out here so we never accidentally
+  // treat it as a normal signal-weight config.
+  const isAiEnsemble = (c: ModelConfig): boolean => {
+    const wj = allRows.find((r) => r.version === c.version)?.weights_json as { kind?: string } | undefined;
+    return wj?.kind === 'ai_ensemble';
+  };
+
   const targets = opts.versions
-    ? allConfigs.filter((c) => opts.versions!.includes(c.version))
-    : allConfigs.filter((c) => c.version !== 1);
+    ? allConfigs.filter((c) => opts.versions!.includes(c.version) && !isAiEnsemble(c))
+    : allConfigs.filter((c) => c.version !== 1 && !isAiEnsemble(c));
 
   if (targets.length === 0) return [];
 

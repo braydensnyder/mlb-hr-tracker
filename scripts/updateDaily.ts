@@ -42,6 +42,8 @@ import { enrichLineups, type EnrichLineupsResult } from './enrichLineups.js';
 import { rebuildPlayerSummaries } from './rebuildPlayerSummaries.js';
 import { snapshotHrTargets, type SnapshotResult } from './snapshotHrTargets.js';
 import { captureDay } from './learning/captureDay.js';
+import { captureChangesForDate } from './learning/captureChanges.js';
+import { computeAiPicksForDate } from './learning/computeAiPicks.js';
 import { replayDateForVersions, type DayModelOutcome } from './learning/replayModels.js';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
 import {
@@ -513,6 +515,46 @@ export async function updateDaily(
   };
 
   // ─────────────────────────────────────────────────────────────────────
+  //  Phase 5b — Change tracking (Priority 2 of Champion System v2)
+  //
+  //  Runs on `full` + `night` + `daily` tiers. Compares TODAY's current
+  //  game state against the frozen game_state_at_snapshot baseline and
+  //  logs deltas (lineup posted, pitcher swap, weather shift, odds move).
+  //
+  //  Purpose: distinguish "model was wrong" from "info changed after the
+  //  snapshot was locked in." Fully isolated — failures never fail run.
+  // ─────────────────────────────────────────────────────────────────────
+  if (mode === 'full' || mode === 'night' || mode === 'daily') {
+    console.log(`\n▶ 5b) Change tracking — diffing today's game state vs snapshot baseline`);
+    const changeStartedAt = Date.now();
+    try {
+      const changeResult = await captureChangesForDate(today);
+      steps.push({
+        step: 'learning:capture-changes',
+        durationMs: Date.now() - changeStartedAt,
+        ok: true,
+        detail: changeResult,
+      });
+      if (changeResult.baseline_missing) {
+        console.log(`  ⚠ no baseline — snapshotHrTargets hasn't seeded game_state_at_snapshot for ${today}`);
+      } else if (changeResult.changes_written === 0) {
+        console.log(`  ✓ ${changeResult.games_compared} games checked, no meaningful changes since snapshot`);
+      } else {
+        console.log(`  ✓ ${changeResult.changes_written} change(s) logged across ${changeResult.games_compared} games`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`  ⚠ change tracking FAILED (non-fatal): ${msg}`);
+      steps.push({
+        step: 'learning:capture-changes',
+        durationMs: Date.now() - changeStartedAt,
+        ok: false,
+        detail: msg,
+      });
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
   //  Phase 6 — Learning Engine capture (Champion System)
   //
   //  Runs ONLY on the night tier (post-game finalization) — and on the
@@ -595,6 +637,50 @@ export async function updateDaily(
     }
   } else {
     console.log(`\n▶ 6) Learning phase — skipped on '${mode}' tier (runs on night + daily only)`);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  //  Phase 7 — AI Picks (Ensemble Meta-Model)
+  //
+  //  MUST run AFTER Phase 6 completes, because the ensemble reads v1-v6
+  //  predictions for the target date (which Phase 6 just wrote) plus the
+  //  prior-window performance data. Hindsight rule is enforced INSIDE
+  //  computeAiPicksForDate — the [D-30, D-1] window is strictly before D.
+  //
+  //  Fully isolated — failures never fail the run.
+  // ─────────────────────────────────────────────────────────────────────
+  if (mode === 'night' || mode === 'daily') {
+    console.log(`\n▶ 7) AI Picks (v7 ensemble)`);
+    const aiStartedAt = Date.now();
+    try {
+      const aiResult = await computeAiPicksForDate(yesterday);
+      console.log(
+        `  ✓ v7 AI Picks: ${aiResult.picks_written} rows written ` +
+          `(TP=${aiResult.tp} FP=${aiResult.fp} FN=${aiResult.fn} TN=${aiResult.tn}) · ` +
+          `window ${aiResult.window.from}..${aiResult.window.to} · ` +
+          `${aiResult.had_prior_data ? 'ensemble weighted' : 'neutral (no prior data)'}`,
+      );
+      steps.push({
+        step: 'learning:ai-picks',
+        durationMs: Date.now() - aiStartedAt,
+        ok: true,
+        detail: {
+          date: aiResult.date,
+          picks_written: aiResult.picks_written,
+          had_prior_data: aiResult.had_prior_data,
+          version_weights: aiResult.version_weights.map((w) => ({ v: w.version, w: Number(w.weight.toFixed(3)) })),
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`  ⚠ AI Picks FAILED (non-fatal): ${msg}`);
+      steps.push({
+        step: 'learning:ai-picks',
+        durationMs: Date.now() - aiStartedAt,
+        ok: false,
+        detail: msg,
+      });
+    }
   }
 
   console.log(`\n████████████████████████████████████████████████████`);
