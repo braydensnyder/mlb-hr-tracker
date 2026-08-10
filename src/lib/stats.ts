@@ -1658,6 +1658,17 @@ interface VenueFormLite {
  * canonical team (already remapped via applyCanonicalTeams upstream) matches
  * one of the game's teams.
  */
+/** Additional lineup-only candidate. Used by the canonical universe
+ *  writer (mig 018) to include zero-HR confirmed starters. When the
+ *  same player is already in the HR-aggregated candidate set, the HR
+ *  entry wins (has more historical context). */
+export interface ExtraLineupCandidate {
+  player_id: number;
+  player_name: string;
+  team: string;
+  batter_side?: string | null;
+}
+
 export function computeHrTargets(
   rows: HomeRunRowLite[],
   asOf: string,
@@ -1665,25 +1676,71 @@ export function computeHrTargets(
   opts: {
     pitcherIndex?: ReadonlyMap<number, PitcherFormLite>;
     venueIndex?: ReadonlyMap<string, VenueFormLite>;
-    limitPerTeam?: number;
+    /**
+     * Max hitters returned per team's board. Default 8 (matches historical
+     * behavior — keeps `hr_target_snapshots` at its established shape).
+     * Pass `null` or `0` for uncapped (used by the canonical universe
+     * writer so rank 9+ per team is preserved).
+     */
+    limitPerTeam?: number | null;
     /**
      * Player IDs the caller has identified as elite power (Power Floor applies).
      * Typically built from the canonical `players` table by matching full_name
      * against ELITE_POWER_NAMES. Override-able for tests.
      */
     elitePowerIds?: ReadonlySet<number>;
+    /**
+     * NEW (mig 018): zero-HR players to include as candidates alongside the
+     * HR-history-derived set. Typically confirmed / pending starters from
+     * `games.home_lineup` / `games.away_lineup`. Merged as a UNION — if a
+     * player_id already exists in the HR-derived candidates, the HR entry
+     * is preserved (richer stats). Zero-HR extras get zero recent-form and
+     * zero season-power contributions, but still score park / pitcher /
+     * weather / lineup context.
+     */
+    extraLineupPlayers?: ReadonlyArray<ExtraLineupCandidate>;
   } = {},
 ): HrTargetsBoard[] {
-  const limit = opts.limitPerTeam ?? 8;
+  // Default 8 (unchanged historical behavior — hr_target_snapshots stays
+  // shaped the same). Explicit `null`, `0`, or a negative number = uncap.
+  // `undefined` (option omitted) still means the historical default.
+  const rawLimit = opts.limitPerTeam;
+  const explicitUncap = rawLimit === null || (typeof rawLimit === 'number' && rawLimit <= 0);
+  const limit = explicitUncap ? Number.POSITIVE_INFINITY : (rawLimit ?? 8);
   const pitcherIndex = opts.pitcherIndex ?? new Map<number, PitcherFormLite>();
   const venueIndex = opts.venueIndex ?? new Map<string, VenueFormLite>();
   const elitePowerIds = opts.elitePowerIds ?? new Set<number>();
   const byPlayer = aggregateByPlayerForTargets(rows, asOf);
 
-  // Group candidate hitters by team for fast lookup
+  // ---- MERGE: zero-HR lineup candidates (mig 018 UNION step) ----
+  // For each extra, if player_id not already in byPlayer, add a synthetic
+  // InternalAgg with empty HR history. Team + name come from the caller.
+  if (opts.extraLineupPlayers && opts.extraLineupPlayers.length > 0) {
+    for (const ex of opts.extraLineupPlayers) {
+      if (byPlayer.has(ex.player_id)) continue;
+      byPlayer.set(ex.player_id, {
+        player_id: ex.player_id,
+        name: ex.player_name,
+        team: ex.team,
+        batter_side: ex.batter_side ?? null,
+        rows: [],
+        perDate: new Map(),
+        distinctDates: [],
+        vs_lhp: 0,
+        vs_rhp: 0,
+        known_hand_hrs: 0,
+      });
+    }
+  }
+
+  // Group candidate hitters by team for fast lookup.
+  //
+  // NOTE (mig 018): the historical filter `if (a.rows.length === 0) continue;`
+  // used to drop zero-HR players entirely. Now we let extras through since
+  // they came from a real lineup. HR-history players with rows.length===0
+  // (impossible in practice — they wouldn't be in byPlayer) also pass now.
   const candidatesByTeam = new Map<string, InternalAgg[]>();
   for (const a of byPlayer.values()) {
-    if (a.rows.length === 0) continue;
     let arr = candidatesByTeam.get(a.team);
     if (!arr) { arr = []; candidatesByTeam.set(a.team, arr); }
     arr.push(a);

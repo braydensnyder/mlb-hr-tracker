@@ -33,6 +33,7 @@
     "snapshot:odds:morning": "tsx scripts/runSnapshotOdds.ts morning",
     "snapshot:odds:midday": "tsx scripts/runSnapshotOdds.ts midday",
     "snapshot:odds:pregame": "tsx scripts/runSnapshotOdds.ts pregame",
+    "universe:report": "tsx scripts/universeReport.ts",
     "process:yesterday": "tsx scripts/runProcessDate.ts yesterday",
     "process:today": "tsx scripts/runProcessDate.ts today",
     "backfill:season": "tsx scripts/runBackfillSeason.ts",
