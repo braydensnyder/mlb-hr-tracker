@@ -43,7 +43,7 @@ import { rebuildPlayerSummaries } from './rebuildPlayerSummaries.js';
 import { snapshotHrTargets, type SnapshotResult } from './snapshotHrTargets.js';
 import { captureDay } from './learning/captureDay.js';
 import { captureChangesForDate } from './learning/captureChanges.js';
-import { computeAiPicksForDate } from './learning/computeAiPicks.js';
+import { computeAiPicksForDate, computeAiPicksPregame } from './learning/computeAiPicks.js';
 import { replayDateForVersions, type DayModelOutcome } from './learning/replayModels.js';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
 import {
@@ -452,6 +452,69 @@ export async function updateDaily(
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  //  Phase 4.5 — Pregame v7 (AI Picks for TODAY)
+  //
+  //  Runs right after Phase 4 so today's snapshot is fresh in
+  //  hr_target_snapshots. Reads that snapshot + v2-v6 signal-additive
+  //  replay in memory + performance window strictly [today-30, today-1]
+  //  to write today's v7 rows BEFORE first pitch.
+  //
+  //  Fences enforced inside computeAiPicksPregame:
+  //    • existing v7 rows for today → keep them frozen (never recompute)
+  //    • any game started AND no prior v7 → refuse
+  //    • --force override for operator use only
+  //
+  //  Yesterday's nightly Phase 7 below is UNCHANGED — it still runs for
+  //  yesterday with actual outcomes so backtest/historical rows exist.
+  //
+  //  Fully isolated — failures never fail the daily run.
+  //  Skipped on 'light' mode (touch runs) since no snapshot ran there.
+  // ─────────────────────────────────────────────────────────────────────
+  if (effectiveSnapshot !== 'none' && mode !== 'light') {
+    console.log(`\n▶ 4.5) Pregame AI Picks (v7 for today: ${today})`);
+    const pgStartedAt = Date.now();
+    try {
+      const pg = await computeAiPicksPregame(today);
+      const statusIcon = pg.status === 'written' ? '✓' :
+                        pg.status === 'frozen_kept' ? '✓' :
+                        pg.status === 'refused_games_started' ? '⛔' :
+                        '⚠';
+      console.log(
+        `  ${statusIcon} pregame v7 [${pg.status}] — ${pg.reason} · ` +
+          `games=${pg.games_started}/${pg.games_total} started · ` +
+          (pg.window ? `window ${pg.window.from}..${pg.window.to}` : '(no window)'),
+      );
+      if (pg.status === 'written' && pg.version_weights.length > 0) {
+        console.log(`    frozen version weights: ${pg.version_weights.map((w) => `v${w.version}=${(w.weight * 100).toFixed(1)}%`).join(' ')}`);
+      }
+      steps.push({
+        step: 'learning:ai-picks:pregame',
+        durationMs: Date.now() - pgStartedAt,
+        ok: pg.status !== 'refused_games_started',
+        detail: {
+          date: pg.date,
+          status: pg.status,
+          picks_written: pg.picks_written,
+          existing_v7_rows: pg.existing_v7_rows,
+          games_started: pg.games_started,
+          games_total: pg.games_total,
+          window: pg.window,
+          had_prior_data: pg.had_prior_data,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`  ⚠ pregame v7 FAILED (non-fatal): ${msg}`);
+      steps.push({
+        step: 'learning:ai-picks:pregame',
+        durationMs: Date.now() - pgStartedAt,
+        ok: false,
+        detail: msg,
+      });
+    }
+  }
+
   // -------------------------------------------------------------
   // 5. Rebuild summaries — config-driven (skipped on light ticks).
   // -------------------------------------------------------------
@@ -650,12 +713,13 @@ export async function updateDaily(
   //  Fully isolated — failures never fail the run.
   // ─────────────────────────────────────────────────────────────────────
   if (mode === 'night' || mode === 'daily') {
-    console.log(`\n▶ 7) AI Picks (v7 ensemble)`);
+    console.log(`\n▶ 7) Nightly historical AI Picks (v7 for yesterday: ${yesterday})`);
+    console.log(`    NOTE: this is the historical/backtest run with actual outcomes. Today's pregame v7 was written in Phase 4.5.`);
     const aiStartedAt = Date.now();
     try {
       const aiResult = await computeAiPicksForDate(yesterday);
       console.log(
-        `  ✓ v7 AI Picks: ${aiResult.picks_written} rows written ` +
+        `  ✓ nightly v7 AI Picks: ${aiResult.picks_written} rows written for ${yesterday} ` +
           `(TP=${aiResult.tp} FP=${aiResult.fp} FN=${aiResult.fn} TN=${aiResult.tn}) · ` +
           `window ${aiResult.window.from}..${aiResult.window.to} · ` +
           `${aiResult.had_prior_data ? 'ensemble weighted' : 'neutral (no prior data)'}`,

@@ -43,6 +43,8 @@
     "learning:replay-models": "tsx scripts/learning/replayModels.ts",
     "learning:capture-changes": "tsx scripts/learning/captureChanges.ts",
     "learning:ai-picks": "tsx scripts/learning/computeAiPicks.ts",
+    "learning:ai-picks:pregame": "tsx scripts/learning/computeAiPicks.ts --pregame today",
+    "learning:ai-picks:pregame:force": "tsx scripts/learning/computeAiPicks.ts --pregame today --force",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json"
   },
   "dependencies": {
