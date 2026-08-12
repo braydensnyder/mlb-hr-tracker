@@ -1196,6 +1196,100 @@ export interface HrTargetBreakdown {
   final_heat_score: number;      // mirror of HrTarget.heat_score (post-adjustments)
 }
 
+/**
+ * PHASE 1 — full, queryable numeric contribution breakdown.
+ *
+ * Keyed structure that answers "exactly how did Player A become 68.4 and
+ * Player B become 67.1?" without parsing reason text. Populated inside
+ * computeHrTargets alongside subscores/breakdown; scoring math is NOT
+ * changed. Every adjustment delta is 0 when the corresponding rule did
+ * not fire, so consumers can sum freely.
+ *
+ *   raw_pre_adjustments
+ *     + adjustments.elite_power_floor
+ *     + adjustments.low_power_cap
+ *     + adjustments.cold_penalty
+ *     + adjustments.pitcher_dominance
+ *     + adjustments.wild_pitcher
+ *     + adjustments.completeness_multiplier_delta
+ *     + adjustments.ceiling_compression
+ *     + adjustments.weather
+ *     + adjustments.lineup_pending
+ *   ≈ scores.final
+ *
+ * Small residuals (≤ 0.2) are expected from per-stage round1() rounding.
+ *
+ * Cold-penalty vs pitcher-dominance are TRACKED SEPARATELY here even
+ * though the legacy `HrTargetBreakdown.cold_penalty` field sums both.
+ */
+export interface HrTargetContributions {
+  /** Base additive contributions (points), post-stability, pre-adjustment. */
+  base: {
+    l3: number;
+    l5: number;
+    l7d: number;
+    season: number;
+    pitcher: number;
+    park: number;
+    hand: number;
+    /** Historical: weight is 0. Real weather effect lives in adjustments.weather. */
+    weather: number;
+  };
+  /** Every adjustment delta the score picked up, keyed by kind. 0 when not fired. */
+  adjustments: {
+    /** Power Floor lift for elite hitters (auto-elite ≥12 season HR OR curated). ≥ 0. */
+    elite_power_floor: number;
+    /** Non-elite fringe cap (heat → 34 when triggered). ≤ 0. */
+    low_power_cap: number;
+    /** Cold-streak penalty (0 HR L5 games AND 0 HR L7 days). ≤ 0. See meta.cold_penalty_tier. */
+    cold_penalty: number;
+    /** Facing dominant pitcher (K/9 ≥ 11). ≤ 0. Tracked separately from cold. */
+    pitcher_dominance: number;
+    /** Wild pitcher (BB/9 ≥ 4.5). ≥ 0. */
+    wild_pitcher: number;
+    /** Delta from completeness multiplier (heat × mult − heat). ≤ 0. */
+    completeness_multiplier_delta: number;
+    /** Delta from ceiling compression above soft cap. ≤ 0. */
+    ceiling_compression: number;
+    /** Weather adjustment (temp + wind sum, clamped [-3, +5]). Any sign. */
+    weather: number;
+    /** Lineup not posted yet (uncertainty). ≤ 0. */
+    lineup_pending: number;
+  };
+  /** Heat score at each stage. Lets us test the ceiling-compression hypothesis
+   *  without removing it (compare `after_completeness` vs `after_ceiling`). */
+  scores: {
+    /** Sum of base contribs (= heat at the top of the adjustment loop). */
+    raw_pre_adjustments: number;
+    after_power_floor: number;
+    after_low_power_cap: number;
+    after_negative_penalties: number;   // after cold + pitcher_dom + wild
+    after_completeness: number;
+    after_ceiling: number;
+    after_weather: number;
+    after_lineup: number;
+    /** Post-floor (heat < 0 → 0), rounded to 1 dp. Equals HrTarget.heat_score. */
+    final: number;
+  };
+  /** Diagnostic context — the multipliers, sample sizes, and flags that
+   *  drove the score. Useful for the Weight Learner (Phase 4) so it can
+   *  filter to "rows where stability was fully applied" etc. */
+  meta: {
+    stability_factor: number;
+    completeness_multiplier: number;
+    factors_firing: number;
+    is_elite_power: boolean;
+    is_auto_elite: boolean;
+    cold_penalty_tier: 'elite' | 'mid' | 'none';
+    pitcher_starts_known: number;
+    known_hand_hrs: number;
+    weather_temp_boost: number;
+    weather_wind_boost: number;
+    weather_is_dome: boolean;
+    weather_included: boolean;
+  };
+}
+
 /** Normalized 0..1 values per component, plus the points each contributed
  *  to the final heat score (= normalized * weight). */
 export interface HrTargetSubscores {
@@ -1263,6 +1357,11 @@ export interface HrTarget {
   subscores: HrTargetSubscores;
   /** Grouped score breakdown (post-stability) for the expandable detail. */
   breakdown: HrTargetBreakdown;
+  /** Phase 1 — full numeric contribution breakdown. Adjustment deltas
+   *  are keyed by kind (not label-parsed), score checkpoints preserve
+   *  raw/pre-ceiling/final so downstream research can measure the
+   *  compression effect without touching Heat Score behavior. */
+  heat_score_contributions: HrTargetContributions;
   /** Legacy: short sentences kept ONLY for snapshot back-compat (the
    *  Backtest page joins this string array). The HR Targets UI now reads
    *  `reason_chips` instead — see ReasonChip below. */
@@ -1899,6 +1998,21 @@ export function computeHrTargets(
       let heat = c_l3 + c_l5 + c_l7d + c_season + c_pitcher + c_park + c_hand + c_weather;
       const adjustments: { label: string; delta: number }[] = [];
 
+      // PHASE 1 — track every delta individually (keyed), plus checkpoints
+      // through the adjustment layer. Zero = didn't fire. These are purely
+      // observational; they never modify `heat` itself.
+      const raw_pre_adjustments = heat;
+      let contrib_elite_power_floor = 0;
+      let contrib_low_power_cap = 0;
+      let contrib_cold_penalty = 0;
+      let cold_penalty_tier: 'elite' | 'mid' | 'none' = 'none';
+      let contrib_pitcher_dominance = 0;
+      let contrib_wild_pitcher = 0;
+      let contrib_completeness_delta = 0;
+      let contrib_ceiling_compression = 0;
+      let contrib_weather_delta = 0;
+      let contrib_lineup_pending = 0;
+
       // Track Power Floor boost (combined season + stability lift)
       const powerFloorDelta = heat - heat_raw;
       if (isElitePower && powerFloorDelta > 0.05) {
@@ -1908,7 +2022,9 @@ export function computeHrTargets(
             : 'Power Floor (curated elite)',
           delta: round1(powerFloorDelta),
         });
+        contrib_elite_power_floor = round1(powerFloorDelta);
       }
+      const heat_after_power_floor = heat;
 
       // Low-power cap: non-elite player with sub-5 season HR and no
       // calendar-recent streak. Caps how high they can rank so a single
@@ -1925,7 +2041,9 @@ export function computeHrTargets(
           label: `Low-power cap (≤${C.cap}; <${C.season_hr_max} season HR + <${C.l7d_exemption} HR L7d)`,
           delta: round1(heat - before),
         });
+        contrib_low_power_cap = round1(heat - before);
       }
+      const heat_after_low_power_cap = heat;
 
       // ---- NEGATIVE WEIGHTING ----
       // Tracks penalties separately so the UI can show a single
@@ -1946,6 +2064,8 @@ export function computeHrTargets(
           label: `Cold streak — 0 HR L5 games + 0 HR L7 days (${season_hr} season HR)`,
           delta: penalty,
         });
+        contrib_cold_penalty = penalty;
+        cold_penalty_tier = 'elite';
       } else if (isQuiet && season_hr >= 8) {
         const penalty = HEAT_SCORE_COLD_PENALTY.mid;
         heat += penalty;
@@ -1954,6 +2074,8 @@ export function computeHrTargets(
           label: `Cold streak — 0 HR L5 games + 0 HR L7 days (${season_hr} season HR)`,
           delta: penalty,
         });
+        contrib_cold_penalty = penalty;
+        cold_penalty_tier = 'mid';
       }
 
       // (b) Pitcher dominance penalty: facing a starter with elite
@@ -1969,6 +2091,7 @@ export function computeHrTargets(
             label: `Facing dominant pitcher (K/9 ${pitcher_k_per_9.toFixed(1)}, ${pitcher_l5_starts} HR L5 starts)`,
             delta: penalty,
           });
+          contrib_pitcher_dominance = penalty;
         } else if (pitcher_k_per_9 >= 11) {
           // High-K pitcher without the HR-suppression bonus → still a headwind
           const penalty = -4;
@@ -1978,6 +2101,7 @@ export function computeHrTargets(
             label: `Facing high-K pitcher (K/9 ${pitcher_k_per_9.toFixed(1)})`,
             delta: penalty,
           });
+          contrib_pitcher_dominance = penalty;
         }
       }
 
@@ -1990,7 +2114,9 @@ export function computeHrTargets(
           label: `Wild pitcher (BB/9 ${pitcher_bb_per_9.toFixed(1)})`,
           delta: boost,
         });
+        contrib_wild_pitcher = boost;
       }
+      const heat_after_negative_penalties = heat;
 
       // ---- COMPLETENESS MULTIPLIER ----
       // Count how many of the 5 independent factors are firing
@@ -2013,12 +2139,14 @@ export function computeHrTargets(
       );
       const heatBeforeMultiplier = heat;
       heat = heat * completenessMultiplier;
+      contrib_completeness_delta = round1(heat - heatBeforeMultiplier);
       if (completenessMultiplier < 1.0) {
         adjustments.push({
           label: `Completeness ×${completenessMultiplier.toFixed(2)} (${factorsForMultiplier}/5 factors firing${isElitePower ? ', incl. elite-power bonus' : ''})`,
-          delta: round1(heat - heatBeforeMultiplier),
+          delta: contrib_completeness_delta,
         });
       }
+      const heat_after_completeness = heat;
 
       // ---- CEILING COMPRESSION ----
       // Above the soft cap, every point gets multiplied by `compression`,
@@ -2033,7 +2161,9 @@ export function computeHrTargets(
           label: `Ceiling compression — diminishing returns above ${CEIL.soft_cap}`,
           delta: ceilingCompressionDelta,
         });
+        contrib_ceiling_compression = ceilingCompressionDelta;
       }
+      const heat_after_ceiling = heat;
 
       // ---- WEATHER ADJUSTMENT (light) ----
       // A small, bounded environmental nudge applied LAST so it never
@@ -2045,7 +2175,9 @@ export function computeHrTargets(
           label: weather.adjustment.label,
           delta: weather.adjustment.delta,
         });
+        contrib_weather_delta = weather.adjustment.delta;
       }
+      const heat_after_weather = heat;
 
       // ---- LINEUP STATUS (task #176) ----
       // Classify the player's availability from the posted batting order.
@@ -2071,7 +2203,9 @@ export function computeHrTargets(
         const penalty = HEAT_SCORE_LINEUP_PENDING_PENALTY;
         heat += penalty;
         adjustments.push({ label: 'Lineup pending (uncertainty)', delta: penalty });
+        contrib_lineup_pending = penalty;
       }
+      const heat_after_lineup = heat;
 
       // Heat never goes below 0
       if (heat < 0) heat = 0;
@@ -2110,6 +2244,56 @@ export function computeHrTargets(
           park: round1(c_park),
           hand: round1(c_hand),
           weather: round1(c_weather),
+        },
+      };
+
+      // PHASE 1 — full contribution breakdown (additive, does not touch scoring).
+      const heat_score_contributions: HrTargetContributions = {
+        base: {
+          l3: round1(c_l3),
+          l5: round1(c_l5),
+          l7d: round1(c_l7d),
+          season: round1(c_season),
+          pitcher: round1(c_pitcher),
+          park: round1(c_park),
+          hand: round1(c_hand),
+          weather: round1(c_weather),
+        },
+        adjustments: {
+          elite_power_floor: contrib_elite_power_floor,
+          low_power_cap: contrib_low_power_cap,
+          cold_penalty: contrib_cold_penalty,
+          pitcher_dominance: contrib_pitcher_dominance,
+          wild_pitcher: contrib_wild_pitcher,
+          completeness_multiplier_delta: contrib_completeness_delta,
+          ceiling_compression: contrib_ceiling_compression,
+          weather: contrib_weather_delta,
+          lineup_pending: contrib_lineup_pending,
+        },
+        scores: {
+          raw_pre_adjustments: round1(raw_pre_adjustments),
+          after_power_floor: round1(heat_after_power_floor),
+          after_low_power_cap: round1(heat_after_low_power_cap),
+          after_negative_penalties: round1(heat_after_negative_penalties),
+          after_completeness: round1(heat_after_completeness),
+          after_ceiling: round1(heat_after_ceiling),
+          after_weather: round1(heat_after_weather),
+          after_lineup: round1(heat_after_lineup),
+          final: round1(heat),
+        },
+        meta: {
+          stability_factor: round2(stab),
+          completeness_multiplier: round2(completenessMultiplier),
+          factors_firing: factorsForMultiplier,
+          is_elite_power: isElitePower,
+          is_auto_elite: isAutoElite,
+          cold_penalty_tier,
+          pitcher_starts_known,
+          known_hand_hrs: a.known_hand_hrs,
+          weather_temp_boost: weather.adjustment.temp_boost,
+          weather_wind_boost: weather.adjustment.wind_boost,
+          weather_is_dome: weather.adjustment.is_dome,
+          weather_included: weather.adjustment.delta !== 0,
         },
       };
 
@@ -2157,6 +2341,7 @@ export function computeHrTargets(
         heat_score: round1(heat),
         subscores,
         breakdown,
+        heat_score_contributions,
         // Filled below from pickReasonChips() / pickReasons() so the
         // chip pass sees all the other fields already populated.
         reasons: [],
@@ -7601,6 +7786,11 @@ export interface LearningPredictionRecord {
   model_prob: number | null;
   reason: string | null;
   signals_json: Record<string, boolean>;
+  /** Phase 1 — numeric contribution breakdown (see HrTargetContributions).
+   *  Optional so pre-mig-019 callers continue to compile; captureDay writes
+   *  the full object when available (fetched from hr_target_universe for v1
+   *  or synthesized by replayModels/computeAiPicks for v2-v7). */
+  contributions_json?: Record<string, unknown>;
   in_safe: boolean;
   in_value: boolean;
   in_chaos: boolean;
@@ -7621,6 +7811,10 @@ export function buildLearningPredictionRecord(opts: {
   in_chaos: boolean;
   homered: boolean;
   hr_count: number;
+  /** Phase 1 — pass the HrTargetContributions object (or a compatible
+   *  shape from hr_target_universe.subscores_json) if available. Falls
+   *  back to `{}` so pre-mig-019 rows keep loading. */
+  contributions?: Record<string, unknown> | null;
 }): LearningPredictionRecord {
   const signals = parseSignalsFromReason(opts.snapshot.reason);
   const signalsObj: Record<string, boolean> = {};
@@ -7640,6 +7834,7 @@ export function buildLearningPredictionRecord(opts: {
     model_prob: modelProb,
     reason: opts.snapshot.reason,
     signals_json: signalsObj,
+    contributions_json: opts.contributions ?? {},
     in_safe: opts.in_safe,
     in_value: opts.in_value,
     in_chaos: opts.in_chaos,
@@ -8029,13 +8224,24 @@ export function applyModelToSnapshot(
   snap: RevAnalysisSnapshotRow,
   odds: number | null,
   config: ModelConfig,
-): ParlayCandidate & { original_heat: number; original_rank: number } {
+): ParlayCandidate & {
+  original_heat: number;
+  original_rank: number;
+  /** Phase 1: per-signal deltas actually applied by this replay
+   *  (only signals PRESENT and with a non-zero weight in config).
+   *  Empty object when the replay changed nothing. */
+  applied_signal_deltas: Record<string, number>;
+} {
   const base = snapshotToParlayCandidate(snap, odds);
   let modifiedHeat = base.heat_score;
+  const appliedSignalDeltas: Record<string, number> = {};
   for (const key of Object.keys(config.signal_weights) as SignalKey[]) {
     const w = config.signal_weights[key] ?? 0;
     if (w === 0) continue;
-    if (base.signals.has(key)) modifiedHeat += w;
+    if (base.signals.has(key)) {
+      modifiedHeat += w;
+      appliedSignalDeltas[key] = w;
+    }
   }
   // Recompute model_prob from modified heat (so the parlay's joint
   // probability matches the new ranking).
@@ -8048,6 +8254,7 @@ export function applyModelToSnapshot(
     edge: implied != null ? modProb - implied : null,
     original_heat: base.heat_score,
     original_rank: base.rank,
+    applied_signal_deltas: appliedSignalDeltas,
   };
 }
 
@@ -8072,6 +8279,11 @@ export function replayDateUnderModel(opts: {
   opponent_by_player: Map<number, string>;
   game_pk_by_player: Map<number, number>;
   config: ModelConfig;
+  /** Phase 1: v1's per-player numeric contribution breakdown fetched
+   *  from hr_target_universe. Passed through into each replayed record's
+   *  contributions_json so the Weight Learner (Phase 4) has both the v1
+   *  base AND the v2-v6 signal-additive delta history in one row. */
+  v1_contributions_by_player?: Map<number, Record<string, unknown>>;
 }): ReplayResult {
   // 1. Apply signal weights to every candidate.
   const candidates = opts.snapshots.map((snap) =>
@@ -8108,6 +8320,18 @@ export function replayDateUnderModel(opts: {
       heat_score: c.heat_score,
       reason: snap.reason,
     };
+    // Phase 1: contributions_json for a replayed row = v1 base contributions
+    // (from hr_target_universe if provided) + the signal-additive deltas
+    // this replay actually applied. Kind marker so Phase 4 can distinguish
+    // real per-component contributions (v1) from bolted-on signal weights.
+    const v1Contribs = opts.v1_contributions_by_player?.get(c.player_id) ?? null;
+    const replayContribs: Record<string, unknown> = {
+      kind: 'signal_additive_replay',
+      v1_base_heat: round1(c.original_heat),
+      modified_heat: round1(c.heat_score),
+      applied_signal_deltas: c.applied_signal_deltas,
+      v1_contributions: v1Contribs ?? {},
+    };
     return buildLearningPredictionRecord({
       snapshot: syntheticSnap,
       model_version: opts.config.version,
@@ -8118,6 +8342,7 @@ export function replayDateUnderModel(opts: {
       in_chaos: inChaos.has(c.player_id),
       homered,
       hr_count: hrCount,
+      contributions: replayContribs,
     });
   });
 

@@ -263,6 +263,28 @@ export async function replayDateForVersions(date: string, opts: {
     return targets.map((t) => ({ date, version: t.version, status: 'failed' as const, error: 'no snapshot for date' }));
   }
 
+  // Phase 1: fetch v1's per-player numeric contributions from
+  // hr_target_universe so each v2-v6 replay row can carry the v1 base
+  // breakdown alongside the applied signal-weight deltas.
+  const v1Contribs = await (async (): Promise<Map<number, Record<string, unknown>>> => {
+    const out = new Map<number, Record<string, unknown>>();
+    const { data, error } = await supabaseAdmin
+      .from('hr_target_universe')
+      .select('player_id, subscores_json')
+      .eq('target_date', date)
+      .eq('model_version', 1);
+    if (error) {
+      // Non-fatal: replay still runs, contributions_json.v1_contributions is {}.
+      return out;
+    }
+    for (const r of (data ?? []) as { player_id: number; subscores_json: Record<string, unknown> | null }[]) {
+      if (r.subscores_json && Object.keys(r.subscores_json).length > 0) {
+        out.set(r.player_id, r.subscores_json);
+      }
+    }
+    return out;
+  })();
+
   const hrIds = new Set(hrs.map((h) => h.player_id));
   const hrCount = new Map<number, number>();
   const oppByPlayer = new Map<number, string>();
@@ -288,6 +310,7 @@ export async function replayDateForVersions(date: string, opts: {
         hr_player_ids: hrIds, hr_count_by_player: hrCount,
         opponent_by_player: oppByPlayer, game_pk_by_player: gamePkByPlayer,
         config,
+        v1_contributions_by_player: v1Contribs,
       });
       let tp = 0, fp = 0, fn = 0, tn = 0;
       for (const r of result.records) {

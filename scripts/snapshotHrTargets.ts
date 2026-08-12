@@ -685,7 +685,16 @@ async function writeUniverseSnapshot(args: UniverseWriteArgs): Promise<void> {
       team_rank: teamRank,
       heat_score: t.heat_score,
       lineup_status: t.lineup_status,
-      subscores_json: t.subscores as unknown as Record<string, unknown>,
+      // Phase 1: subscores_json now stores the FULL contribution breakdown
+      // (base + adjustments + scores + meta), not just the compact
+      // subscores object. Consumers that read only the base fields (l3/l5/…)
+      // still work because they live at subscores_json.base.{l3,l5,…}.
+      // Also mirror the legacy compact subscores at subscores_json.legacy
+      // so any query still reading the old shape has a migration path.
+      subscores_json: {
+        ...t.heat_score_contributions,
+        legacy: t.subscores,
+      } as unknown as Record<string, unknown>,
       signals_json: signalsMap,
       reason: reasonText,
       american_odds: odds?.american ?? null,

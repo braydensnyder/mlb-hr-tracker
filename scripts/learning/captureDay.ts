@@ -213,6 +213,41 @@ async function loadOdds(date: string): Promise<Map<number, number>> {
   return out;
 }
 
+/**
+ * Phase 1 — pull the per-player numeric contribution breakdown from
+ * hr_target_universe for the given date. captureDay ingests this so
+ * learning_predictions can carry the same structured math the universe
+ * snapshotter records at snapshot time. Silent no-op when the table or
+ * date has no rows (pre-mig-018 dates, or captureDay running before the
+ * universe writer has run).
+ */
+async function loadContributionsFromUniverse(
+  date: string,
+  modelVersion: number,
+): Promise<Map<number, Record<string, unknown>>> {
+  const out = new Map<number, Record<string, unknown>>();
+  const { data, error } = await supabaseAdmin
+    .from('hr_target_universe')
+    .select('player_id, subscores_json')
+    .eq('target_date', date)
+    .eq('model_version', modelVersion);
+  if (error) {
+    if (/does not exist|schema cache/i.test(error.message)) {
+      logWarn('hr_target_universe missing — learning_predictions.contributions_json will stay {}');
+      return out;
+    }
+    // Non-fatal: contributions_json just stays empty for this run.
+    logWarn(`hr_target_universe contribs read failed (non-fatal): ${error.message}`);
+    return out;
+  }
+  for (const r of (data ?? []) as { player_id: number; subscores_json: Record<string, unknown> | null }[]) {
+    if (r.subscores_json && Object.keys(r.subscores_json).length > 0) {
+      out.set(r.player_id, r.subscores_json);
+    }
+  }
+  return out;
+}
+
 async function loadLearningRowsFor(
   date: string,
   modelVersion: number,
@@ -332,6 +367,11 @@ export async function captureDay(date: string, importanceWindows: number[]): Pro
 
   // ---- 9) Build learning records ----
   logStep('9)', 'Building learning_predictions records…');
+  // Phase 1: fetch numeric contributions per player from hr_target_universe.
+  // Falls back to {} for players/dates where universe hasn't written yet.
+  const contribsByPlayer = await loadContributionsFromUniverse(date, mv.version);
+  logOk(`contributions loaded: ${contribsByPlayer.size} player-day entries`);
+
   const records = snapshots.map((snap) => {
     const homered = hrCountByPlayer.has(snap.player_id);
     const hrCount = hrCountByPlayer.get(snap.player_id) ?? 0;
@@ -346,6 +386,7 @@ export async function captureDay(date: string, importanceWindows: number[]): Pro
       in_chaos: inChaos.has(snap.player_id),
       homered,
       hr_count: hrCount,
+      contributions: contribsByPlayer.get(snap.player_id) ?? null,
     });
   });
 
@@ -368,6 +409,11 @@ export async function captureDay(date: string, importanceWindows: number[]): Pro
       model_prob: null,
       reason: null,
       signals_json: {},
+      // Phase 1: phantom-FN rows CAN carry contributions if the player
+      // was in hr_target_universe but ranked outside snapshot's Top-50.
+      // This is exactly the "ranked-too-low HR hitter" case Phase 3 wants
+      // to analyze — preserve their numeric breakdown when available.
+      contributions_json: contribsByPlayer.get(pid) ?? {},
       in_safe: false,
       in_value: false,
       in_chaos: false,

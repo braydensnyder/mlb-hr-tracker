@@ -220,12 +220,17 @@ export async function computeAiPicksForDate(date: string): Promise<AiPicksCaptur
       heat_score: heat,
       model_prob: heatToProbLocal(heat),
       reason: p.reasoning,
-      signals_json: {
+      // Phase 1: signals_json is a plain boolean map for every version;
+      // ensemble math moved to contributions_json below so downstream
+      // consumers can treat signals_json uniformly.
+      signals_json: {},
+      contributions_json: {
+        kind: 'ai_ensemble',
         ensemble_score: p.ensemble_score,
         versions_agreeing: p.versions_agreeing,
         average_rank: p.average_rank,
         strongest_version: p.strongest_version,
-        contributions: p.contributions,
+        per_version_contributions: p.contributions,
         window: { from: windowFrom, to: windowTo, had_prior_data: ensemble.had_prior_data },
       },
       in_safe: false, in_value: false, in_chaos: false, // AI Picks isn't a parlay style; leave false
@@ -248,7 +253,16 @@ export async function computeAiPicksForDate(date: string): Promise<AiPicksCaptur
       opponent: r.opponent, game_pk: r.game_pk,
       rank: null, heat_score: 0, model_prob: null,
       reason: 'Not in AI Picks (unscored — no input version placed in Top 50).',
-      signals_json: { ensemble_score: 0, versions_agreeing: 0, average_rank: null, strongest_version: null, contributions: [], window: { from: windowFrom, to: windowTo, had_prior_data: ensemble.had_prior_data } },
+      signals_json: {},
+      contributions_json: {
+        kind: 'ai_ensemble',
+        ensemble_score: 0,
+        versions_agreeing: 0,
+        average_rank: null,
+        strongest_version: null,
+        per_version_contributions: [],
+        window: { from: windowFrom, to: windowTo, had_prior_data: ensemble.had_prior_data },
+      },
       in_safe: false, in_value: false, in_chaos: false,
       homered: true, hr_count: 0,
       classification: 'FN' as const,
