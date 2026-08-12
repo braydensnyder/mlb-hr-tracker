@@ -45,6 +45,7 @@
     "learning:ai-picks": "tsx scripts/learning/computeAiPicks.ts",
     "learning:ai-picks:pregame": "tsx scripts/learning/computeAiPicks.ts --pregame today",
     "learning:ai-picks:pregame:force": "tsx scripts/learning/computeAiPicks.ts --pregame today --force",
+    "learning:analyze-misses": "tsx scripts/learning/analyzeMissesByRank.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json"
   },
   "dependencies": {
