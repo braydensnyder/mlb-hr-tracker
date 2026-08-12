@@ -274,20 +274,119 @@ export async function computeAiPicksForDate(date: string): Promise<AiPicksCaptur
     fn++;
   }
 
-  // 6. Upsert.
-  if (rows.length > 0) {
+  // 6. Persist — preserving any existing pregame v7 rows.
+  //
+  //    A v7 row with contributions_json.kind === 'ai_ensemble_pregame'
+  //    represents exactly what the model produced BEFORE first pitch.
+  //    Post-game enrichment must NOT overwrite that decision record;
+  //    it only fills in outcome fields (homered, hr_count,
+  //    classification) and appends outcome_enriched_at +
+  //    final_result_status to the frozen contributions_json.
+  //
+  //    Rows without an existing pregame counterpart are upserted as
+  //    usual (this handles historical dates that never had pregame v7
+  //    and any player who first appears in the post-game ensemble).
+  const { data: existingV7Raw, error: existingErr } = await supabaseAdmin
+    .from('learning_predictions')
+    .select('player_id, contributions_json')
+    .eq('target_date', date)
+    .eq('model_version', AI_VERSION);
+  if (existingErr && !/does not exist|schema cache/i.test(existingErr.message)) {
+    throw new Error(`fetch existing v7 ${date}: ${existingErr.message}`);
+  }
+  const pregameByPlayer = new Map<number, Record<string, unknown>>();
+  for (const r of (existingV7Raw ?? []) as { player_id: number; contributions_json: Record<string, unknown> | null }[]) {
+    const cj = r.contributions_json;
+    if (cj && cj.kind === 'ai_ensemble_pregame') {
+      pregameByPlayer.set(r.player_id, cj);
+    }
+  }
+
+  const outcomeEnrichRows: Array<{
+    player_id: number;
+    homered: boolean;
+    hr_count: number;
+    classification: string | null;
+    contributions_json: Record<string, unknown>;
+  }> = [];
+  const upsertRows: typeof rows = [];
+  for (const row of rows) {
+    const pregame = pregameByPlayer.get(row.player_id);
+    if (pregame) {
+      // Preserve pregame decision record verbatim; append outcome metadata only.
+      outcomeEnrichRows.push({
+        player_id: row.player_id,
+        homered: !!row.homered,
+        hr_count: row.hr_count ?? 0,
+        classification: row.classification ?? null,
+        contributions_json: {
+          ...pregame,
+          outcome_enriched_at: now,
+          final_result_status: row.homered ? 'homered' : 'no_hr',
+        },
+      });
+    } else {
+      upsertRows.push(row);
+    }
+  }
+  // Second pass: any pregame row whose player didn't appear in the fresh
+  // ensemble output (rare — ensemble is deterministic so this only fires
+  // when the underlying snapshot / model set changed between pregame and
+  // post-game). Still owed an outcome enrichment.
+  for (const [pid, pregame] of pregameByPlayer) {
+    if (rows.some((r) => r.player_id === pid)) continue;
+    const homered = !!homeredById.get(pid);
+    outcomeEnrichRows.push({
+      player_id: pid,
+      homered,
+      hr_count: 0,
+      classification: null,
+      contributions_json: {
+        ...pregame,
+        outcome_enriched_at: now,
+        final_result_status: homered ? 'homered' : 'no_hr',
+        note: 'player not in post-game ensemble; frozen pregame data preserved',
+      },
+    });
+  }
+
+  let written = 0;
+  if (upsertRows.length > 0) {
     const BATCH = 500;
-    let written = 0;
-    for (let i = 0; i < rows.length; i += BATCH) {
-      const chunk = rows.slice(i, i + BATCH);
+    for (let i = 0; i < upsertRows.length; i += BATCH) {
+      const chunk = upsertRows.slice(i, i + BATCH);
       const { error, count } = await supabaseAdmin
         .from('learning_predictions')
         .upsert(chunk, { onConflict: 'target_date,player_id,model_version', count: 'exact' });
       if (error) throw new Error(`upsert v${AI_VERSION}: ${error.message}`);
       written += count ?? chunk.length;
     }
-    console.log(`[computeAiPicks]   ${written} v7 rows written (TP=${tp} FP=${fp} FN=${fn} TN=${tn})`);
   }
+
+  let enrichedCount = 0;
+  for (const er of outcomeEnrichRows) {
+    // Outcome-only update: leaves rank, heat_score, model_prob, reason,
+    // signals_json, in_safe/value/chaos, captured_at all UNCHANGED so
+    // the pregame audit trail stays byte-identical (aside from the two
+    // appended keys inside contributions_json).
+    const { error } = await supabaseAdmin
+      .from('learning_predictions')
+      .update({
+        homered: er.homered,
+        hr_count: er.hr_count,
+        classification: er.classification,
+        contributions_json: er.contributions_json,
+      })
+      .eq('target_date', date)
+      .eq('player_id', er.player_id)
+      .eq('model_version', AI_VERSION);
+    if (error) throw new Error(`enrich v7 outcome (${date}, pid ${er.player_id}): ${error.message}`);
+    enrichedCount++;
+  }
+
+  const wroteMsg = written > 0 ? `${written} v7 rows written` : 'no new v7 rows';
+  const enrichMsg = enrichedCount > 0 ? `${enrichedCount} pregame rows outcome-enriched (frozen data preserved)` : '';
+  console.log(`[computeAiPicks]   ${wroteMsg}${enrichMsg ? ' · ' + enrichMsg : ''} (TP=${tp} FP=${fp} FN=${fn} TN=${tn})`);
 
   return {
     date,
@@ -303,6 +402,9 @@ export async function computeAiPicksForDate(date: string): Promise<AiPicksCaptur
     skipped,
   };
 }
+// (rows.length above still reports the total decision-record count for
+// the day. Pregame rows counted here were enriched — not overwritten —
+// so downstream metrics stay comparable to the pre-preservation era.)
 
 // =====================================================================
 //  PREGAME v7 (Phase 2)
