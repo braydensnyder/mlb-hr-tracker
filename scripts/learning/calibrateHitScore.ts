@@ -643,32 +643,56 @@ function topNHitRate(
   return { hits, total, rate: total > 0 ? hits / total : 0 };
 }
 
-// ---------- Deterministic Hit Score (for comparison baseline) ----------
+// ---------- Deterministic Hit Score presets ----------
 //
-// Rounded, interpretable weights. Same feature set as the LR contact-first
-// list. Score = weighted sum of z-scored features (train-set μ/σ), then
-// sigmoid → probability. Not optimised, purely a "if we didn't calibrate
-// at all, how would rounded intuition do?" baseline.
-const DETERMINISTIC_WEIGHTS: Record<string, number> = {
-  season_avg_asof:        6,
-  hit_rate_l7d_asof:      3,
-  hits_l7d_asof:          1,
-  expected_pa:            5,
-  season_k_rate_asof:    -3,
-  recent_k_rate_asof:    -2,
-  pitcher_h_per_9_asof:   3,
-  pitcher_whip_asof:      2,
-  pitcher_k_per_9_asof:  -3,
-  pitcher_bb_per_9_asof:  1,
-  platoon_hit_rate_asof:  1,
-  weather_temp_f:         0.5,
-  weather_wind_mph:       0,
-  multi_hit_rate_l10g_asof: 0,   // deterministic 1+; the 2+ variant flips a few of these
+// Rounded, interpretable weights on z-scored features → sigmoid.
+// Two presets — the 1+ variant emphasises contact + opportunity,
+// the 2+ variant lifts multi-hit-frequency and expected-PA and
+// slightly softens pitcher rate weights (2+ hits are harder to
+// suppress with one dominant matchup fact than 1+).
+//
+// The user's earlier result (deterministic 2+ Top-5 = 8/20, Top-10 =
+// 11/40 vs 21.5% baseline) is why the 2+ preset gets its own row
+// and calibrate v2 investigates it in the ablation grid.
+const DETERMINISTIC_WEIGHTS_1PLUS: Record<string, number> = {
+  season_avg_asof:          6,
+  hit_rate_l7d_asof:        3,
+  hits_l7d_asof:            1,
+  ab_l7d_asof:              0,
+  expected_pa:              5,
+  season_k_rate_asof:      -3,
+  recent_k_rate_asof:      -2,
+  pitcher_h_per_9_asof:     3,
+  pitcher_whip_asof:        2,
+  pitcher_k_per_9_asof:    -3,
+  pitcher_bb_per_9_asof:    1,
+  platoon_hit_rate_asof:    1,
+  weather_temp_f:           0.5,
+  weather_wind_mph:         0,
+  multi_hit_rate_l10g_asof: 0,
 };
 
-function deterministicScore(row: number[], keys: string[]): number {
+const DETERMINISTIC_WEIGHTS_2PLUS: Record<string, number> = {
+  season_avg_asof:          5,
+  hit_rate_l7d_asof:        3,
+  hits_l7d_asof:            2,
+  ab_l7d_asof:              1,
+  expected_pa:              6,
+  season_k_rate_asof:      -3,
+  recent_k_rate_asof:      -2,
+  pitcher_h_per_9_asof:     3,
+  pitcher_whip_asof:        2,
+  pitcher_k_per_9_asof:    -2,
+  pitcher_bb_per_9_asof:    1,
+  platoon_hit_rate_asof:    1,
+  weather_temp_f:           0.5,
+  weather_wind_mph:         0,
+  multi_hit_rate_l10g_asof: 4,
+};
+
+function deterministicScore(row: number[], keys: string[], weights: Record<string, number>): number {
   let s = 0;
-  for (let i = 0; i < keys.length; i++) s += (DETERMINISTIC_WEIGHTS[keys[i]] ?? 0) * row[i];
+  for (let i = 0; i < keys.length; i++) s += (weights[keys[i]] ?? 0) * row[i];
   return sigmoid(s / 10);
 }
 
@@ -803,72 +827,320 @@ async function main() {
     return { X: outX, y1: oy1, y2: oy2, rows: oRows };
   }
 
-  async function trainAndReport(label: string, outcome: 'y1' | 'y2', specsForModel: FeatureSpec[]) {
-    const modelKeys = specsForModel.map((s) => s.key);
+  // 10. Ablation configuration.
+  //
+  // Every ablation runs on the SAME chronological split. Deterministic
+  // scoring uses the appropriate 1+/2+ weight preset with any dropped
+  // features contributing zero. LR is retrained per-ablation on the
+  // reduced feature set.
+  //
+  // "drop" is a list of feature keys to remove from the full set for this
+  // ablation. Empty = full model. "keepOnly" (when set) overrides drop
+  // and restricts to exactly the listed keys.
+  interface AblationConfig {
+    id: string;
+    label: string;
+    drop?: string[];
+    keepOnly?: string[];  // for opportunity-only
+  }
+  const ABLATIONS: AblationConfig[] = [
+    { id: 'full',            label: 'Full (all features)' },
+    { id: 'no_weather',      label: 'No weather (drop temp + wind)',
+      drop: ['weather_temp_f', 'weather_wind_mph'] },
+    { id: 'no_volume',       label: 'No recent volume (drop hits_l7d + ab_l7d)',
+      drop: ['hits_l7d_asof', 'ab_l7d_asof'] },
+    { id: 'no_rate',         label: 'No recent rate (drop hit_rate_l7d)',
+      drop: ['hit_rate_l7d_asof'] },
+    { id: 'no_whip',         label: 'No pitcher WHIP (keep H/9 + BB/9)',
+      drop: ['pitcher_whip_asof'] },
+    { id: 'opportunity',     label: 'Opportunity-only (contact + PA + K + pitcher H9/K9)',
+      keepOnly: [
+        'season_avg_asof', 'expected_pa',
+        'season_k_rate_asof', 'recent_k_rate_asof',
+        'pitcher_h_per_9_asof', 'pitcher_k_per_9_asof',
+        'platoon_hit_rate_asof',
+        'multi_hit_rate_l10g_asof',
+      ] },
+  ];
+
+  function specsForAblation(
+    outcome: 'y1' | 'y2', abl: AblationConfig,
+  ): FeatureSpec[] {
+    const base = outcome === 'y1'
+      ? specs.filter((s) => s.common)
+      : specs.filter((s) => s.common || s.twoPlusOnly);
+    if (abl.keepOnly) return base.filter((s) => abl.keepOnly!.includes(s.key));
+    if (abl.drop)     return base.filter((s) => !abl.drop!.includes(s.key));
+    return base;
+  }
+
+  // ---------- Per-test-date metrics ----------
+  interface DailyRow {
+    date: string;
+    slate_size: number;                   // number of players on the slate that day
+    slate_pos: number;                    // number who actually satisfied the outcome
+    slate_rate: number;                   // slate_pos / slate_size (baseline for this date)
+    top_hits: Record<number, number>;     // {3: hits, 5: hits, 10: hits, 25: hits}
+    top_total: Record<number, number>;
+  }
+
+  // Compute FULL-slate baseline per test date ONCE, using every filtered
+  // starter row on that date regardless of which config could score them.
+  // This makes ablation lift comparable across configs — a config that
+  // drops rows for missing features doesn't get an easier baseline.
+  function fullSlateBaselines(outcome: 'y1' | 'y2'): Map<string, { size: number; pos: number }> {
+    const out = new Map<string, { size: number; pos: number }>();
+    for (const r of testRows) {
+      const y = outcome === 'y1' ? r.y1 : r.y2;
+      const cur = out.get(r.target_date) ?? { size: 0, pos: 0 };
+      cur.size += 1;
+      cur.pos += y;
+      out.set(r.target_date, cur);
+    }
+    return out;
+  }
+  const slateBaselineY1 = fullSlateBaselines('y1');
+  const slateBaselineY2 = fullSlateBaselines('y2');
+
+  function dailyBreakdown(
+    rows: Row[], scores: number[], y: number[], outcome: 'y1' | 'y2',
+  ): DailyRow[] {
+    const byDate = new Map<string, { s: number; y: number }[]>();
+    for (let i = 0; i < rows.length; i++) {
+      const arr = byDate.get(rows[i].target_date) ?? [];
+      arr.push({ s: scores[i], y: y[i] });
+      byDate.set(rows[i].target_date, arr);
+    }
+    const baselineMap = outcome === 'y1' ? slateBaselineY1 : slateBaselineY2;
+    const out: DailyRow[] = [];
+    for (const [d, arr] of [...byDate.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      const sorted = arr.slice().sort((a, b) => b.s - a.s);
+      const top_hits: Record<number, number> = {};
+      const top_total: Record<number, number> = {};
+      for (const n of TOPN_LIST) {
+        const topN = sorted.slice(0, n);
+        top_hits[n]  = topN.reduce((s, r) => s + r.y, 0);
+        top_total[n] = topN.length;
+      }
+      // Baseline from the full slate, not the config's subset.
+      const bl = baselineMap.get(d) ?? { size: arr.length, pos: arr.reduce((s, r) => s + r.y, 0) };
+      out.push({
+        date: d, slate_size: bl.size, slate_pos: bl.pos,
+        slate_rate: bl.size > 0 ? bl.pos / bl.size : 0,
+        top_hits, top_total,
+      });
+    }
+    return out;
+  }
+
+  // Aggregate lift metrics + bootstrap 95% CI over test DATES (units of
+  // variation — resampling rows would hide within-date correlation).
+  interface LiftStats {
+    topN: number;
+    top_rate: number;
+    base_rate: number;
+    abs_lift: number;
+    rel_lift: number;
+    ci95_top_rate: [number, number];
+    total_top: number;
+    total_hits: number;
+    n_dates: number;
+  }
+  const BOOTSTRAP_ITERS = 500;
+  const BOOTSTRAP_SEED = 1234;
+  function seededRng(seed: number) {
+    let s = seed;
+    return () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
+  }
+
+  function aggregate(daily: DailyRow[], n: number): LiftStats {
+    const totalHits  = daily.reduce((s, d) => s + d.top_hits[n], 0);
+    const totalTop   = daily.reduce((s, d) => s + d.top_total[n], 0);
+    const baseHits   = daily.reduce((s, d) => s + d.slate_pos, 0);
+    const baseTotal  = daily.reduce((s, d) => s + d.slate_size, 0);
+    const top_rate  = totalTop > 0  ? totalHits / totalTop  : 0;
+    const base_rate = baseTotal > 0 ? baseHits  / baseTotal : 0;
+    // Bootstrap over dates.
+    const rng = seededRng(BOOTSTRAP_SEED + n);
+    const samples: number[] = new Array(BOOTSTRAP_ITERS);
+    for (let b = 0; b < BOOTSTRAP_ITERS; b++) {
+      let h = 0, t = 0;
+      for (let i = 0; i < daily.length; i++) {
+        const pick = daily[Math.floor(rng() * daily.length)];
+        h += pick.top_hits[n]; t += pick.top_total[n];
+      }
+      samples[b] = t > 0 ? h / t : 0;
+    }
+    samples.sort((a, b) => a - b);
+    const lo = samples[Math.max(0, Math.floor(0.025 * BOOTSTRAP_ITERS))];
+    const hi = samples[Math.min(BOOTSTRAP_ITERS - 1, Math.floor(0.975 * BOOTSTRAP_ITERS))];
+    return {
+      topN: n, top_rate, base_rate,
+      abs_lift: top_rate - base_rate,
+      rel_lift: base_rate > 0 ? top_rate / base_rate - 1 : NaN,
+      ci95_top_rate: [lo, hi],
+      total_top: totalTop, total_hits: totalHits,
+      n_dates: daily.length,
+    };
+  }
+
+  // ---------- Runner ----------
+  interface RunResult {
+    id: string;
+    label: string;
+    outcome: 'y1' | 'y2';
+    kind: 'LR' | 'DET';
+    features: string[];
+    n_train_rows: number; n_val_rows: number; n_test_rows: number;
+    train_loss?: number; val_loss?: number; test_loss?: number;
+    train_auc?: number; val_auc?: number; test_auc?: number;
+    coefficients?: Array<{ key: string; beta: number }>;
+    l2Used?: number; epochs?: number;
+    daily: DailyRow[];
+    aggregate: Record<number, LiftStats>;  // {3, 5, 10, 25}
+  }
+
+  function evalOn(rowsMat: { X: number[][]; y1: number[]; y2: number[]; rows: Row[] }, scoreFn: (r: number[]) => number, outcome: 'y1' | 'y2') {
+    const y = outcome === 'y1' ? rowsMat.y1 : rowsMat.y2;
+    const scores = rowsMat.X.map((r) => scoreFn(r));
+    const daily = dailyBreakdown(rowsMat.rows, scores, y, outcome);
+    const aggByN: Record<number, LiftStats> = {};
+    for (const n of TOPN_LIST) aggByN[n] = aggregate(daily, n);
+    return { daily, aggregate: aggByN, scores, y };
+  }
+
+  async function runConfig(abl: AblationConfig, outcome: 'y1' | 'y2'): Promise<RunResult[]> {
+    const specsForModel = specsForAblation(outcome, abl);
+    const keys = specsForModel.map((s) => s.key);
     const tr = materialise(trainRows, specsForModel);
     const va = materialise(valRows, specsForModel);
     const te = materialise(testRows, specsForModel);
-    if (tr.X.length < 100 || va.X.length < 30 || te.X.length < 30) {
-      console.log(`\n  ── ${label}: INSUFFICIENT DATA (train=${tr.X.length} val=${va.X.length} test=${te.X.length}) — skipped`);
-      return;
+    const label = abl.label;
+    if (tr.X.length < 50 || va.X.length < 20 || te.X.length < 20) {
+      console.log(`  ${abl.id}/${outcome}: INSUFFICIENT DATA (train=${tr.X.length} val=${va.X.length} test=${te.X.length}) — skipped`);
+      return [];
     }
     const { means, stds } = computeMeansStds(tr.X);
     const XtrS = standardise(tr.X, means, stds);
     const XvaS = standardise(va.X, means, stds);
     const XteS = standardise(te.X, means, stds);
-
     const ytr = outcome === 'y1' ? tr.y1 : tr.y2;
     const yva = outcome === 'y1' ? va.y1 : va.y2;
     const yte = outcome === 'y1' ? te.y1 : te.y2;
 
+    // --- LR ---
     const fit = trainWithL2Sweep(XtrS, ytr, XvaS, yva, means, stds);
-
-    console.log(`\n  ── ${label}: logistic (outcome=${outcome === 'y1' ? 'hits≥1' : 'hits≥2'}) ──`);
-    console.log(`    features (${modelKeys.length}): ${modelKeys.join(', ')}`);
-    console.log(`    L2 chosen: ${fit.l2Used}  ·  epochs: ${fit.epochs}`);
-    console.log(`    losses: train=${fit.finalTrainLoss.toFixed(4)}  val=${fit.finalValLoss.toFixed(4)}  test=${logLoss(XteS, yte, fit.weights, fit.bias, 0).toFixed(4)}`);
     const trPred = predict(XtrS, fit.weights, fit.bias);
     const vaPred = predict(XvaS, fit.weights, fit.bias);
     const tePred = predict(XteS, fit.weights, fit.bias);
-    console.log(`    AUC:    train=${auc(trPred, ytr).toFixed(3)}  val=${auc(vaPred, yva).toFixed(3)}  test=${auc(tePred, yte).toFixed(3)}`);
+    const lrRes = evalOn({ X: XteS, y1: te.y1, y2: te.y2, rows: te.rows }, (r) => {
+      let z = fit.bias; for (let j = 0; j < r.length; j++) z += fit.weights[j] * r[j]; return sigmoid(z);
+    }, outcome);
+    const lrResult: RunResult = {
+      id: abl.id, label, outcome, kind: 'LR',
+      features: keys,
+      n_train_rows: tr.X.length, n_val_rows: va.X.length, n_test_rows: te.X.length,
+      train_loss: fit.finalTrainLoss, val_loss: fit.finalValLoss,
+      test_loss: logLoss(XteS, yte, fit.weights, fit.bias, 0),
+      train_auc: auc(trPred, ytr), val_auc: auc(vaPred, yva), test_auc: auc(tePred, yte),
+      coefficients: keys.map((k, i) => ({ key: k, beta: fit.weights[i] })).sort((a, b) => Math.abs(b.beta) - Math.abs(a.beta)),
+      l2Used: fit.l2Used, epochs: fit.epochs,
+      daily: lrRes.daily, aggregate: lrRes.aggregate,
+    };
 
-    console.log(`    standardised coefficients (larger |β| = stronger effect after z-scoring):`);
-    const paired = modelKeys.map((k, i) => ({ k, b: fit.weights[i] })).sort((a, b) => Math.abs(b.b) - Math.abs(a.b));
-    for (const p of paired) console.log(`      ${p.k.padEnd(32)}  β = ${p.b.toFixed(4)}`);
-    console.log(`      (bias                              β = ${fit.bias.toFixed(4)})`);
+    // --- Deterministic (uses same standardised test features + preset weights) ---
+    const detWeights = outcome === 'y1' ? DETERMINISTIC_WEIGHTS_1PLUS : DETERMINISTIC_WEIGHTS_2PLUS;
+    const detRes = evalOn({ X: XteS, y1: te.y1, y2: te.y2, rows: te.rows }, (r) => deterministicScore(r, keys, detWeights), outcome);
+    const detResult: RunResult = {
+      id: abl.id, label, outcome, kind: 'DET',
+      features: keys,
+      n_train_rows: tr.X.length, n_val_rows: va.X.length, n_test_rows: te.X.length,
+      test_auc: auc(detRes.scores, detRes.y),
+      daily: detRes.daily, aggregate: detRes.aggregate,
+    };
+    return [lrResult, detResult];
+  }
 
-    console.log(`    Top-N hit rate on TEST dates:`);
-    for (const n of TOPN_LIST) {
-      const stats = topNHitRate(te.rows, tePred, yte, n);
-      console.log(`      Top-${String(n).padStart(2)}  →  ${stats.hits}/${stats.total} = ${(stats.rate * 100).toFixed(1)}%`);
-    }
-
-    // Deterministic score comparison on the same test rows.
-    const detScores = XteS.map((r) => deterministicScore(r, modelKeys));
-    console.log(`    Deterministic baseline (rounded weights, same features, sigmoid transform):`);
-    console.log(`      AUC(test) = ${auc(detScores, yte).toFixed(3)}`);
-    for (const n of TOPN_LIST) {
-      const stats = topNHitRate(te.rows, detScores, yte, n);
-      console.log(`      Top-${String(n).padStart(2)}  →  ${stats.hits}/${stats.total} = ${(stats.rate * 100).toFixed(1)}%`);
+  // 11. Run full grid: 6 ablations × 2 outcomes × 2 kinds (LR + DET) = 24 configs.
+  console.log(`\n  ── Running ablation grid (${ABLATIONS.length} ablations × 2 outcomes × 2 kinds = ${ABLATIONS.length * 4} configs) ──`);
+  const allResults: RunResult[] = [];
+  for (const abl of ABLATIONS) {
+    for (const outcome of ['y1', 'y2'] as const) {
+      const results = await runConfig(abl, outcome);
+      allResults.push(...results);
     }
   }
 
-  // 10. Train + report both models.
-  // For 1+ we keep every common feature; for 2+ we also include multi_hit rate.
-  const specs1Plus = specs.filter((s) => s.common);
-  const specs2Plus = specs.filter((s) => s.common || s.twoPlusOnly);
-  await trainAndReport('LR(1+)', 'y1', specs1Plus);
-  await trainAndReport('LR(2+)', 'y2', specs2Plus);
+  // ---------- REPORT ----------
+  // Table 1: aggregate lift table sorted by outcome then Top-5 rate.
+  function fmtPct(x: number): string { return Number.isFinite(x) ? (x * 100).toFixed(1).padStart(5) + '%' : '  -  '.padStart(6); }
+  function fmtCI(ci: [number, number]): string { return `[${(ci[0] * 100).toFixed(1)}, ${(ci[1] * 100).toFixed(1)}]`; }
 
-  console.log(`\n═══ end of calibration report ═══`);
+  console.log(`\n═══ Aggregate lift table (bootstrapped 95% CI over test dates, ${BOOTSTRAP_ITERS} iters) ═══\n`);
+  for (const outcome of ['y1', 'y2'] as const) {
+    const outcomeLabel = outcome === 'y1' ? 'hits ≥ 1' : 'hits ≥ 2';
+    const rows = allResults.filter((r) => r.outcome === outcome);
+    const baseRate = rows[0]?.aggregate[5]?.base_rate ?? NaN;
+    console.log(`── outcome = ${outcomeLabel}  (test slate baseline = ${(baseRate * 100).toFixed(1)}%) ──`);
+    console.log(`   ${'config'.padEnd(32)}  ${'kind'.padEnd(4)}  ${'topN'.padStart(4)}  ${'topN_hit%'.padStart(9)}  ${'abs_lift'.padStart(8)}  ${'rel_lift'.padStart(8)}  ${'CI_95%'.padStart(16)}  ${'n(hits/top)'.padStart(11)}`);
+    // Sort by test Top-5 rate desc so best rows float up.
+    const sorted = rows.slice().sort((a, b) => (b.aggregate[5]?.top_rate ?? 0) - (a.aggregate[5]?.top_rate ?? 0));
+    for (const r of sorted) {
+      for (const n of TOPN_LIST) {
+        const a = r.aggregate[n];
+        if (!a) continue;
+        const rel = Number.isFinite(a.rel_lift) ? (a.rel_lift * 100).toFixed(1) + '%' : '  -  ';
+        console.log(
+          `   ${(r.label.slice(0, 32)).padEnd(32)}  ${r.kind.padEnd(4)}  ${String(n).padStart(4)}  ${fmtPct(a.top_rate)}  ${fmtPct(a.abs_lift)}  ${rel.padStart(8)}  ${fmtCI(a.ci95_top_rate).padStart(16)}  ${String(`${a.total_hits}/${a.total_top}`).padStart(11)}`,
+        );
+      }
+      console.log('');
+    }
+  }
+
+  // Table 2: coefficients for LR models (all ablations).
+  console.log(`\n═══ LR coefficients per ablation (standardised features) ═══`);
+  for (const outcome of ['y1', 'y2'] as const) {
+    const label = outcome === 'y1' ? 'hits ≥ 1' : 'hits ≥ 2';
+    console.log(`\n── outcome = ${label} ──`);
+    for (const r of allResults.filter((x) => x.outcome === outcome && x.kind === 'LR')) {
+      console.log(`  ${r.label}   (L2=${r.l2Used}, epochs=${r.epochs}, train/val/test loss=${r.train_loss?.toFixed(3)}/${r.val_loss?.toFixed(3)}/${r.test_loss?.toFixed(3)}, AUC test=${r.test_auc?.toFixed(3)})`);
+      for (const c of (r.coefficients ?? []).slice(0, 8)) console.log(`    ${c.key.padEnd(32)}  β = ${c.beta.toFixed(4)}`);
+      if ((r.coefficients?.length ?? 0) > 8) console.log(`    … (${(r.coefficients?.length ?? 0) - 8} more)`);
+    }
+  }
+
+  // Table 3: per-test-date breakdown. Emit for every config so the user
+  // can see stability across dates (this is the point of the exercise).
+  console.log(`\n═══ Per-test-date breakdown ═══`);
+  for (const outcome of ['y1', 'y2'] as const) {
+    const label = outcome === 'y1' ? 'hits ≥ 1' : 'hits ≥ 2';
+    for (const r of allResults.filter((x) => x.outcome === outcome)) {
+      console.log(`\n── ${r.label}  [${r.kind}]  outcome=${label} ──`);
+      console.log(`   ${'date'.padEnd(11)}  ${'slate'.padStart(6)}  ${'baseline'.padStart(9)}  ${'T3(h/n)'.padStart(9)}  ${'T5(h/n)'.padStart(9)}  ${'T10(h/n)'.padStart(9)}  ${'T25(h/n)'.padStart(10)}`);
+      for (const d of r.daily) {
+        const t3 = `${d.top_hits[3]}/${d.top_total[3]}`;
+        const t5 = `${d.top_hits[5]}/${d.top_total[5]}`;
+        const t10 = `${d.top_hits[10]}/${d.top_total[10]}`;
+        const t25 = `${d.top_hits[25]}/${d.top_total[25]}`;
+        console.log(`   ${d.date.padEnd(11)}  ${String(d.slate_size).padStart(6)}  ${fmtPct(d.slate_rate)}  ${t3.padStart(9)}  ${t5.padStart(9)}  ${t10.padStart(9)}  ${t25.padStart(10)}`);
+      }
+    }
+  }
+
+  console.log(`\n═══ end of calibration report v2 ═══`);
   console.log(`Reading guide:`);
-  console.log(`  • The primary decision metric is Top-N hit rate on TEST — nothing else.`);
-  console.log(`  • AUC is a secondary sanity check (0.5 = random, 0.7+ = solid for binary game outcomes).`);
-  console.log(`  • Standardised β sign/magnitude are for interpretability, not for pasting into a`);
-  console.log(`    live scoring formula. To score a live row: standardise its features with the same`);
-  console.log(`    μ/σ from training, then apply β · x + bias, then sigmoid.`);
-  console.log(`  • Correlations are exploratory — a low correlation may still contribute inside`);
-  console.log(`    the LR through joint effects, and a high correlation may be redundant.\n`);
+  console.log(`  • Aggregate lift table sorted by Top-5 rate within each outcome — top rows are the`);
+  console.log(`    most-promising rankers. Absolute lift is (Top-N% − slate baseline%). Relative lift`);
+  console.log(`    is Top-N% / baseline% − 1.`);
+  console.log(`  • Bootstrap CI is over TEST DATES (units of variation), 500 iters. Wide CIs on 4-6`);
+  console.log(`    dates are expected — that's a sample-size problem, not a scoring problem. Reruning`);
+  console.log(`    after a wider batting-line backfill is the fix.`);
+  console.log(`  • Compare DET (deterministic 2+ investigation) against LR row-for-row on the same`);
+  console.log(`    ablation. If DET wins on multiple ablations, that's evidence the deterministic`);
+  console.log(`    preset is genuinely capturing signal — not just a lucky sample.`);
+  console.log(`  • Ablations that MATCH or BEAT 'full' with fewer features are the safer choice for`);
+  console.log(`    v1 — same lift, lower overfitting risk.\n`);
 }
 
 const __filename = fileURLToPath(import.meta.url);
