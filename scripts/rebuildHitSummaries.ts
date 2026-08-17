@@ -67,6 +67,7 @@ interface BattingLineLite {
   walks: number;
   strikeouts: number;
   hit_by_pitch: number;
+  opposing_starter_id: number | null;
   opposing_starter_hand: string | null;
 }
 
@@ -84,7 +85,7 @@ async function loadBattingLines(fromDate: string, toDate: string): Promise<Batti
   for (let page = 0; page < 40; page++) {
     const { data, error } = await supabaseAdmin
       .from('player_batting_lines')
-      .select('target_date, player_id, player_name, team, at_bats, hits, plate_appearances, doubles, triples, walks, strikeouts, hit_by_pitch, opposing_starter_hand')
+      .select('target_date, player_id, player_name, team, at_bats, hits, plate_appearances, doubles, triples, walks, strikeouts, hit_by_pitch, opposing_starter_id, opposing_starter_hand')
       .gte('target_date', fromDate)
       .lte('target_date', toDate)
       .range(page * PAGE, page * PAGE + PAGE - 1);
@@ -123,6 +124,36 @@ async function loadPlayerSeasonSlash(playerIds: number[]): Promise<Map<number, P
     }
     for (const r of (data ?? []) as PlayerSeasonSlash[]) {
       out.set(r.player_id, r);
+    }
+  }
+  return out;
+}
+
+/** Look up pitch_hand for a set of pitcher_ids from the players
+ *  catalog. Used as a fallback when player_batting_lines rows have
+ *  opposing_starter_id populated but opposing_starter_hand null —
+ *  typically because the historical boxscore didn't embed pitchHand
+ *  on the pitcher's `person` object. The catalog value came from the
+ *  same MLB source (enrichPlayers /v1/people), so this is not
+ *  inference — it's resolving one persisted authoritative value from
+ *  another. Returns 'L' | 'R' | null (null preserved when catalog has
+ *  no entry or explicit null). */
+async function loadPitcherHands(pitcherIds: number[]): Promise<Map<number, string | null>> {
+  const out = new Map<number, string | null>();
+  if (pitcherIds.length === 0) return out;
+  const CHUNK = 300;
+  for (let i = 0; i < pitcherIds.length; i += CHUNK) {
+    const chunk = pitcherIds.slice(i, i + CHUNK);
+    const { data, error } = await supabaseAdmin
+      .from('players')
+      .select('player_id, pitch_hand')
+      .in('player_id', chunk);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return out;
+      throw new Error(`select players pitch_hand failed: ${error.message}`);
+    }
+    for (const r of (data ?? []) as { player_id: number; pitch_hand: string | null }[]) {
+      out.set(r.player_id, r.pitch_hand);
     }
   }
   return out;
@@ -172,6 +203,25 @@ export async function rebuildHitSummaries(targetDate?: string): Promise<HitSumma
   // Fetch season slash for every player we're about to write.
   const activePlayerIds = Array.from(rollingByPlayer.keys());
   const slashById = await loadPlayerSeasonSlash(activePlayerIds);
+
+  // Fallback source for opposing_starter_hand: the players catalog.
+  // When a boxscore didn't embed pitchHand on the pitcher's person
+  // object (common on some historical feeds), the batting_lines row
+  // has opposing_starter_id populated but opposing_starter_hand null.
+  // The catalog value came from the same MLB source via enrichPlayers,
+  // so resolving from there is not inference — it's using the
+  // authoritative persisted value we already have.
+  const starterIdSet = new Set<number>();
+  for (const rows of seasonByPlayer.values()) {
+    for (const l of rows) {
+      if (l.opposing_starter_id != null && l.opposing_starter_hand == null) {
+        starterIdSet.add(l.opposing_starter_id);
+      }
+    }
+  }
+  const catalogHandByPitcher = await loadPitcherHands([...starterIdSet]);
+  let platoonHandFilledFromCatalog = 0;
+  let platoonHandStillUnknown = 0;
 
   const activityCutoff = addDays(date, -(ACTIVITY_WINDOW_DAYS - 1));
   const sevenDaysAgo = addDays(date, -6);
@@ -227,14 +277,29 @@ export async function rebuildHitSummaries(targetDate?: string): Promise<HitSumma
 
     // Platoon splits — season-to-date only. Attribution is per
     // opposing_starter_hand (v1 approximation, see mig 020 header).
+    // When the persisted hand is null but starter_id is present, fall
+    // back to players.pitch_hand (also from MLB). If neither, the row
+    // contributes to neither split — NEVER guessed.
     const seasonLines = seasonByPlayer.get(player_id) ?? [];
     let hits_vs_lhp_starters = 0, ab_vs_lhp_starters = 0;
     let hits_vs_rhp_starters = 0, ab_vs_rhp_starters = 0;
     for (const l of seasonLines) {
-      if (l.opposing_starter_hand === 'L') {
+      let hand = l.opposing_starter_hand;
+      if (hand == null && l.opposing_starter_id != null) {
+        const catHand = catalogHandByPitcher.get(l.opposing_starter_id);
+        if (catHand === 'L' || catHand === 'R') {
+          hand = catHand;
+          platoonHandFilledFromCatalog += 1;
+        } else {
+          platoonHandStillUnknown += 1;
+        }
+      } else if (hand == null) {
+        platoonHandStillUnknown += 1;
+      }
+      if (hand === 'L') {
         hits_vs_lhp_starters += l.hits ?? 0;
         ab_vs_lhp_starters   += l.at_bats ?? 0;
-      } else if (l.opposing_starter_hand === 'R') {
+      } else if (hand === 'R') {
         hits_vs_rhp_starters += l.hits ?? 0;
         ab_vs_rhp_starters   += l.at_bats ?? 0;
       }
@@ -317,6 +382,10 @@ export async function rebuildHitSummaries(targetDate?: string): Promise<HitSumma
   console.log(`  players with ≥5 games in load window: ${with5plusGames} (${pct(with5plusGames)})`);
   console.log(`  players with platoon data:            ${withPlatoon} (${pct(withPlatoon)})`);
   console.log(`  players with season slash:            ${withSeasonSlash} (${pct(withSeasonSlash)})`);
+  console.log(`  platoon-hand fallback (catalog):`);
+  console.log(`    starter ids we tried to resolve:    ${starterIdSet.size}`);
+  console.log(`    catalog hand rows attributed:       ${platoonHandFilledFromCatalog}`);
+  console.log(`    hand still unknown (skipped):       ${platoonHandStillUnknown}`);
   if (flagCounts.size > 0) {
     console.log(`[rebuildHitSummaries] flags histogram:`);
     for (const [flag, n] of [...flagCounts.entries()].sort((a, b) => b[1] - a[1])) {
