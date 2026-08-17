@@ -295,7 +295,35 @@ export async function rebuildHitSummaries(targetDate?: string): Promise<HitSumma
     if (error) throw new Error(`upsert hit summaries failed: ${error.message}`);
   }
 
+  // -------- Diagnostic report — shape of the run --------
+  const flagCounts = new Map<string, number>();
+  let with3plusGames = 0, with5plusGames = 0;
+  let withPlatoon = 0, withSeasonSlash = 0;
+  const gamesPerPlayer: number[] = [];
+  for (const s of summaries) {
+    for (const f of s.flags) flagCounts.set(f, (flagCounts.get(f) ?? 0) + 1);
+    // Count games from raw last3g/last5g helpers we already have in scope:
+    // approximate "3+ games" via absence of the lt3 flag, etc.
+    if (!s.flags.includes('lt3_games_in_load_window')) with3plusGames += 1;
+    if (!s.flags.includes('lt5_games_in_load_window')) with5plusGames += 1;
+    if (!s.flags.includes('no_platoon_data'))          withPlatoon    += 1;
+    if (!s.flags.includes('no_season_slash'))          withSeasonSlash += 1;
+    gamesPerPlayer.push((s.ab_l14d ?? 0) > 0 ? 1 : 0); // placeholder
+  }
+  const pct = (n: number) => summaries.length > 0 ? (100 * n / summaries.length).toFixed(1) + '%' : '0.0%';
   console.log(`[rebuildHitSummaries] wrote ${summaries.length} rows for ${date} (${skippedInactive} inactive players skipped)`);
+  console.log(`[rebuildHitSummaries] coverage:`);
+  console.log(`  players with ≥3 games in load window: ${with3plusGames} (${pct(with3plusGames)})`);
+  console.log(`  players with ≥5 games in load window: ${with5plusGames} (${pct(with5plusGames)})`);
+  console.log(`  players with platoon data:            ${withPlatoon} (${pct(withPlatoon)})`);
+  console.log(`  players with season slash:            ${withSeasonSlash} (${pct(withSeasonSlash)})`);
+  if (flagCounts.size > 0) {
+    console.log(`[rebuildHitSummaries] flags histogram:`);
+    for (const [flag, n] of [...flagCounts.entries()].sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${flag}: ${n}`);
+    }
+  }
+
   return {
     targetDate: date,
     playersWritten: summaries.length,

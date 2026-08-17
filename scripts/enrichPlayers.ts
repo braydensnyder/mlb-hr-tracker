@@ -69,6 +69,75 @@ async function listDistinctIdsFromHrs(idCol: 'player_id' | 'pitcher_id'): Promis
   return Array.from(ids);
 }
 
+/**
+ * Mig 020 additions to the enrichment universe. Previously enrichPlayers
+ * only saw players who had hit an HR OR allowed one this season, which
+ * meant every contact hitter / call-up / low-power position player got
+ * zero enrichment (and therefore no season slash line). Extending to
+ * player_batting_lines and pitcher_starts closes that gap. Missing
+ * tables (pre-mig-020 environments) are treated as empty rather than
+ * fatal — the HR-only universe still works there.
+ */
+async function listDistinctBatterIdsFromBattingLines(): Promise<number[]> {
+  const ids = new Set<number>();
+  for (let page = 0; ; page++) {
+    const { data, error } = await supabaseAdmin
+      .from('player_batting_lines')
+      .select('player_id')
+      .not('player_id', 'is', null)
+      .range(page * PAGE, page * PAGE + PAGE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return []; // mig 020 not applied yet
+      throw new Error(`list batting_lines player_id failed: ${error.message}`);
+    }
+    const rows = (data ?? []) as { player_id: number }[];
+    for (const r of rows) if (typeof r.player_id === 'number') ids.add(r.player_id);
+    if (rows.length < PAGE) break;
+  }
+  return Array.from(ids);
+}
+
+async function listDistinctPitcherIdsFromStarts(): Promise<number[]> {
+  const ids = new Set<number>();
+  for (let page = 0; ; page++) {
+    const { data, error } = await supabaseAdmin
+      .from('pitcher_starts')
+      .select('pitcher_id')
+      .not('pitcher_id', 'is', null)
+      .range(page * PAGE, page * PAGE + PAGE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return [];
+      throw new Error(`list pitcher_starts pitcher_id failed: ${error.message}`);
+    }
+    const rows = (data ?? []) as { pitcher_id: number }[];
+    for (const r of rows) if (typeof r.pitcher_id === 'number') ids.add(r.pitcher_id);
+    if (rows.length < PAGE) break;
+  }
+  return Array.from(ids);
+}
+
+/** Also grab opposing-starter IDs from batting lines — some pitchers
+ *  never allowed an HR AND never had a start recorded (rare, but keeps
+ *  the universe honest). Anything already covered above dedupes. */
+async function listDistinctOpposingStartersFromBattingLines(): Promise<number[]> {
+  const ids = new Set<number>();
+  for (let page = 0; ; page++) {
+    const { data, error } = await supabaseAdmin
+      .from('player_batting_lines')
+      .select('opposing_starter_id')
+      .not('opposing_starter_id', 'is', null)
+      .range(page * PAGE, page * PAGE + PAGE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return [];
+      throw new Error(`list batting_lines opposing_starter_id failed: ${error.message}`);
+    }
+    const rows = (data ?? []) as { opposing_starter_id: number | null }[];
+    for (const r of rows) if (typeof r.opposing_starter_id === 'number') ids.add(r.opposing_starter_id);
+    if (rows.length < PAGE) break;
+  }
+  return Array.from(ids);
+}
+
 async function listFreshPlayers(refreshDays: number): Promise<Set<number>> {
   // Players whose record is newer than (now - refreshDays). We page to be safe.
   const cutoff = new Date(Date.now() - refreshDays * 86_400_000).toISOString();
@@ -283,12 +352,43 @@ export async function enrichPlayers(opts: EnrichPlayersOptions = {}): Promise<En
   }
 
   // 1. universe of IDs we want resolved
-  const [batters, pitchers] = await Promise.all([
+  //
+  //    Previously this was HR-hitters + HR-allowing pitchers only,
+  //    which meant every position player without an HR this season
+  //    (contact hitters, call-ups, low-power bench) got zero
+  //    enrichment — no season slash line, no persisted metadata.
+  //
+  //    Mig 020 extends the universe with:
+  //      - every batter that ever appeared in player_batting_lines
+  //      - every pitcher that ever appeared in pitcher_starts
+  //      - every opposing_starter_id from player_batting_lines
+  //        (catches pitchers who neither allowed an HR nor had a
+  //        pitcher_starts row — rare but possible)
+  //    Sources that don't yet exist (pre-mig-020) return []; the
+  //    HR-only universe still works there.
+  const [
+    hrBatters, hrPitchers,
+    blBatters, psStarts, blOppStarters,
+  ] = await Promise.all([
     listDistinctIdsFromHrs('player_id'),
     listDistinctIdsFromHrs('pitcher_id'),
+    listDistinctBatterIdsFromBattingLines(),
+    listDistinctPitcherIdsFromStarts(),
+    listDistinctOpposingStartersFromBattingLines(),
   ]);
-  const universe = new Set<number>([...batters, ...pitchers]);
-  console.log(`[enrichPlayers] universe = ${universe.size} ids (${batters.length} batters, ${pitchers.length} pitchers)`);
+  const universe = new Set<number>([
+    ...hrBatters, ...hrPitchers,
+    ...blBatters, ...psStarts, ...blOppStarters,
+  ]);
+  const hrOnly = new Set<number>([...hrBatters, ...hrPitchers]);
+  const addedByHits = [...universe].filter((id) => !hrOnly.has(id)).length;
+  console.log(
+    `[enrichPlayers] universe = ${universe.size} ids ` +
+      `(hr_batters=${hrBatters.length} hr_pitchers=${hrPitchers.length} ` +
+      `bl_batters=${blBatters.length} pitcher_starts=${psStarts.length} ` +
+      `bl_opp_starters=${blOppStarters.length}) · ` +
+      `+${addedByHits} new via mig 020 sources`,
+  );
 
   // 2. subtract already-fresh
   const fresh = force ? new Set<number>() : await listFreshPlayers(refreshDays);
@@ -310,6 +410,12 @@ export async function enrichPlayers(opts: EnrichPlayersOptions = {}): Promise<En
 
   const seeds: PlayerSeed[] = [];
 
+  // Track slash-line coverage for diagnostic at end. When the MLB API
+  // returns no hitting stats for a player (pitcher / injured / no MLB
+  // PAs this year), slash values legitimately land as null.
+  let slashPopulated = 0;
+  let slashNull = 0;
+
   for (let i = 0; i < pending.length; i++) {
     const id = pending[i];
     try {
@@ -321,10 +427,16 @@ export async function enrichPlayers(opts: EnrichPlayersOptions = {}): Promise<En
         continue;
       }
       result.fetched++;
+      if (seed.season_avg != null || seed.season_obp != null || seed.season_slg != null || seed.season_ops != null) {
+        slashPopulated++;
+      } else {
+        slashNull++;
+      }
 
       if (dryRun) {
         if (i % 50 === 0) {
-          console.log(`  [dry-run] ${id} → ${seed.full_name} / ${seed.current_team_name ?? '(no team)'}`);
+          const slashPart = seed.season_avg != null ? ` avg=${seed.season_avg}` : ' (no season slash)';
+          console.log(`  [dry-run] ${id} → ${seed.full_name} / ${seed.current_team_name ?? '(no team)'}${slashPart}`);
         }
         continue;
       }
@@ -334,7 +446,8 @@ export async function enrichPlayers(opts: EnrichPlayersOptions = {}): Promise<En
         result.upserted += await upsertPlayers(seeds.splice(0));
       }
       if (i % 50 === 0) {
-        console.log(`  ${id} → ${seed.full_name} / ${seed.current_team_name ?? '(no team)'}`);
+        const slashPart = seed.season_avg != null ? ` avg=${seed.season_avg}` : ' (no season slash)';
+        console.log(`  ${id} → ${seed.full_name} / ${seed.current_team_name ?? '(no team)'}${slashPart}`);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -348,6 +461,11 @@ export async function enrichPlayers(opts: EnrichPlayersOptions = {}): Promise<En
     result.upserted += await upsertPlayers(seeds);
   }
 
+  const slashPct = result.fetched > 0 ? (slashPopulated / result.fetched * 100).toFixed(1) : '0.0';
+  console.log(
+    `[enrichPlayers] season slash coverage: ${slashPopulated}/${result.fetched} fetched had slash (${slashPct}%). ` +
+      `${slashNull} legitimately had no MLB hitting stats this season (pitchers, injured, unpromoted).`,
+  );
   console.log('[enrichPlayers] DONE', result);
   return result;
 }
