@@ -83,36 +83,39 @@ const EXPECTED_PA_BY_SLOT: Record<number, number> = {
 interface Args {
   from: string | null;
   to: string;
-  trainFrac: number;
-  valFrac: number;
   minPriorGames: number;
   dropPlatoon: boolean;
+  warmupDates: number;
+  /** Fraction of training dates used for LR val (L2 sweep + early stopping).
+   *  Walk-forward carves this out of the training window per step. */
+  valFracOfTrain: number;
 }
 function parseArgs(argv: string[]): Args {
   let from: string | null = null;
   let to = mlbToday();
   let last: number | null = null;
-  let trainFrac = DEFAULT_TRAIN;
-  let valFrac = DEFAULT_VAL;
   let minPriorGames = MIN_PRIOR_GAMES;
   let dropPlatoon = false;
+  let warmupDates = 20;
+  let valFracOfTrain = 0.15;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--from') from = argv[++i];
     else if (a === '--to') to = argv[++i];
     else if (a === '--last') last = Number(argv[++i]);
-    else if (a === '--train') trainFrac = Number(argv[++i]);
-    else if (a === '--val') valFrac = Number(argv[++i]);
     else if (a === '--min-prior-games') minPriorGames = Number(argv[++i]);
     else if (a === '--drop-platoon') dropPlatoon = true;
+    else if (a === '--warmup-dates') warmupDates = Number(argv[++i]);
+    else if (a === '--val-frac') valFracOfTrain = Number(argv[++i]);
+    else if (a === '--train' || a === '--val') { i++; console.warn(`  ⚠ ${a} is ignored — v3 uses walk-forward`); }
     else if (/^\d{4}-\d{2}-\d{2}$/.test(a)) { from = to = a; }
     else throw new Error(`Unknown arg: ${a}`);
   }
   if (!from) from = mlbAddDays(to, -((last ?? DEFAULT_LAST_DAYS) - 1));
   if (from > to) throw new Error(`--from > --to`);
-  if (trainFrac <= 0 || trainFrac >= 1) throw new Error('--train in (0,1)');
-  if (valFrac <= 0 || valFrac >= 1 - trainFrac) throw new Error('--val must leave room for test');
-  return { from, to, trainFrac, valFrac, minPriorGames, dropPlatoon };
+  if (warmupDates < 5) throw new Error('--warmup-dates must be >= 5');
+  if (valFracOfTrain <= 0 || valFracOfTrain >= 1) throw new Error('--val-frac in (0,1)');
+  return { from, to, minPriorGames, dropPlatoon, warmupDates, valFracOfTrain };
 }
 
 // ---------- Data loading ----------
@@ -202,6 +205,40 @@ async function loadGames(from: string, to: string): Promise<GameCtx[]> {
       .gte('game_date', from)
       .lte('game_date', to),
   );
+}
+
+/**
+ * A date is COMPLETE only if every game on that date has status='Final'
+ * (or another terminal status). Half-finished dates would give a batter
+ * an incomplete hit count — a hitter could get another hit in a still-
+ * playing game — so those dates MUST be excluded from training AND
+ * from evaluation.
+ *
+ * Terminal statuses per MLB feed convention: Final, Game Over,
+ * Completed Early, Postponed, Cancelled. Postponed/Cancelled dates
+ * yield zero rows anyway; they're safe to include.
+ */
+async function loadCompleteDates(from: string, to: string): Promise<Set<string>> {
+  const { data, error } = await supabaseAdmin
+    .from('games')
+    .select('game_date, status')
+    .gte('game_date', from)
+    .lte('game_date', to);
+  if (error) throw new Error(`games status: ${error.message}`);
+  const rows = (data ?? []) as { game_date: string; status: string | null }[];
+  const TERMINAL = new Set(['Final', 'Game Over', 'Completed Early', 'Postponed', 'Cancelled']);
+  const byDate = new Map<string, { total: number; terminal: number }>();
+  for (const r of rows) {
+    const cur = byDate.get(r.game_date) ?? { total: 0, terminal: 0 };
+    cur.total += 1;
+    if (r.status && TERMINAL.has(r.status)) cur.terminal += 1;
+    byDate.set(r.game_date, cur);
+  }
+  const complete = new Set<string>();
+  for (const [d, c] of byDate) {
+    if (c.total > 0 && c.terminal === c.total) complete.add(d);
+  }
+  return complete;
 }
 
 async function loadPlayerCatalog(ids: number[]): Promise<Map<number, PlayerCatalog>> {
@@ -719,10 +756,10 @@ function pearson(x: number[], y: number[]): number {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  console.log(`\n═══ Hit Score calibration ═══`);
+  console.log(`\n═══ Hit Score calibration v3 (walk-forward) ═══`);
   console.log(`  range: ${args.from} .. ${args.to}`);
-  console.log(`  train/val/test fractions: ${args.trainFrac} / ${args.valFrac} / ${(1 - args.trainFrac - args.valFrac).toFixed(3)}`);
   console.log(`  min prior games required: ${args.minPriorGames}`);
+  console.log(`  warmup dates: ${args.warmupDates}   val-frac of train per fit: ${args.valFracOfTrain}`);
 
   // 1. Load raw data
   console.log(`\n  loading raw data …`);
@@ -767,37 +804,58 @@ async function main() {
   console.log(`    P(hits ≥ 1) = ${(posRate1 * 100).toFixed(1)}%   (${filtered.filter((r) => r.y1 === 1).length}/${filtered.length})`);
   console.log(`    P(hits ≥ 2) = ${(posRate2 * 100).toFixed(1)}%   (${filtered.filter((r) => r.y2 === 1).length}/${filtered.length})`);
 
-  // 6. Platoon coverage decision.
-  const platoonPresent = filtered.filter((r) => r.has_platoon).length;
-  const platoonPct = filtered.length > 0 ? platoonPresent / filtered.length : 0;
-  const keepPlatoon = !args.dropPlatoon && platoonPct >= MIN_PLATOON_COVERAGE;
-  console.log(`\n  platoon coverage: ${(platoonPct * 100).toFixed(1)}% (${platoonPresent}/${filtered.length}) — ${keepPlatoon ? 'KEEP' : 'DROP'} (threshold ${(MIN_PLATOON_COVERAGE * 100).toFixed(0)}%)`);
+  // 6. Complete-date filter.
+  //
+  //    Unfinished dates get EXCLUDED from every phase. A partially-
+  //    finished date (any game still in progress or pregame) would give
+  //    a hitter an incomplete hit count — training would learn wrong
+  //    outcomes, evaluation would score the model against wrong labels.
+  //    This fixes the v2 report where Aug 17 leaked into the test-date
+  //    count but had zero outcome rows.
+  console.log(`\n  loading complete-date set …`);
+  const completeDates = await loadCompleteDates(args.from!, args.to);
+  const rowDatesBefore = new Set(filtered.map((r) => r.target_date));
+  const excluded = [...rowDatesBefore].filter((d) => !completeDates.has(d)).sort();
+  const filteredComplete = filtered.filter((r) => completeDates.has(r.target_date));
+  console.log(`    complete dates in range: ${completeDates.size}`);
+  if (excluded.length > 0) {
+    console.log(`    excluded ${excluded.length} incomplete date(s): ${excluded.slice(0, 6).join(', ')}${excluded.length > 6 ? ` … (+${excluded.length - 6} more)` : ''}`);
+  } else {
+    console.log(`    no incomplete dates found in row set`);
+  }
+  console.log(`    rows before complete-date filter: ${filtered.length}`);
+  console.log(`    rows after complete-date filter:  ${filteredComplete.length}`);
 
-  // 7. Chronological split.
-  const dates = [...new Set(filtered.map((r) => r.target_date))].sort();
-  const nTrainDates = Math.floor(dates.length * args.trainFrac);
-  const nValDates = Math.floor(dates.length * args.valFrac);
-  const trainDates = new Set(dates.slice(0, nTrainDates));
-  const valDates   = new Set(dates.slice(nTrainDates, nTrainDates + nValDates));
-  const testDates  = new Set(dates.slice(nTrainDates + nValDates));
-  const trainRows = filtered.filter((r) => trainDates.has(r.target_date));
-  const valRows   = filtered.filter((r) => valDates.has(r.target_date));
-  const testRows  = filtered.filter((r) => testDates.has(r.target_date));
-  console.log(`\n  chronological split:`);
-  console.log(`    train: ${trainDates.size} dates, ${trainRows.length} rows  [${[...trainDates][0]} .. ${[...trainDates].pop()}]`);
-  console.log(`    val:   ${valDates.size} dates, ${valRows.length} rows  [${[...valDates][0]} .. ${[...valDates].pop()}]`);
-  console.log(`    test:  ${testDates.size} dates, ${testRows.length} rows  [${[...testDates][0]} .. ${[...testDates].pop()}]`);
+  // 7. Platoon coverage decision (recomputed post-complete-date filter).
+  const platoonPresent = filteredComplete.filter((r) => r.has_platoon).length;
+  const platoonPct = filteredComplete.length > 0 ? platoonPresent / filteredComplete.length : 0;
+  const keepPlatoon = !args.dropPlatoon && platoonPct >= MIN_PLATOON_COVERAGE;
+  console.log(`\n  platoon coverage: ${(platoonPct * 100).toFixed(1)}% (${platoonPresent}/${filteredComplete.length}) — ${keepPlatoon ? 'KEEP' : 'DROP'} (threshold ${(MIN_PLATOON_COVERAGE * 100).toFixed(0)}%)`);
 
   const specs = baseFeatureSpecs(keepPlatoon);
-  const keys = specs.map((s) => s.key);
 
-  // 8. Exploratory correlations against y1 and y2 (Pearson on train only,
-  //    dropping rows with null on that feature per column).
-  console.log(`\n  ── exploratory correlations (train only; per-feature drops missing rows) ──`);
-  console.log(`    ${'feature'.padEnd(32)}  ${'n_train'.padStart(8)}  ${'corr(y1)'.padStart(9)}  ${'corr(y2)'.padStart(9)}`);
+  // 8. Walk-forward setup.
+  const orderedDates = [...new Set(filteredComplete.map((r) => r.target_date))].sort();
+  console.log(`\n  walk-forward setup:`);
+  console.log(`    total complete dates with rows: ${orderedDates.length}`);
+  console.log(`    warmup dates (skipped, used only for training the first eval date): ${args.warmupDates}`);
+  if (orderedDates.length <= args.warmupDates) {
+    console.log(`\n  Not enough complete dates for walk-forward evaluation.`);
+    console.log(`  Need ≥ ${args.warmupDates + 1} complete dates; have ${orderedDates.length}.`);
+    console.log(`  Widen --from / --to, lower --warmup-dates, or backfill more history.`);
+    return;
+  }
+  const evalDates = orderedDates.slice(args.warmupDates);
+  console.log(`    eval dates (walked forward, each trained on strictly-prior data): ${evalDates.length}`);
+  console.log(`    eval date range: ${evalDates[0]} .. ${evalDates[evalDates.length - 1]}`);
+
+  // 9. Exploratory correlations — over ALL warmup+eval rows now (walk-
+  //    forward has no fixed train slice). Diagnostic only.
+  console.log(`\n  ── exploratory correlations (all filtered rows; per-feature drops missing rows) ──`);
+  console.log(`    ${'feature'.padEnd(32)}  ${'n'.padStart(8)}  ${'corr(y1)'.padStart(9)}  ${'corr(y2)'.padStart(9)}`);
   for (const s of specs) {
     const xs: number[] = []; const y1s: number[] = []; const y2s: number[] = [];
-    for (const r of trainRows) {
+    for (const r of filteredComplete) {
       const v = s.extract(r);
       if (v == null || !Number.isFinite(v)) continue;
       xs.push(v); y1s.push(r.y1); y2s.push(r.y2);
@@ -807,8 +865,8 @@ async function main() {
     console.log(`    ${s.key.padEnd(32)}  ${String(xs.length).padStart(8)}  ${(Number.isFinite(c1) ? c1.toFixed(3) : '  -  ').padStart(9)}  ${(Number.isFinite(c2) ? c2.toFixed(3) : '  -  ').padStart(9)}`);
   }
 
-  // 9. Materialise feature matrices. Rows with ANY null feature (for the
-  //    chosen model) are DROPPED — never zero-filled.
+  // 10. Materialise feature matrices. Rows with ANY null feature (for the
+  //     chosen model) are DROPPED — never zero-filled.
   function materialise(
     rows: Row[], specsForModel: FeatureSpec[],
   ): { X: number[][]; y1: number[]; y2: number[]; rows: Row[] } {
@@ -827,7 +885,7 @@ async function main() {
     return { X: outX, y1: oy1, y2: oy2, rows: oRows };
   }
 
-  // 10. Ablation configuration.
+  // ----- old-ablation-config STUB kept for spec picker -----
   //
   // Every ablation runs on the SAME chronological split. Deterministic
   // scoring uses the appropriate 1+/2+ weight preset with any dropped
@@ -837,23 +895,16 @@ async function main() {
   // "drop" is a list of feature keys to remove from the full set for this
   // ablation. Empty = full model. "keepOnly" (when set) overrides drop
   // and restricts to exactly the listed keys.
-  interface AblationConfig {
-    id: string;
-    label: string;
-    drop?: string[];
-    keepOnly?: string[];  // for opportunity-only
+  interface CandidateModel {
+    id: string;                    // stable key
+    label: string;                  // display
+    kind: 'DET' | 'LR';
+    drop?: string[];                // feature keys to remove from base
+    keepOnly?: string[];            // feature keys to restrict to
   }
-  const ABLATIONS: AblationConfig[] = [
-    { id: 'full',            label: 'Full (all features)' },
-    { id: 'no_weather',      label: 'No weather (drop temp + wind)',
-      drop: ['weather_temp_f', 'weather_wind_mph'] },
-    { id: 'no_volume',       label: 'No recent volume (drop hits_l7d + ab_l7d)',
-      drop: ['hits_l7d_asof', 'ab_l7d_asof'] },
-    { id: 'no_rate',         label: 'No recent rate (drop hit_rate_l7d)',
-      drop: ['hit_rate_l7d_asof'] },
-    { id: 'no_whip',         label: 'No pitcher WHIP (keep H/9 + BB/9)',
-      drop: ['pitcher_whip_asof'] },
-    { id: 'opportunity',     label: 'Opportunity-only (contact + PA + K + pitcher H9/K9)',
+  const CANDIDATE_MODELS: CandidateModel[] = [
+    { id: 'DET_full',        kind: 'DET', label: 'DET full' },
+    { id: 'DET_opportunity', kind: 'DET', label: 'DET opportunity-only',
       keepOnly: [
         'season_avg_asof', 'expected_pa',
         'season_k_rate_asof', 'recent_k_rate_asof',
@@ -861,286 +912,395 @@ async function main() {
         'platoon_hit_rate_asof',
         'multi_hit_rate_l10g_asof',
       ] },
+    { id: 'DET_no_volume',   kind: 'DET', label: 'DET no recent volume',
+      drop: ['hits_l7d_asof', 'ab_l7d_asof'] },
+    { id: 'DET_no_weather',  kind: 'DET', label: 'DET no weather',
+      drop: ['weather_temp_f', 'weather_wind_mph'] },
+    { id: 'LR_opportunity',  kind: 'LR',  label: 'LR opportunity-only',
+      keepOnly: [
+        'season_avg_asof', 'expected_pa',
+        'season_k_rate_asof', 'recent_k_rate_asof',
+        'pitcher_h_per_9_asof', 'pitcher_k_per_9_asof',
+        'platoon_hit_rate_asof',
+        'multi_hit_rate_l10g_asof',
+      ] },
+    { id: 'LR_full',         kind: 'LR',  label: 'LR full (diagnostic/control)' },
   ];
 
-  function specsForAblation(
-    outcome: 'y1' | 'y2', abl: AblationConfig,
-  ): FeatureSpec[] {
+  function specsForCandidate(outcome: 'y1' | 'y2', cm: CandidateModel): FeatureSpec[] {
     const base = outcome === 'y1'
       ? specs.filter((s) => s.common)
       : specs.filter((s) => s.common || s.twoPlusOnly);
-    if (abl.keepOnly) return base.filter((s) => abl.keepOnly!.includes(s.key));
-    if (abl.drop)     return base.filter((s) => !abl.drop!.includes(s.key));
+    if (cm.keepOnly) return base.filter((s) => cm.keepOnly!.includes(s.key));
+    if (cm.drop)     return base.filter((s) => !cm.drop!.includes(s.key));
     return base;
   }
 
-  // ---------- Per-test-date metrics ----------
+  // ---------- Walk-forward types ----------
   interface DailyRow {
     date: string;
-    slate_size: number;                   // number of players on the slate that day
-    slate_pos: number;                    // number who actually satisfied the outcome
-    slate_rate: number;                   // slate_pos / slate_size (baseline for this date)
-    top_hits: Record<number, number>;     // {3: hits, 5: hits, 10: hits, 25: hits}
+    slate_size: number;
+    slate_pos: number;
+    slate_rate: number;
+    top_hits: Record<number, number>;
     top_total: Record<number, number>;
   }
 
-  // Compute FULL-slate baseline per test date ONCE, using every filtered
-  // starter row on that date regardless of which config could score them.
-  // This makes ablation lift comparable across configs — a config that
-  // drops rows for missing features doesn't get an easier baseline.
-  function fullSlateBaselines(outcome: 'y1' | 'y2'): Map<string, { size: number; pos: number }> {
-    const out = new Map<string, { size: number; pos: number }>();
-    for (const r of testRows) {
-      const y = outcome === 'y1' ? r.y1 : r.y2;
-      const cur = out.get(r.target_date) ?? { size: 0, pos: 0 };
-      cur.size += 1;
-      cur.pos += y;
-      out.set(r.target_date, cur);
-    }
-    return out;
-  }
-  const slateBaselineY1 = fullSlateBaselines('y1');
-  const slateBaselineY2 = fullSlateBaselines('y2');
+  // ---------- Runner ----------
+  // 12. Walk-forward evaluator.
+  //
+  //     For each eval date D:
+  //       - build train set from rows on dates strictly < D
+  //       - materialise on the candidate's feature set (drop rows with any
+  //         null feature; never zero-fill)
+  //       - for LR: chronologically split train into (train_fit, val)
+  //         using --val-frac. Fit L2 sweep on val loss. If val ends up
+  //         empty, skip candidate for this date.
+  //       - score D's slate on the model
+  //       - record daily result
+  //     Collect Map<candidate_id + outcome, DailyRow[]>.
 
-  function dailyBreakdown(
-    rows: Row[], scores: number[], y: number[], outcome: 'y1' | 'y2',
-  ): DailyRow[] {
-    const byDate = new Map<string, { s: number; y: number }[]>();
-    for (let i = 0; i < rows.length; i++) {
-      const arr = byDate.get(rows[i].target_date) ?? [];
-      arr.push({ s: scores[i], y: y[i] });
-      byDate.set(rows[i].target_date, arr);
+  interface DailyResult extends DailyRow {
+    /** How many D-day rows the candidate could actually score after
+     *  feature-availability drops. If < TOPN, the candidate can't fill
+     *  the top-N and it still counts toward the aggregate (short top-N
+     *  is a real deficiency, not a bookkeeping edge case). */
+    scored_rows: number;
+    /** True when the LR fit was skipped (insufficient val rows etc). */
+    skipped: boolean;
+    skip_reason?: string;
+  }
+
+  interface CandidateResult {
+    id: string;
+    label: string;
+    kind: 'LR' | 'DET';
+    outcome: 'y1' | 'y2';
+    features: string[];
+    daily: DailyResult[];
+    /** LR only: how often each feature carried a non-trivial |β| across
+     *  the walk-forward fits. Diagnostic for stability of interpretation. */
+    beta_by_feature_avg?: Map<string, number>;
+    fits_ok: number;
+    fits_skipped: number;
+  }
+
+  function fmtPct(x: number): string { return Number.isFinite(x) ? (x * 100).toFixed(1).padStart(5) + '%' : '  -  '.padStart(6); }
+
+  function scoreCandidateForDate(
+    cm: CandidateModel,
+    outcome: 'y1' | 'y2',
+    D: string,
+  ): { day: DailyResult; betas?: Map<string, number> } {
+    const specsForModel = specsForCandidate(outcome, cm);
+    const keys = specsForModel.map((s) => s.key);
+    const trainRows = filteredComplete.filter((r) => r.target_date < D);
+    const dayRows   = filteredComplete.filter((r) => r.target_date === D);
+
+    const trMat  = materialise(trainRows, specsForModel);
+    const dayMat = materialise(dayRows, specsForModel);
+
+    // Full-slate baseline for this outcome/date (all filtered rows on D,
+    // not just those this candidate could score).
+    const slate = dayRows;
+    const slate_pos = slate.reduce((s, r) => s + (outcome === 'y1' ? r.y1 : r.y2), 0);
+    const emptyDaily: DailyResult = {
+      date: D, slate_size: slate.length, slate_pos, slate_rate: slate.length > 0 ? slate_pos / slate.length : 0,
+      top_hits: {}, top_total: {},
+      scored_rows: dayMat.X.length, skipped: true,
+    };
+    for (const n of TOPN_LIST) { emptyDaily.top_hits[n] = 0; emptyDaily.top_total[n] = 0; }
+
+    if (dayMat.X.length === 0) {
+      return { day: { ...emptyDaily, skip_reason: 'no scorable rows on D after feature-availability drops' } };
     }
-    const baselineMap = outcome === 'y1' ? slateBaselineY1 : slateBaselineY2;
-    const out: DailyRow[] = [];
-    for (const [d, arr] of [...byDate.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-      const sorted = arr.slice().sort((a, b) => b.s - a.s);
-      const top_hits: Record<number, number> = {};
-      const top_total: Record<number, number> = {};
-      for (const n of TOPN_LIST) {
-        const topN = sorted.slice(0, n);
-        top_hits[n]  = topN.reduce((s, r) => s + r.y, 0);
-        top_total[n] = topN.length;
+
+    // Compute scores per candidate kind.
+    let scoreFn: (row: number[]) => number;
+    let betas: Map<string, number> | undefined;
+    if (cm.kind === 'DET') {
+      // DET uses train-set μ/σ to standardise, then preset weights.
+      if (trMat.X.length < 100) {
+        return { day: { ...emptyDaily, skip_reason: `DET needs ≥100 train rows to compute μ/σ; have ${trMat.X.length}` } };
       }
-      // Baseline from the full slate, not the config's subset.
-      const bl = baselineMap.get(d) ?? { size: arr.length, pos: arr.reduce((s, r) => s + r.y, 0) };
-      out.push({
-        date: d, slate_size: bl.size, slate_pos: bl.pos,
-        slate_rate: bl.size > 0 ? bl.pos / bl.size : 0,
-        top_hits, top_total,
-      });
+      const { means, stds } = computeMeansStds(trMat.X);
+      const detWeights = outcome === 'y1' ? DETERMINISTIC_WEIGHTS_1PLUS : DETERMINISTIC_WEIGHTS_2PLUS;
+      scoreFn = (row: number[]) => {
+        const std = row.map((v, j) => (v - means[j]) / (stds[j] || 1));
+        return deterministicScore(std, keys, detWeights);
+      };
+    } else {
+      // LR: chronologically split train into (fit, val) by dates.
+      const trainDatesOrdered = [...new Set(trainRows.map((r) => r.target_date))].sort();
+      if (trainDatesOrdered.length < 5) {
+        return { day: { ...emptyDaily, skip_reason: `LR needs ≥5 training dates; have ${trainDatesOrdered.length}` } };
+      }
+      const nVal = Math.max(1, Math.floor(trainDatesOrdered.length * args.valFracOfTrain));
+      const valDates = new Set(trainDatesOrdered.slice(-nVal));
+      const fitRows = trainRows.filter((r) => !valDates.has(r.target_date));
+      const valRows = trainRows.filter((r) =>  valDates.has(r.target_date));
+      const fitMat = materialise(fitRows, specsForModel);
+      const valMat = materialise(valRows, specsForModel);
+      if (fitMat.X.length < 100 || valMat.X.length < 20) {
+        return { day: { ...emptyDaily, skip_reason: `LR needs ≥100 fit + ≥20 val rows; have fit=${fitMat.X.length} val=${valMat.X.length}` } };
+      }
+      const yFit = outcome === 'y1' ? fitMat.y1 : fitMat.y2;
+      const yVal = outcome === 'y1' ? valMat.y1 : valMat.y2;
+      // Guard: LR needs at least one positive AND one negative on both fit/val.
+      const okBalance = (y: number[]) => y.some((v) => v === 1) && y.some((v) => v === 0);
+      if (!okBalance(yFit) || !okBalance(yVal)) {
+        return { day: { ...emptyDaily, skip_reason: 'LR fit/val slice has no positive or no negative outcome' } };
+      }
+      const { means, stds } = computeMeansStds(fitMat.X);
+      const XfitS = standardise(fitMat.X, means, stds);
+      const XvalS = standardise(valMat.X, means, stds);
+      const fit = trainWithL2Sweep(XfitS, yFit, XvalS, yVal, means, stds);
+      scoreFn = (row: number[]) => {
+        const std = row.map((v, j) => (v - means[j]) / (stds[j] || 1));
+        let z = fit.bias;
+        for (let j = 0; j < std.length; j++) z += fit.weights[j] * std[j];
+        return sigmoid(z);
+      };
+      betas = new Map<string, number>();
+      for (let j = 0; j < keys.length; j++) betas.set(keys[j], fit.weights[j]);
     }
-    return out;
+
+    // Rank D's slate and compute Top-N.
+    const scored = dayMat.X.map((row, i) => ({
+      score: scoreFn(row),
+      y: outcome === 'y1' ? dayMat.y1[i] : dayMat.y2[i],
+    }));
+    scored.sort((a, b) => b.score - a.score);
+    const top_hits: Record<number, number> = {};
+    const top_total: Record<number, number> = {};
+    for (const n of TOPN_LIST) {
+      const topN = scored.slice(0, n);
+      top_hits[n]  = topN.reduce((s, r) => s + r.y, 0);
+      top_total[n] = topN.length;
+    }
+    return {
+      day: {
+        date: D,
+        slate_size: slate.length,
+        slate_pos, slate_rate: slate.length > 0 ? slate_pos / slate.length : 0,
+        top_hits, top_total,
+        scored_rows: dayMat.X.length,
+        skipped: false,
+      },
+      betas,
+    };
   }
 
-  // Aggregate lift metrics + bootstrap 95% CI over test DATES (units of
-  // variation — resampling rows would hide within-date correlation).
-  interface LiftStats {
-    topN: number;
-    top_rate: number;
-    base_rate: number;
-    abs_lift: number;
-    rel_lift: number;
-    ci95_top_rate: [number, number];
-    total_top: number;
+  console.log(`\n  ── walk-forward evaluation (${CANDIDATE_MODELS.length} candidates × 2 outcomes × ${evalDates.length} dates) ──`);
+  const allResults: CandidateResult[] = [];
+  for (const cm of CANDIDATE_MODELS) {
+    for (const outcome of ['y1', 'y2'] as const) {
+      const daily: DailyResult[] = [];
+      const betaAcc = new Map<string, { sum: number; n: number }>();
+      let fitsOk = 0, fitsSkipped = 0;
+      for (const D of evalDates) {
+        const { day, betas } = scoreCandidateForDate(cm, outcome, D);
+        daily.push(day);
+        if (day.skipped) fitsSkipped++; else fitsOk++;
+        if (betas) {
+          for (const [k, v] of betas) {
+            const cur = betaAcc.get(k) ?? { sum: 0, n: 0 };
+            cur.sum += v; cur.n += 1;
+            betaAcc.set(k, cur);
+          }
+        }
+      }
+      const beta_by_feature_avg = cm.kind === 'LR' ? new Map<string, number>() : undefined;
+      if (beta_by_feature_avg) {
+        for (const [k, v] of betaAcc) beta_by_feature_avg.set(k, v.n > 0 ? v.sum / v.n : 0);
+      }
+      const features = specsForCandidate(outcome, cm).map((s) => s.key);
+      allResults.push({
+        id: cm.id, label: cm.label, kind: cm.kind, outcome,
+        features, daily, beta_by_feature_avg, fits_ok: fitsOk, fits_skipped: fitsSkipped,
+      });
+      process.stdout.write('.');
+    }
+  }
+  console.log(' done.\n');
+
+  // ---------- aggregate + reporting helpers ----------
+
+  interface WalkAgg {
+    n_test_dates: number;                    // dates the candidate scored (skipped excluded)
+    n_dates_skipped: number;
+    total_selections: number;                // sum of top_total across scored dates
     total_hits: number;
-    n_dates: number;
-  }
-  const BOOTSTRAP_ITERS = 500;
-  const BOOTSTRAP_SEED = 1234;
-  function seededRng(seed: number) {
-    let s = seed;
-    return () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
+    top_rate: number;                        // total_hits / total_selections
+    slate_baseline: number;                  // weighted mean of slate_rate across scored dates
+    abs_lift: number;                        // top_rate − slate_baseline
+    rel_lift: number;                        // ratio − 1
+    dates_beating_baseline: number;
+    dates_beating_baseline_pct: number;
+    median_daily_lift: number;
+    worst_daily_lift: number;
+    ci95: [number, number];
   }
 
-  function aggregate(daily: DailyRow[], n: number): LiftStats {
-    const totalHits  = daily.reduce((s, d) => s + d.top_hits[n], 0);
-    const totalTop   = daily.reduce((s, d) => s + d.top_total[n], 0);
-    const baseHits   = daily.reduce((s, d) => s + d.slate_pos, 0);
-    const baseTotal  = daily.reduce((s, d) => s + d.slate_size, 0);
-    const top_rate  = totalTop > 0  ? totalHits / totalTop  : 0;
-    const base_rate = baseTotal > 0 ? baseHits  / baseTotal : 0;
-    // Bootstrap over dates.
-    const rng = seededRng(BOOTSTRAP_SEED + n);
-    const samples: number[] = new Array(BOOTSTRAP_ITERS);
-    for (let b = 0; b < BOOTSTRAP_ITERS; b++) {
+  const BOOTSTRAP_ITERS_V3 = 500;
+  function seededRng(seed: number) { let s = seed; return () => { s = (s * 9301 + 49297) % 233280; return s / 233280; }; }
+
+  function aggregateWalk(daily: DailyResult[], n: number): WalkAgg {
+    const scored = daily.filter((d) => !d.skipped);
+    const skipped = daily.length - scored.length;
+    const total_hits = scored.reduce((s, d) => s + d.top_hits[n], 0);
+    const total_selections = scored.reduce((s, d) => s + d.top_total[n], 0);
+    const totalSlatePos = scored.reduce((s, d) => s + d.slate_pos, 0);
+    const totalSlate = scored.reduce((s, d) => s + d.slate_size, 0);
+    const slate_baseline = totalSlate > 0 ? totalSlatePos / totalSlate : 0;
+    const top_rate = total_selections > 0 ? total_hits / total_selections : 0;
+    const daily_top_rates = scored.map((d) => d.top_total[n] > 0 ? d.top_hits[n] / d.top_total[n] : NaN);
+    const daily_baselines  = scored.map((d) => d.slate_rate);
+    const daily_lifts = daily_top_rates.map((r, i) => Number.isFinite(r) ? r - daily_baselines[i] : NaN).filter((v) => Number.isFinite(v));
+    const dates_beating_baseline = daily_lifts.filter((l) => l > 0).length;
+    const median_daily_lift = daily_lifts.length > 0
+      ? daily_lifts.slice().sort((a, b) => a - b)[Math.floor(daily_lifts.length / 2)]
+      : NaN;
+    const worst_daily_lift = daily_lifts.length > 0 ? Math.min(...daily_lifts) : NaN;
+
+    // Bootstrap CI over dates.
+    const rng = seededRng(4242 + n);
+    const samples: number[] = new Array(BOOTSTRAP_ITERS_V3);
+    for (let b = 0; b < BOOTSTRAP_ITERS_V3; b++) {
       let h = 0, t = 0;
-      for (let i = 0; i < daily.length; i++) {
-        const pick = daily[Math.floor(rng() * daily.length)];
+      for (let i = 0; i < scored.length; i++) {
+        const pick = scored[Math.floor(rng() * scored.length)];
         h += pick.top_hits[n]; t += pick.top_total[n];
       }
       samples[b] = t > 0 ? h / t : 0;
     }
     samples.sort((a, b) => a - b);
-    const lo = samples[Math.max(0, Math.floor(0.025 * BOOTSTRAP_ITERS))];
-    const hi = samples[Math.min(BOOTSTRAP_ITERS - 1, Math.floor(0.975 * BOOTSTRAP_ITERS))];
+    const lo = samples[Math.max(0, Math.floor(0.025 * BOOTSTRAP_ITERS_V3))];
+    const hi = samples[Math.min(BOOTSTRAP_ITERS_V3 - 1, Math.floor(0.975 * BOOTSTRAP_ITERS_V3))];
+
     return {
-      topN: n, top_rate, base_rate,
-      abs_lift: top_rate - base_rate,
-      rel_lift: base_rate > 0 ? top_rate / base_rate - 1 : NaN,
-      ci95_top_rate: [lo, hi],
-      total_top: totalTop, total_hits: totalHits,
-      n_dates: daily.length,
+      n_test_dates: scored.length, n_dates_skipped: skipped,
+      total_selections, total_hits, top_rate, slate_baseline,
+      abs_lift: top_rate - slate_baseline,
+      rel_lift: slate_baseline > 0 ? top_rate / slate_baseline - 1 : NaN,
+      dates_beating_baseline,
+      dates_beating_baseline_pct: daily_lifts.length > 0 ? dates_beating_baseline / daily_lifts.length : 0,
+      median_daily_lift, worst_daily_lift,
+      ci95: [lo, hi],
     };
   }
 
-  // ---------- Runner ----------
-  interface RunResult {
-    id: string;
-    label: string;
-    outcome: 'y1' | 'y2';
-    kind: 'LR' | 'DET';
-    features: string[];
-    n_train_rows: number; n_val_rows: number; n_test_rows: number;
-    train_loss?: number; val_loss?: number; test_loss?: number;
-    train_auc?: number; val_auc?: number; test_auc?: number;
-    coefficients?: Array<{ key: string; beta: number }>;
-    l2Used?: number; epochs?: number;
-    daily: DailyRow[];
-    aggregate: Record<number, LiftStats>;  // {3, 5, 10, 25}
-  }
+  // ---------- Report ----------
 
-  function evalOn(rowsMat: { X: number[][]; y1: number[]; y2: number[]; rows: Row[] }, scoreFn: (r: number[]) => number, outcome: 'y1' | 'y2') {
-    const y = outcome === 'y1' ? rowsMat.y1 : rowsMat.y2;
-    const scores = rowsMat.X.map((r) => scoreFn(r));
-    const daily = dailyBreakdown(rowsMat.rows, scores, y, outcome);
-    const aggByN: Record<number, LiftStats> = {};
-    for (const n of TOPN_LIST) aggByN[n] = aggregate(daily, n);
-    return { daily, aggregate: aggByN, scores, y };
-  }
-
-  async function runConfig(abl: AblationConfig, outcome: 'y1' | 'y2'): Promise<RunResult[]> {
-    const specsForModel = specsForAblation(outcome, abl);
-    const keys = specsForModel.map((s) => s.key);
-    const tr = materialise(trainRows, specsForModel);
-    const va = materialise(valRows, specsForModel);
-    const te = materialise(testRows, specsForModel);
-    const label = abl.label;
-    if (tr.X.length < 50 || va.X.length < 20 || te.X.length < 20) {
-      console.log(`  ${abl.id}/${outcome}: INSUFFICIENT DATA (train=${tr.X.length} val=${va.X.length} test=${te.X.length}) — skipped`);
-      return [];
-    }
-    const { means, stds } = computeMeansStds(tr.X);
-    const XtrS = standardise(tr.X, means, stds);
-    const XvaS = standardise(va.X, means, stds);
-    const XteS = standardise(te.X, means, stds);
-    const ytr = outcome === 'y1' ? tr.y1 : tr.y2;
-    const yva = outcome === 'y1' ? va.y1 : va.y2;
-    const yte = outcome === 'y1' ? te.y1 : te.y2;
-
-    // --- LR ---
-    const fit = trainWithL2Sweep(XtrS, ytr, XvaS, yva, means, stds);
-    const trPred = predict(XtrS, fit.weights, fit.bias);
-    const vaPred = predict(XvaS, fit.weights, fit.bias);
-    const tePred = predict(XteS, fit.weights, fit.bias);
-    const lrRes = evalOn({ X: XteS, y1: te.y1, y2: te.y2, rows: te.rows }, (r) => {
-      let z = fit.bias; for (let j = 0; j < r.length; j++) z += fit.weights[j] * r[j]; return sigmoid(z);
-    }, outcome);
-    const lrResult: RunResult = {
-      id: abl.id, label, outcome, kind: 'LR',
-      features: keys,
-      n_train_rows: tr.X.length, n_val_rows: va.X.length, n_test_rows: te.X.length,
-      train_loss: fit.finalTrainLoss, val_loss: fit.finalValLoss,
-      test_loss: logLoss(XteS, yte, fit.weights, fit.bias, 0),
-      train_auc: auc(trPred, ytr), val_auc: auc(vaPred, yva), test_auc: auc(tePred, yte),
-      coefficients: keys.map((k, i) => ({ key: k, beta: fit.weights[i] })).sort((a, b) => Math.abs(b.beta) - Math.abs(a.beta)),
-      l2Used: fit.l2Used, epochs: fit.epochs,
-      daily: lrRes.daily, aggregate: lrRes.aggregate,
-    };
-
-    // --- Deterministic (uses same standardised test features + preset weights) ---
-    const detWeights = outcome === 'y1' ? DETERMINISTIC_WEIGHTS_1PLUS : DETERMINISTIC_WEIGHTS_2PLUS;
-    const detRes = evalOn({ X: XteS, y1: te.y1, y2: te.y2, rows: te.rows }, (r) => deterministicScore(r, keys, detWeights), outcome);
-    const detResult: RunResult = {
-      id: abl.id, label, outcome, kind: 'DET',
-      features: keys,
-      n_train_rows: tr.X.length, n_val_rows: va.X.length, n_test_rows: te.X.length,
-      test_auc: auc(detRes.scores, detRes.y),
-      daily: detRes.daily, aggregate: detRes.aggregate,
-    };
-    return [lrResult, detResult];
-  }
-
-  // 11. Run full grid: 6 ablations × 2 outcomes × 2 kinds (LR + DET) = 24 configs.
-  console.log(`\n  ── Running ablation grid (${ABLATIONS.length} ablations × 2 outcomes × 2 kinds = ${ABLATIONS.length * 4} configs) ──`);
-  const allResults: RunResult[] = [];
-  for (const abl of ABLATIONS) {
-    for (const outcome of ['y1', 'y2'] as const) {
-      const results = await runConfig(abl, outcome);
-      allResults.push(...results);
-    }
-  }
-
-  // ---------- REPORT ----------
-  // Table 1: aggregate lift table sorted by outcome then Top-5 rate.
-  function fmtPct(x: number): string { return Number.isFinite(x) ? (x * 100).toFixed(1).padStart(5) + '%' : '  -  '.padStart(6); }
-  function fmtCI(ci: [number, number]): string { return `[${(ci[0] * 100).toFixed(1)}, ${(ci[1] * 100).toFixed(1)}]`; }
-
-  console.log(`\n═══ Aggregate lift table (bootstrapped 95% CI over test dates, ${BOOTSTRAP_ITERS} iters) ═══\n`);
+  console.log(`\n═══ Walk-forward aggregate lift (bootstrapped 95% CI over test dates, ${BOOTSTRAP_ITERS_V3} iters) ═══\n`);
   for (const outcome of ['y1', 'y2'] as const) {
     const outcomeLabel = outcome === 'y1' ? 'hits ≥ 1' : 'hits ≥ 2';
     const rows = allResults.filter((r) => r.outcome === outcome);
-    const baseRate = rows[0]?.aggregate[5]?.base_rate ?? NaN;
-    console.log(`── outcome = ${outcomeLabel}  (test slate baseline = ${(baseRate * 100).toFixed(1)}%) ──`);
-    console.log(`   ${'config'.padEnd(32)}  ${'kind'.padEnd(4)}  ${'topN'.padStart(4)}  ${'topN_hit%'.padStart(9)}  ${'abs_lift'.padStart(8)}  ${'rel_lift'.padStart(8)}  ${'CI_95%'.padStart(16)}  ${'n(hits/top)'.padStart(11)}`);
-    // Sort by test Top-5 rate desc so best rows float up.
-    const sorted = rows.slice().sort((a, b) => (b.aggregate[5]?.top_rate ?? 0) - (a.aggregate[5]?.top_rate ?? 0));
+    console.log(`── outcome = ${outcomeLabel} ──`);
+    console.log(`   ${'candidate'.padEnd(32)}  ${'kind'.padEnd(4)}  ${'topN'.padStart(4)}  ${'topN_hit%'.padStart(9)}  ${'baseline%'.padStart(9)}  ${'abs_lift'.padStart(8)}  ${'rel_lift'.padStart(8)}  ${'dates_beat'.padStart(10)}  ${'med_lift'.padStart(8)}  ${'worst_lift'.padStart(10)}  ${'CI_95%'.padStart(16)}  ${'nD'.padStart(3)}  ${'skp'.padStart(3)}  ${'n(hits/top)'.padStart(11)}`);
+    // Sort by Top-5 rate.
+    const sorted = rows.slice().sort((a, b) => {
+      const av = aggregateWalk(a.daily, 5).top_rate;
+      const bv = aggregateWalk(b.daily, 5).top_rate;
+      return bv - av;
+    });
     for (const r of sorted) {
       for (const n of TOPN_LIST) {
-        const a = r.aggregate[n];
-        if (!a) continue;
+        const a = aggregateWalk(r.daily, n);
         const rel = Number.isFinite(a.rel_lift) ? (a.rel_lift * 100).toFixed(1) + '%' : '  -  ';
         console.log(
-          `   ${(r.label.slice(0, 32)).padEnd(32)}  ${r.kind.padEnd(4)}  ${String(n).padStart(4)}  ${fmtPct(a.top_rate)}  ${fmtPct(a.abs_lift)}  ${rel.padStart(8)}  ${fmtCI(a.ci95_top_rate).padStart(16)}  ${String(`${a.total_hits}/${a.total_top}`).padStart(11)}`,
+          `   ${r.label.slice(0, 32).padEnd(32)}  ${r.kind.padEnd(4)}  ${String(n).padStart(4)}  ${fmtPct(a.top_rate)}  ${fmtPct(a.slate_baseline)}  ${fmtPct(a.abs_lift)}  ${rel.padStart(8)}  ${(a.dates_beating_baseline + '/' + a.n_test_dates + ' (' + (a.dates_beating_baseline_pct * 100).toFixed(0) + '%)').padStart(10)}  ${fmtPct(a.median_daily_lift)}  ${fmtPct(a.worst_daily_lift).padStart(10)}  ${('[' + (a.ci95[0] * 100).toFixed(1) + ', ' + (a.ci95[1] * 100).toFixed(1) + ']').padStart(16)}  ${String(a.n_test_dates).padStart(3)}  ${String(a.n_dates_skipped).padStart(3)}  ${(a.total_hits + '/' + a.total_selections).padStart(11)}`,
         );
       }
       console.log('');
     }
   }
 
-  // Table 2: coefficients for LR models (all ablations).
-  console.log(`\n═══ LR coefficients per ablation (standardised features) ═══`);
+  // Model-stability rankings: per outcome per Top-N, count how often each
+  // candidate finished #1 / #2 / #3 across scored dates.
+  console.log(`\n═══ Model-stability rankings (per date, sorted candidates by daily Top-5 hit rate) ═══`);
+  for (const outcome of ['y1', 'y2'] as const) {
+    const label = outcome === 'y1' ? 'hits ≥ 1' : 'hits ≥ 2';
+    console.log(`\n── outcome = ${label} ──`);
+    // For each date, compute per-candidate daily Top-5 rate (score = hits/total,
+    // NaN if skipped) then rank candidates.
+    const outcomeResults = allResults.filter((r) => r.outcome === outcome);
+    const dateRanks = new Map<string, string[]>(); // date → candidate id order (desc by rate)
+    for (const D of evalDates) {
+      const perCandidate: Array<{ id: string; label: string; rate: number }> = [];
+      for (const r of outcomeResults) {
+        const d = r.daily.find((x) => x.date === D);
+        if (!d || d.skipped || d.top_total[5] === 0) continue;
+        perCandidate.push({ id: r.id, label: r.label, rate: d.top_hits[5] / d.top_total[5] });
+      }
+      if (perCandidate.length === 0) continue;
+      perCandidate.sort((a, b) => b.rate - a.rate);
+      dateRanks.set(D, perCandidate.map((c) => c.id));
+    }
+    // Aggregate per-candidate position histograms.
+    const positionCounts = new Map<string, number[]>(); // id → [count_pos1, count_pos2, …]
+    for (const [, ordered] of dateRanks) {
+      for (let pos = 0; pos < ordered.length; pos++) {
+        const arr = positionCounts.get(ordered[pos]) ?? new Array(outcomeResults.length).fill(0);
+        arr[pos] += 1;
+        positionCounts.set(ordered[pos], arr);
+      }
+    }
+    console.log(`   ${'candidate'.padEnd(32)}  ${'#1'.padStart(4)}  ${'#2'.padStart(4)}  ${'#3'.padStart(4)}  ${'#4'.padStart(4)}  ${'#5'.padStart(4)}  ${'#6'.padStart(4)}  ${'ranked_days'.padStart(11)}`);
+    for (const r of outcomeResults.sort((a, b) => (positionCounts.get(b.id)?.[0] ?? 0) - (positionCounts.get(a.id)?.[0] ?? 0))) {
+      const counts = positionCounts.get(r.id) ?? new Array(6).fill(0);
+      const total = counts.reduce((s, c) => s + c, 0);
+      console.log(`   ${r.label.slice(0, 32).padEnd(32)}  ${String(counts[0] ?? 0).padStart(4)}  ${String(counts[1] ?? 0).padStart(4)}  ${String(counts[2] ?? 0).padStart(4)}  ${String(counts[3] ?? 0).padStart(4)}  ${String(counts[4] ?? 0).padStart(4)}  ${String(counts[5] ?? 0).padStart(4)}  ${String(total).padStart(11)}`);
+    }
+    console.log(`   Note: ties broken by candidate order; ranked_days = dates this candidate produced a valid Top-5 ranking.`);
+  }
+
+  // LR coefficient averages across walk-forward fits (interpretation).
+  console.log(`\n═══ LR average coefficients across walk-forward fits (standardised features) ═══`);
   for (const outcome of ['y1', 'y2'] as const) {
     const label = outcome === 'y1' ? 'hits ≥ 1' : 'hits ≥ 2';
     console.log(`\n── outcome = ${label} ──`);
     for (const r of allResults.filter((x) => x.outcome === outcome && x.kind === 'LR')) {
-      console.log(`  ${r.label}   (L2=${r.l2Used}, epochs=${r.epochs}, train/val/test loss=${r.train_loss?.toFixed(3)}/${r.val_loss?.toFixed(3)}/${r.test_loss?.toFixed(3)}, AUC test=${r.test_auc?.toFixed(3)})`);
-      for (const c of (r.coefficients ?? []).slice(0, 8)) console.log(`    ${c.key.padEnd(32)}  β = ${c.beta.toFixed(4)}`);
-      if ((r.coefficients?.length ?? 0) > 8) console.log(`    … (${(r.coefficients?.length ?? 0) - 8} more)`);
+      const avg = r.beta_by_feature_avg;
+      if (!avg || avg.size === 0) { console.log(`  ${r.label}  (no valid fits)`); continue; }
+      const paired = [...avg.entries()].sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+      console.log(`  ${r.label}  (fits ok: ${r.fits_ok}, skipped: ${r.fits_skipped})`);
+      for (const [k, v] of paired.slice(0, 8)) console.log(`    ${k.padEnd(32)}  β̄ = ${v.toFixed(4)}`);
+      if (paired.length > 8) console.log(`    … (${paired.length - 8} more)`);
     }
   }
 
-  // Table 3: per-test-date breakdown. Emit for every config so the user
-  // can see stability across dates (this is the point of the exercise).
+  // Per-date breakdown.
   console.log(`\n═══ Per-test-date breakdown ═══`);
   for (const outcome of ['y1', 'y2'] as const) {
     const label = outcome === 'y1' ? 'hits ≥ 1' : 'hits ≥ 2';
     for (const r of allResults.filter((x) => x.outcome === outcome)) {
       console.log(`\n── ${r.label}  [${r.kind}]  outcome=${label} ──`);
-      console.log(`   ${'date'.padEnd(11)}  ${'slate'.padStart(6)}  ${'baseline'.padStart(9)}  ${'T3(h/n)'.padStart(9)}  ${'T5(h/n)'.padStart(9)}  ${'T10(h/n)'.padStart(9)}  ${'T25(h/n)'.padStart(10)}`);
+      console.log(`   ${'date'.padEnd(11)}  ${'slate'.padStart(6)}  ${'baseline'.padStart(9)}  ${'scored'.padStart(7)}  ${'T3(h/n)'.padStart(9)}  ${'T5(h/n)'.padStart(9)}  ${'T10(h/n)'.padStart(9)}  ${'T25(h/n)'.padStart(10)}  ${'skip_reason'.padEnd(32)}`);
       for (const d of r.daily) {
-        const t3 = `${d.top_hits[3]}/${d.top_total[3]}`;
-        const t5 = `${d.top_hits[5]}/${d.top_total[5]}`;
-        const t10 = `${d.top_hits[10]}/${d.top_total[10]}`;
-        const t25 = `${d.top_hits[25]}/${d.top_total[25]}`;
-        console.log(`   ${d.date.padEnd(11)}  ${String(d.slate_size).padStart(6)}  ${fmtPct(d.slate_rate)}  ${t3.padStart(9)}  ${t5.padStart(9)}  ${t10.padStart(9)}  ${t25.padStart(10)}`);
+        const skip = d.skipped ? (d.skip_reason ?? 'skipped') : '';
+        const t3  = d.skipped ? '-' : `${d.top_hits[3]}/${d.top_total[3]}`;
+        const t5  = d.skipped ? '-' : `${d.top_hits[5]}/${d.top_total[5]}`;
+        const t10 = d.skipped ? '-' : `${d.top_hits[10]}/${d.top_total[10]}`;
+        const t25 = d.skipped ? '-' : `${d.top_hits[25]}/${d.top_total[25]}`;
+        console.log(`   ${d.date.padEnd(11)}  ${String(d.slate_size).padStart(6)}  ${fmtPct(d.slate_rate)}  ${String(d.scored_rows).padStart(7)}  ${t3.padStart(9)}  ${t5.padStart(9)}  ${t10.padStart(9)}  ${t25.padStart(10)}  ${skip.slice(0, 32).padEnd(32)}`);
       }
     }
   }
 
-  console.log(`\n═══ end of calibration report v2 ═══`);
+  console.log(`\n═══ end of calibration report v3 ═══`);
   console.log(`Reading guide:`);
-  console.log(`  • Aggregate lift table sorted by Top-5 rate within each outcome — top rows are the`);
-  console.log(`    most-promising rankers. Absolute lift is (Top-N% − slate baseline%). Relative lift`);
-  console.log(`    is Top-N% / baseline% − 1.`);
-  console.log(`  • Bootstrap CI is over TEST DATES (units of variation), 500 iters. Wide CIs on 4-6`);
-  console.log(`    dates are expected — that's a sample-size problem, not a scoring problem. Reruning`);
-  console.log(`    after a wider batting-line backfill is the fix.`);
-  console.log(`  • Compare DET (deterministic 2+ investigation) against LR row-for-row on the same`);
-  console.log(`    ablation. If DET wins on multiple ablations, that's evidence the deterministic`);
-  console.log(`    preset is genuinely capturing signal — not just a lucky sample.`);
-  console.log(`  • Ablations that MATCH or BEAT 'full' with fewer features are the safer choice for`);
-  console.log(`    v1 — same lift, lower overfitting risk.\n`);
+  console.log(`  • Walk-forward: for each eval date D, training was rebuilt from rows on dates < D.`);
+  console.log(`    Zero future leakage. Model is fit fresh every date.`);
+  console.log(`  • Look for candidates that ALSO have a high dates_beat % AND positive median_lift`);
+  console.log(`    AND worst_lift not deeply negative. Persistent lift > one-window burst.`);
+  console.log(`  • CI is bootstrapped over TEST DATES (dates resampled with replacement). Wide CIs`);
+  console.log(`    at few dates are a sample-size issue, not a model issue — extend backfill.`);
+  console.log(`  • Model stability table shows how often each candidate finished #1 across dates.`);
+  console.log(`    A candidate with #1 finishes in ~40%+ of dates AND top-of-table aggregate lift is`);
+  console.log(`    the right kind of persistent.`);
+  console.log(`  • NO candidate should be promoted to live ranking on 2-4 test dates. Wait for the`);
+  console.log(`    backfill to widen the walk-forward window meaningfully (≥ 30 test dates).\n`);
 }
 
 const __filename = fileURLToPath(import.meta.url);
