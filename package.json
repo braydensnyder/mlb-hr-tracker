@@ -14,6 +14,7 @@
     "rebuild:pitcher-form": "tsx scripts/runRebuildPitcherForm.ts",
     "backfill:batting-lines": "tsx scripts/runBackfillBattingLines.ts",
     "diagnose:platoon": "tsx scripts/diagnosePlatoonCoverage.ts",
+    "learning:calibrate-hits": "tsx scripts/learning/calibrateHitScore.ts",
     "rebuild:all": "tsx scripts/runRebuildAll.ts",
     "enrich:handedness": "tsx scripts/runEnrichHandedness.ts",
     "enrich:venues": "tsx scripts/runEnrichVenues.ts",
