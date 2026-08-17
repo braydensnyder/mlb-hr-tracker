@@ -26,7 +26,7 @@
  *   --force              ignore the freshness check; refresh every player
  */
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
-import { getPersonRaw } from './lib/mlb.js';
+import { getPersonWithSeasonHittingRaw } from './lib/mlb.js';
 import { withRetry } from './lib/retry.js';
 
 export interface EnrichPlayersOptions {
@@ -129,12 +129,59 @@ interface PlayerSeed {
   pitch_hand: string | null;
   birth_country: string | null;
   active: boolean;
+  // Phase Hits ingestion (mig 020) — season slash filled from the
+  // hydrated /v1/people response. Null when the player has no MLB PAs
+  // this season or the stats block is missing/malformed.
+  season_avg: number | null;
+  season_obp: number | null;
+  season_slg: number | null;
+  season_ops: number | null;
+  season_stats_as_of: string | null;
 }
 
 function normHand(v: unknown): string | null {
   if (typeof v !== 'string') return null;
   const u = v.trim().toUpperCase();
   return u === 'L' || u === 'R' || u === 'S' ? u : null;
+}
+
+/** Parse a numeric slash-line value ("0.312", ".312", or 0.312) → number
+ *  or null. The MLB API returns strings like ".312" (leading dot dropped);
+ *  Number(".312") is 0.312 so this works, but we still guard for garbage. */
+function parseSlashNum(v: unknown): number | null {
+  if (v == null) return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v !== 'string') return null;
+  const trimmed = v.trim();
+  if (trimmed === '' || trimmed === '.---' || trimmed === '-') return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Extract season hitting slash from the hydrated /v1/people response.
+ *  Shape: person.stats = [{ group: {displayName: 'hitting'}, type: {displayName: 'season'}, splits: [{stat: {avg, obp, slg, ops, ...}}] }]
+ *  Returns nulls when the block is missing or the player has no PAs. */
+function parseSeasonHitting(person: any): {
+  avg: number | null; obp: number | null; slg: number | null; ops: number | null;
+} {
+  const empty = { avg: null, obp: null, slg: null, ops: null };
+  const groups: any[] = Array.isArray(person?.stats) ? person.stats : [];
+  const hitting = groups.find((g) =>
+    (g?.group?.displayName?.toLowerCase?.() === 'hitting') &&
+    (g?.type?.displayName?.toLowerCase?.() === 'season'),
+  );
+  if (!hitting) return empty;
+  const splits: any[] = Array.isArray(hitting.splits) ? hitting.splits : [];
+  // Multiple splits appear when the player was traded mid-season. Use
+  // the last one, which MLB normalises to season totals across teams.
+  const stat = splits.length > 0 ? splits[splits.length - 1]?.stat : null;
+  if (!stat) return empty;
+  return {
+    avg: parseSlashNum(stat.avg),
+    obp: parseSlashNum(stat.obp),
+    slg: parseSlashNum(stat.slg),
+    ops: parseSlashNum(stat.ops),
+  };
 }
 
 function toPlayerSeed(personId: number, person: any): PlayerSeed | null {
@@ -149,6 +196,9 @@ function toPlayerSeed(personId: number, person: any): PlayerSeed | null {
       [person.firstName, person.lastName].filter(Boolean).join(' ')) ||
     `Player ${personId}`;
 
+  const slash = parseSeasonHitting(person);
+  const anySlash = slash.avg != null || slash.obp != null || slash.slg != null || slash.ops != null;
+
   return {
     player_id: personId,
     full_name: fullName,
@@ -158,7 +208,16 @@ function toPlayerSeed(personId: number, person: any): PlayerSeed | null {
     bat_side: normHand(person?.batSide?.code),
     pitch_hand: normHand(person?.pitchHand?.code),
     birth_country: person?.birthCountry ?? null,
-    active: person?.active === true || person?.active === undefined, // treat unknown as active
+    active: person?.active === true || person?.active === undefined,
+    season_avg: slash.avg,
+    season_obp: slash.obp,
+    season_slg: slash.slg,
+    season_ops: slash.ops,
+    // Only stamp as_of when we actually captured at least one slash number.
+    // A NULL as_of tells downstream "we don't have season stats for this
+    // player" without collapsing to the ambiguous "asked at date X, got
+    // nulls" case.
+    season_stats_as_of: anySlash ? new Date().toISOString().slice(0, 10) : null,
   };
 }
 
@@ -166,12 +225,27 @@ async function upsertPlayers(seeds: PlayerSeed[]): Promise<number> {
   if (seeds.length === 0) return 0;
   const CHUNK = 500;
   let total = 0;
+  let stripSlash = false; // set true if mig 020 hasn't been applied
   for (let i = 0; i < seeds.length; i += CHUNK) {
     const slice = seeds.slice(i, i + CHUNK);
+    const payload = stripSlash
+      ? slice.map(({ season_avg, season_obp, season_slg, season_ops, season_stats_as_of, ...rest }) => rest)
+      : slice;
     const { error } = await supabaseAdmin
       .from('players')
-      .upsert(slice, { onConflict: 'player_id' });
-    if (error) throw new Error(`upsert players failed: ${error.message}`);
+      .upsert(payload, { onConflict: 'player_id' });
+    if (error) {
+      // Graceful fallback: pre-mig-020 environments won't have the
+      // season_* columns. Retry this chunk without those fields and
+      // remember to strip on future chunks in the same run.
+      if (!stripSlash && /column .* does not exist|schema cache/i.test(error.message)) {
+        console.warn(`  ⚠ players.season_* columns missing — apply migration 020 to persist season slash. Continuing without.`);
+        stripSlash = true;
+        i -= CHUNK; // retry this chunk
+        continue;
+      }
+      throw new Error(`upsert players failed: ${error.message}`);
+    }
     total += slice.length;
   }
   return total;
@@ -239,7 +313,7 @@ export async function enrichPlayers(opts: EnrichPlayersOptions = {}): Promise<En
   for (let i = 0; i < pending.length; i++) {
     const id = pending[i];
     try {
-      const data = await withRetry(() => getPersonRaw(id));
+      const data = await withRetry(() => getPersonWithSeasonHittingRaw(id));
       const person = data?.people?.[0];
       const seed = toPlayerSeed(id, person);
       if (!seed) {

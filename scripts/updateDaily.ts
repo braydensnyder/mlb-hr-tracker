@@ -40,6 +40,8 @@ import { enrichPlayers } from './enrichPlayers.js';
 import { enrichWeather, type EnrichWeatherResult } from './enrichWeather.js';
 import { enrichLineups, type EnrichLineupsResult } from './enrichLineups.js';
 import { rebuildPlayerSummaries } from './rebuildPlayerSummaries.js';
+import { rebuildHitSummaries } from './rebuildHitSummaries.js';
+import { rebuildPitcherForm } from './rebuildPitcherForm.js';
 import { snapshotHrTargets, type SnapshotResult } from './snapshotHrTargets.js';
 import { captureDay } from './learning/captureDay.js';
 import { captureChangesForDate } from './learning/captureChanges.js';
@@ -533,6 +535,58 @@ export async function updateDaily(
     );
     if (ySummary != null) summariesRebuilt += 1;
     if (tSummary != null) summariesRebuilt += 1;
+
+    // ─────────────────────────────────────────────────────────────────
+    //  Hits ingestion rebuild (mig 020) — fully isolated.
+    //
+    //  Failure MUST NOT break the HR pipeline. Each hits-side step is
+    //  wrapped in its own try/catch so pitcher_form can succeed even
+    //  if the hit-summary rebuild fails, and vice-versa.
+    //
+    //  Rolls yesterday + today so the summary and pitcher form both
+    //  reflect the freshest games. Uses the same cadence guard as
+    //  above — 'light' mode skips this whole block by design.
+    // ─────────────────────────────────────────────────────────────────
+    console.log(`\n[5b] Hits-side rebuild (mig 020)`);
+
+    const yHits = await runStep(
+      `rebuildHitSummaries(${yesterday})`,
+      async () => {
+        try { return await rebuildHitSummaries(yesterday); }
+        catch (e) {
+          const m = e instanceof Error ? e.message : String(e);
+          console.warn(`  ⚠ rebuildHitSummaries(${yesterday}) FAILED (non-fatal, HR path unaffected): ${m}`);
+          return null;
+        }
+      },
+      steps,
+    );
+    const tHits = await runStep(
+      `rebuildHitSummaries(${today})`,
+      async () => {
+        try { return await rebuildHitSummaries(today); }
+        catch (e) {
+          const m = e instanceof Error ? e.message : String(e);
+          console.warn(`  ⚠ rebuildHitSummaries(${today}) FAILED (non-fatal, HR path unaffected): ${m}`);
+          return null;
+        }
+      },
+      steps,
+    );
+    void yHits; void tHits; // silence unused-var check
+
+    await runStep(
+      `rebuildPitcherForm(${today})`,
+      async () => {
+        try { return await rebuildPitcherForm(today); }
+        catch (e) {
+          const m = e instanceof Error ? e.message : String(e);
+          console.warn(`  ⚠ rebuildPitcherForm(${today}) FAILED (non-fatal, HR path unaffected): ${m}`);
+          return null;
+        }
+      },
+      steps,
+    );
   } else {
     console.log(`    (summary rebuilds skipped — mode=${mode})`);
   }

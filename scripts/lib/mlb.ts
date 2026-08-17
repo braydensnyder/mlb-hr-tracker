@@ -53,3 +53,18 @@ export function getGameFeedRaw(gamePk: number) {
 export function getPersonRaw(personId: number) {
   return getJson<any>(`/v1/people/${personId}`);
 }
+
+/**
+ * /v1/people/{id}?hydrate=stats(group=[hitting],type=[season])
+ *
+ * Same person endpoint as getPersonRaw, but with season hitting stats
+ * hydrated inline on `people[0].stats`. Used by enrichPlayers (mig 020)
+ * to fill players.season_avg / season_obp / season_slg / season_ops
+ * without a second call. Free-ish — MLB returns both name/catalog and
+ * season slash in the same response.
+ */
+export function getPersonWithSeasonHittingRaw(personId: number) {
+  return getJson<any>(
+    `/v1/people/${personId}?hydrate=stats(group=[hitting],type=[season])`,
+  );
+}

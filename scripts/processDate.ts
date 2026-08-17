@@ -28,6 +28,7 @@ import { fetchSchedule } from './fetchSchedule.js';
 import { fetchGameFeed } from './fetchGameFeed.js';
 import { extractHomeRuns } from './extractHomeRuns.js';
 import { extractPitcherStarts } from './extractPitcherStarts.js';
+import { extractBattingLines } from './extractBattingLines.js';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
 import { upsertVenues } from './lib/venues.js';
 import { upsertGameRows } from './lib/games.js';
@@ -133,6 +134,7 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
   let totalHRs = 0;
   let totalDupes = 0;
   let totalStarts = 0;
+  let totalBattingLines = 0;
   let latestHrCreatedAt: string | null = null;
   const perGame: ProcessDateResult['perGame'] = [];
 
@@ -173,12 +175,13 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
     }
   }
 
-  // ---- 3b. process FINAL games — HRs + pitcher_starts + mark processed ----
+  // ---- 3b. process FINAL games — HRs + pitcher_starts + batting_lines + mark processed ----
   for (const game of finals) {
     try {
       const feed = await fetchGameFeed(game.game_pk);
       const hrs = extractHomeRuns(feed);
       const starts = extractPitcherStarts(feed);
+      const battingLines = extractBattingLines(feed);
 
       const hrIns = await upsertHomeRuns(hrs);
       latestHrCreatedAt = bumpLatestCreatedAt(latestHrCreatedAt, hrIns.maxCreatedAt);
@@ -201,6 +204,35 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
         }
       }
 
+      // Hits ingestion (mig 020): fully isolated from HR path.
+      // A batting-line failure MUST NOT block HR mark-processed.
+      let battingLineCount = 0;
+      if (battingLines.length > 0) {
+        try {
+          const { error: blErr } = await supabaseAdmin
+            .from('player_batting_lines')
+            .upsert(battingLines, { onConflict: 'target_date,game_pk,player_id' });
+          if (blErr) {
+            if (/does not exist|schema cache/i.test(blErr.message)) {
+              // Migration 020 not applied yet — expected during rollout.
+              // Log once per run rather than per game to avoid spam.
+              if (!(globalThis as any).__mig020Warned) {
+                console.warn(`  ⚠ player_batting_lines table missing — apply migration 020 to enable Hits ingestion`);
+                (globalThis as any).__mig020Warned = true;
+              }
+            } else {
+              console.warn(`  [final game ${game.game_pk}] player_batting_lines upsert FAILED (non-fatal): ${blErr.message}`);
+            }
+          } else {
+            battingLineCount = battingLines.length;
+            totalBattingLines += battingLineCount;
+          }
+        } catch (blEx) {
+          const m = blEx instanceof Error ? blEx.message : String(blEx);
+          console.warn(`  [final game ${game.game_pk}] batting_lines threw (non-fatal): ${m}`);
+        }
+      }
+
       // Mark processed AFTER ingest succeeds so a transient failure
       // doesn't leave us with a game we'll never re-check.
       const { error: markErr } = await supabaseAdmin
@@ -211,7 +243,8 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
 
       console.log(
         `  [final game ${game.game_pk}] ${hrIns.netInserted} new HR(s) ` +
-          `(${hrDupes} dupe(s) skipped), ${starterCount}/${starts.length} starter(s), processed=true`,
+          `(${hrDupes} dupe(s) skipped), ${starterCount}/${starts.length} starter(s), ` +
+          `${battingLineCount}/${battingLines.length} batting line(s), processed=true`,
       );
       record(game.game_pk, game.status, 'final', hrIns.netInserted, starterCount, hrDupes);
     } catch (err) {
@@ -234,6 +267,7 @@ export async function processDate(date: string): Promise<ProcessDateResult> {
   console.log(`  finals newly processed — ${finals.length} for ${date}`);
   console.log(`  home runs ingested — ${totalHRs} new row(s) for ${date}`);
   console.log(`  duplicates skipped — ${totalDupes} HR row(s) for ${date}`);
+  console.log(`  batting lines ingested — ${totalBattingLines} row(s) for ${date}`);
   if (latestHrCreatedAt) {
     console.log(`  latest HR created_at — ${latestHrCreatedAt}`);
   }
