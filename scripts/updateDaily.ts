@@ -46,6 +46,8 @@ import { snapshotHrTargets, type SnapshotResult } from './snapshotHrTargets.js';
 import { captureDay } from './learning/captureDay.js';
 import { captureChangesForDate } from './learning/captureChanges.js';
 import { computeAiPicksForDate, computeAiPicksPregame } from './learning/computeAiPicks.js';
+import { snapshotHitTargets } from './snapshotHitTargets.js';
+import { enrichHitOutcomes } from './enrichHitOutcomes.js';
 import { replayDateForVersions, type DayModelOutcome } from './learning/replayModels.js';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
 import {
@@ -517,6 +519,67 @@ export async function updateDaily(
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  //  Phase 4.7 — Pregame Hits snapshot (parallel Hits tab)
+  //
+  //  Writes today's hit_target_universe + hit_target_snapshots. Uses
+  //  today's lineups + probable pitchers + pitcher_form + rolling hit
+  //  summaries (as-of yesterday). Snapshot pregame decision record is
+  //  IMMUTABLE — outcome enrichment happens in Phase 6c after games
+  //  complete.
+  //
+  //  Games-started fence: refuses to fabricate a pregame record when
+  //  any game has already started AND no prior snapshot exists.
+  //
+  //  Fully isolated try/catch — a Hits failure MUST NOT break the HR
+  //  pipeline. Skipped on 'light' mode (touch runs).
+  // ─────────────────────────────────────────────────────────────────────
+  if (effectiveSnapshot !== 'none' && mode !== 'light') {
+    console.log(`\n▶ 4.7) Pregame Hits snapshot (${today})`);
+    const hStartedAt = Date.now();
+    try {
+      const hitRes = await snapshotHitTargets(today);
+      const icon =
+        hitRes.status === 'written' || hitRes.status === 'frozen_kept' ? '✓' :
+        hitRes.status === 'refused_games_started' ? '⛔' :
+        hitRes.status === 'no_games' || hitRes.status === 'no_candidates' ? '·' :
+        '⚠';
+      console.log(
+        `  ${icon} hits snapshot [${hitRes.status}] — ${hitRes.reason} · ` +
+        `candidates=${hitRes.candidates_total} (${hitRes.candidates_confirmed} confirmed, ${hitRes.candidates_pending} pending) · ` +
+        `universe=${hitRes.universe_rows_written} · snapshot=${hitRes.snapshot_rows_written} new / ${hitRes.snapshot_rows_kept_frozen} frozen · ` +
+        `games=${hitRes.games_started}/${hitRes.games_total} started`,
+      );
+      if (!hitRes.model_1plus.is_validated || !hitRes.model_2plus.is_validated) {
+        console.log(`    ⓘ EXPERIMENTAL configs (1+ id=${hitRes.model_1plus.id}, 2+ id=${hitRes.model_2plus.id}) — walk-forward promotion still pending.`);
+      }
+      steps.push({
+        step: 'snapshot:hits',
+        durationMs: Date.now() - hStartedAt,
+        ok: hitRes.status !== 'refused_games_started',
+        detail: {
+          date: hitRes.date,
+          status: hitRes.status,
+          candidates_total: hitRes.candidates_total,
+          universe_rows_written: hitRes.universe_rows_written,
+          snapshot_rows_written: hitRes.snapshot_rows_written,
+          snapshot_rows_kept_frozen: hitRes.snapshot_rows_kept_frozen,
+          model_1plus: hitRes.model_1plus,
+          model_2plus: hitRes.model_2plus,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`  ⚠ hits snapshot FAILED (non-fatal, HR path unaffected): ${msg}`);
+      steps.push({
+        step: 'snapshot:hits',
+        durationMs: Date.now() - hStartedAt,
+        ok: false,
+        detail: msg,
+      });
+    }
+  }
+
   // -------------------------------------------------------------
   // 5. Rebuild summaries — config-driven (skipped on light ticks).
   // -------------------------------------------------------------
@@ -715,6 +778,51 @@ export async function updateDaily(
         } else if (r.status === 'failed') {
           console.log(`    v${r.version}: FAILED — ${r.error}`);
         }
+      }
+
+      // ─────────────────────────────────────────────────────────────────
+      //  Phase 6c — Hits outcome enrichment (parallel Hits tab)
+      //
+      //  Updates hit_target_snapshots outcome columns from
+      //  player_batting_lines for yesterday. Rank / score /
+      //  contributions / model stamps are LEFT BYTE-IDENTICAL — same
+      //  freeze principle as pregame v7 (Phase 2.5).
+      //
+      //  Isolated try/catch — Hits enrichment failure MUST NOT break
+      //  the HR learning phase.
+      // ─────────────────────────────────────────────────────────────────
+      try {
+        const hitEnrich = await enrichHitOutcomes(yesterday);
+        console.log(
+          `  ✓ hits outcome enrichment: ${hitEnrich.snapshot_rows_enriched} enriched, ` +
+          `${hitEnrich.snapshot_rows_no_batting_line} zeroed (scratched/DH-lost), ` +
+          `${hitEnrich.snapshot_rows_already_enriched} already enriched, ` +
+          `${hitEnrich.snapshot_rows_total} total snapshot row(s)` +
+          (hitEnrich.players_with_no_snapshot_row > 0
+            ? ` · ${hitEnrich.players_with_no_snapshot_row} batter(s) had a batting line but no snapshot row (scratched-in)`
+            : ''),
+        );
+        steps.push({
+          step: 'enrich:hit-outcomes',
+          durationMs: Date.now() - learningStartedAt,
+          ok: true,
+          detail: {
+            date: yesterday,
+            snapshot_rows_total: hitEnrich.snapshot_rows_total,
+            enriched: hitEnrich.snapshot_rows_enriched,
+            zeroed: hitEnrich.snapshot_rows_no_batting_line,
+            already_enriched: hitEnrich.snapshot_rows_already_enriched,
+          },
+        });
+      } catch (hitErr) {
+        const m = hitErr instanceof Error ? hitErr.message : String(hitErr);
+        console.warn(`  ⚠ hits outcome enrichment FAILED (non-fatal, HR path unaffected): ${m}`);
+        steps.push({
+          step: 'enrich:hit-outcomes',
+          durationMs: Date.now() - learningStartedAt,
+          ok: false,
+          detail: m,
+        });
       }
 
       summary.learning = {
