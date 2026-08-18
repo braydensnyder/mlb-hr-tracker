@@ -1,26 +1,16 @@
 /**
- * /hits — Hits ranker page.
+ * /hits — Hits ranker page (dark, compact).
  *
- * Two independent rankers (1+ Hit and 2+ Hits) shown as tabs. Board
- * defaults to Top 10 with expand controls (25 / 50 / full universe).
+ * Two independent rankers (1+ Hit / 2+ Hits). Board defaults to Top 10
+ * with expand controls (25 / 50 / full universe).
  *
- * Data source rules:
- *   - date == today: read hit_target_universe (live view)
- *   - date != today: read hit_target_snapshots (frozen pregame archive)
- *   - When date == today AND the writer has already run, both tables
- *     have data; universe is the tie-breaker (freshest scoring).
- *
- * EXPERIMENTAL badge:
- *   Every row carries model_config_id_{1plus,2plus}. When either id
- *   starts with 'experimental_' the badge is shown persistently at
- *   the top of the page — the rankings are NOT production-validated.
- *
- * This page does not compute anything itself — all scoring already
- * happened in snapshotHitTargets. UI is purely presentation.
+ * Visual pass: matches the dark navy palette from index.css. Compact
+ * experimental strip with details expand. No changes to scoring or
+ * ranking logic.
  */
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { fetchHitTargetsForDate, type HitBoardBundle } from '../lib/supabase';
+import { fetchHitTargetsForDate, fetchPlayerIndex, type HitBoardBundle } from '../lib/supabase';
 import { mlbToday, addDays as mlbAddDays } from '../lib/mlbDate';
 import HitsBoard from '../components/HitsBoard';
 
@@ -28,10 +18,7 @@ type Ranker = '1plus' | '2plus';
 type BoardLimit = 10 | 25 | 50 | 999;
 
 const LIMIT_LABELS: Record<BoardLimit, string> = {
-  10: 'Top 10',
-  25: 'Top 25',
-  50: 'Top 50',
-  999: 'Full universe',
+  10: 'Top 10', 25: 'Top 25', 50: 'Top 50', 999: 'Full',
 };
 
 export default function Hits() {
@@ -46,6 +33,8 @@ export default function Hits() {
   const [bundle, setBundle] = useState<HitBoardBundle | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [showModelDetails, setShowModelDetails] = useState(false);
+  const [pitcherNames, setPitcherNames] = useState<Map<number, string>>(new Map());
 
   useEffect(() => {
     let cancelled = false;
@@ -56,6 +45,22 @@ export default function Hits() {
       .catch((e) => { if (!cancelled) { setErr(e instanceof Error ? e.message : String(e)); setLoading(false); } });
     return () => { cancelled = true; };
   }, [date, today]);
+
+  // Load the players catalog once — used to resolve opposing-pitcher names.
+  useEffect(() => {
+    let cancelled = false;
+    fetchPlayerIndex()
+      .then((idx) => {
+        if (cancelled) return;
+        const map = new Map<number, string>();
+        for (const [id, info] of idx) {
+          if (info.full_name) map.set(id, info.full_name);
+        }
+        setPitcherNames(map);
+      })
+      .catch(() => { /* non-fatal — board will fall back to #<id> */ });
+    return () => { cancelled = true; };
+  }, []);
 
   const isPastDate = date < today;
   const outcomesAvailable = useMemo(
@@ -72,186 +77,195 @@ export default function Hits() {
   }
 
   return (
-    <div className="panel" style={{ padding: '18px 20px' }}>
-      {/* ---- Header ---- */}
-      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
-        <div>
-          <h2 style={{ margin: 0 }}>Hits — {date}</h2>
-          <p style={{ margin: '4px 0 0', color: '#6b7280', fontSize: 13 }}>
-            Who is most likely to record ≥1 hit or ≥2 hits today.
-          </p>
-        </div>
-        {/* Date navigator */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <button
-            onClick={() => updateParam('date', mlbAddDays(date, -1))}
-            style={buttonStyle(false)}
-          >← prev day</button>
+    <div className="panel" style={{ padding: 14 }}>
+      {/* ---- Header row ---- */}
+      <div style={{
+        display: 'flex', alignItems: 'baseline', justifyContent: 'space-between',
+        flexWrap: 'wrap', gap: 10, marginBottom: 10,
+      }}>
+        <h2 style={{
+          margin: 0, fontSize: 14, textTransform: 'uppercase', letterSpacing: 0.8,
+          color: 'var(--muted)',
+        }}>
+          Hits · {date}
+        </h2>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <button onClick={() => updateParam('date', mlbAddDays(date, -1))} style={btn(false)}>◀</button>
           <input
-            type="date"
-            value={date}
+            type="date" value={date}
             onChange={(e) => updateParam('date', e.target.value)}
-            style={{ padding: '4px 8px', border: '1px solid #d1d5db', borderRadius: 4 }}
+            style={{
+              padding: '4px 8px', background: 'var(--panel-2)',
+              border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)',
+              fontSize: 12, colorScheme: 'dark',
+            }}
           />
-          <button
-            onClick={() => updateParam('date', mlbAddDays(date, 1))}
-            style={buttonStyle(false)}
-          >next day →</button>
+          <button onClick={() => updateParam('date', mlbAddDays(date, 1))} style={btn(false)}>▶</button>
           <button
             onClick={() => updateParam('date', today)}
-            style={buttonStyle(date === today)}
-            disabled={date === today}
+            style={btn(date === today)} disabled={date === today}
           >Today</button>
         </div>
       </div>
 
-      {/* ---- Experimental badge ---- */}
+      {/* ---- Compact experimental strip ---- */}
       {experimental && (
         <div style={{
-          marginTop: 12, padding: '10px 14px',
-          background: '#fef3c7', border: '1px solid #f59e0b', borderRadius: 6,
-          fontSize: 13, color: '#92400e',
+          display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+          padding: '6px 10px', marginBottom: 10,
+          background: 'rgba(255,209,102,0.06)',
+          border: '1px solid rgba(255,209,102,0.30)',
+          borderRadius: 6, fontSize: 12,
         }}>
-          <strong>EXPERIMENTAL — unvalidated rankers.</strong>{' '}
-          These rankings come from placeholder configs that have not yet
-          cleared the walk-forward promotion guardrails
-          (≥30 eval dates, positive Top-N lift, CI lower bound above 0,
-          ≥55% dates beating baseline, ≥25% #1-stability finishes).
-          {bundle && (
-            <div style={{ marginTop: 4, fontSize: 12, fontFamily: 'ui-monospace, SFMono-Regular, monospace' }}>
-              1+ config: {bundle.model_1plus_id ?? '?'} · hash {bundle.model_1plus_hash ?? '?'}<br />
-              2+ config: {bundle.model_2plus_id ?? '?'} · hash {bundle.model_2plus_hash ?? '?'}
+          <span style={{
+            background: 'var(--accent-2)', color: 'var(--bg)',
+            padding: '1px 6px', borderRadius: 3, fontSize: 10, fontWeight: 700,
+            letterSpacing: 0.6,
+          }}>EXPERIMENTAL</span>
+          <span style={{ color: 'var(--muted)' }}>
+            Ranker has not cleared validation guardrails yet.
+          </span>
+          <button
+            onClick={() => setShowModelDetails((v) => !v)}
+            style={{
+              marginLeft: 'auto', background: 'transparent',
+              border: 'none', color: 'var(--muted)', cursor: 'pointer',
+              fontSize: 11, textDecoration: 'underline',
+            }}
+          >
+            {showModelDetails ? 'hide details' : 'details'}
+          </button>
+          {showModelDetails && bundle && (
+            <div style={{
+              width: '100%', marginTop: 4, padding: '6px 10px',
+              background: 'var(--panel-2)', borderRadius: 4,
+              fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+              fontSize: 11, color: 'var(--muted)',
+            }}>
+              1+: {bundle.model_1plus_id ?? '?'} · hash {bundle.model_1plus_hash ?? '?'}<br />
+              2+: {bundle.model_2plus_id ?? '?'} · hash {bundle.model_2plus_hash ?? '?'}
             </div>
           )}
         </div>
       )}
 
-      {/* ---- Ranker toggle + limit expand ---- */}
-      <div style={{ display: 'flex', gap: 20, alignItems: 'center', marginTop: 18, flexWrap: 'wrap' }}>
-        <div style={{ display: 'flex', gap: 4 }}>
-          <button
-            onClick={() => updateParam('r', '1plus')}
-            style={tabStyle(ranker === '1plus')}
-          >1+ Hit</button>
-          <button
-            onClick={() => updateParam('r', '2plus')}
-            style={tabStyle(ranker === '2plus')}
-          >2+ Hits</button>
+      {/* ---- Segmented controls: ranker + limit ---- */}
+      <div style={{
+        display: 'flex', gap: 12, alignItems: 'center',
+        marginBottom: 10, flexWrap: 'wrap',
+      }}>
+        <div style={segGroup()}>
+          {(['1plus', '2plus'] as const).map((r) => (
+            <button key={r} onClick={() => updateParam('r', r)} style={segBtn(ranker === r)}>
+              {r === '1plus' ? '1+ Hit' : '2+ Hits'}
+            </button>
+          ))}
         </div>
-        <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
+        <div style={{ ...segGroup(), marginLeft: 'auto' }}>
           {([10, 25, 50, 999] as BoardLimit[]).map((n) => (
-            <button
-              key={n}
-              onClick={() => updateParam('n', String(n))}
-              style={pillStyle(validLimit === n)}
-            >{LIMIT_LABELS[n]}</button>
+            <button key={n} onClick={() => updateParam('n', String(n))} style={segBtn(validLimit === n)}>
+              {LIMIT_LABELS[n]}
+            </button>
           ))}
         </div>
       </div>
 
-      {/* ---- Board ---- */}
-      <div style={{ marginTop: 16 }}>
-        {loading && <p style={{ color: '#6b7280' }}>Loading…</p>}
-        {err && (
-          <div style={{ padding: 12, background: '#fee2e2', border: '1px solid #dc2626', borderRadius: 4, color: '#991b1b' }}>
-            <strong>Failed to load:</strong> {err}
-          </div>
-        )}
-        {!loading && !err && bundle && bundle.rows.length === 0 && (
-          <div style={{ padding: 14, background: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: 4 }}>
-            <p style={{ margin: 0 }}>
-              No Hits data for {date}. The pregame snapshot may not have run yet, or the
-              date has no scheduled games. Data source attempted:{' '}
-              <code style={{ background: '#e5e7eb', padding: '1px 4px', borderRadius: 3 }}>{bundle.source}</code>.
-            </p>
-            {date === today && (
-              <p style={{ margin: '8px 0 0', color: '#6b7280', fontSize: 13 }}>
-                Try running <code>npm run snapshot:hits:today</code> from the CLI, or wait
-                for the nightly cron (Phase 4.7).
-              </p>
-            )}
-          </div>
-        )}
-        {!loading && !err && bundle && bundle.rows.length > 0 && (
-          <>
-            <div style={{
-              display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10,
-              fontSize: 12, color: '#6b7280',
-            }}>
-              <span>
-                Source: <code style={{ background: '#f3f4f6', padding: '1px 5px', borderRadius: 3 }}>
-                  {bundle.source === 'snapshots' ? 'hit_target_snapshots (frozen pregame)' : 'hit_target_universe (live view)'}
-                </code>
-              </span>
+      {/* ---- Source strip (thin) ---- */}
+      {bundle && bundle.rows.length > 0 && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+          fontSize: 11, color: 'var(--muted)', marginBottom: 6,
+        }}>
+          <span>
+            <code style={{ background: 'var(--panel-2)', padding: '1px 5px', borderRadius: 3, color: 'var(--muted)' }}>
+              {bundle.source === 'snapshots' ? 'snapshots (frozen)' : 'universe (live)'}
+            </code>
+          </span>
+          <span>·</span>
+          <span>{bundle.rows.length} starters</span>
+          {isPastDate && (
+            <>
               <span>·</span>
-              <span>{bundle.rows.length} eligible starters</span>
-              {isPastDate && (
-                <>
-                  <span>·</span>
-                  <span>{outcomesAvailable ? 'outcomes enriched' : 'outcomes pending'}</span>
-                </>
-              )}
-            </div>
-            <HitsBoard
-              rows={bundle.rows}
-              ranker={ranker}
-              limit={validLimit}
-              showOutcomeBadges={showOutcomeBadges}
-            />
-          </>
-        )}
-      </div>
+              <span>{outcomesAvailable ? 'outcomes enriched' : 'outcomes pending'}</span>
+            </>
+          )}
+        </div>
+      )}
 
-      {/* ---- Footer / help ---- */}
-      <div style={{ marginTop: 24, fontSize: 12, color: '#9ca3af' }}>
-        <p style={{ margin: 0 }}>
-          Confidence: high (≥10 prior games, ≥12 AB in L7d, pitcher form known,
-          ≤2 features missing) · medium · low (thin data or ≥4 features missing).
-          Chip triggers are evidence-only — a chip never fires without underlying
-          data. Click a player to drill in.
-        </p>
-      </div>
+      {/* ---- Board ---- */}
+      {loading && <p style={{ color: 'var(--muted)' }}>Loading…</p>}
+      {err && (
+        <div style={{
+          padding: 10, background: 'rgba(239,68,68,0.08)',
+          border: '1px solid rgba(239,68,68,0.30)', borderRadius: 6,
+          color: '#fca5a5', fontSize: 13,
+        }}>
+          <strong>Failed to load:</strong> {err}
+        </div>
+      )}
+      {!loading && !err && bundle && bundle.rows.length === 0 && (
+        <div style={{
+          padding: 12, background: 'var(--panel-2)',
+          border: '1px solid var(--border)', borderRadius: 6, fontSize: 13,
+        }}>
+          <p style={{ margin: 0 }}>
+            No Hits data for {date}. Pregame snapshot may not have run yet, or the
+            date has no scheduled games.
+          </p>
+          {date === today && (
+            <p style={{ margin: '6px 0 0', color: 'var(--muted)', fontSize: 12 }}>
+              Try <code style={{ background: 'var(--panel)', padding: '1px 4px', borderRadius: 3 }}>npm run snapshot:hits:today</code>, or
+              wait for the nightly cron (Phase 4.7).
+            </p>
+          )}
+        </div>
+      )}
+      {!loading && !err && bundle && bundle.rows.length > 0 && (
+        <HitsBoard
+          rows={bundle.rows}
+          ranker={ranker}
+          limit={validLimit}
+          showOutcomeBadges={showOutcomeBadges}
+          pitcherNames={pitcherNames}
+        />
+      )}
     </div>
   );
 }
 
-// -------------------------------------------------------------------
-// Small style helpers — keep the palette consistent with existing pages
-// without pulling in a new CSS file.
-// -------------------------------------------------------------------
+// ---- Style helpers (dark palette, small) ----
 
-function tabStyle(active: boolean): React.CSSProperties {
+function segGroup(): React.CSSProperties {
   return {
-    padding: '8px 16px',
-    background: active ? '#111827' : '#f9fafb',
-    color: active ? '#f9fafb' : '#111827',
-    border: '1px solid ' + (active ? '#111827' : '#d1d5db'),
+    display: 'inline-flex',
+    background: 'var(--panel-2)',
+    border: '1px solid var(--border)',
     borderRadius: 6,
-    cursor: 'pointer',
-    fontWeight: active ? 600 : 500,
+    padding: 2,
   };
 }
-
-function pillStyle(active: boolean): React.CSSProperties {
+function segBtn(active: boolean): React.CSSProperties {
   return {
-    padding: '4px 12px',
-    background: active ? '#374151' : 'transparent',
-    color: active ? '#f9fafb' : '#374151',
-    border: '1px solid ' + (active ? '#374151' : '#d1d5db'),
-    borderRadius: 999,
-    cursor: 'pointer',
-    fontSize: 13,
-  };
-}
-
-function buttonStyle(active: boolean): React.CSSProperties {
-  return {
-    padding: '4px 10px',
-    background: active ? '#111827' : '#ffffff',
-    color: active ? '#f9fafb' : '#111827',
-    border: '1px solid #d1d5db',
+    padding: '5px 12px',
+    background: active ? 'var(--accent)' : 'transparent',
+    color: active ? 'var(--bg)' : 'var(--muted)',
+    border: 'none',
     borderRadius: 4,
-    fontSize: 13,
+    fontSize: 12,
+    fontWeight: active ? 700 : 500,
+    letterSpacing: active ? 0.3 : 0,
+    cursor: active ? 'default' : 'pointer',
+    transition: 'background 120ms',
+  };
+}
+function btn(active: boolean): React.CSSProperties {
+  return {
+    padding: '4px 9px',
+    background: active ? 'var(--accent)' : 'var(--panel-2)',
+    color: active ? 'var(--bg)' : 'var(--text)',
+    border: '1px solid var(--border)',
+    borderRadius: 6,
+    fontSize: 12,
     cursor: active ? 'default' : 'pointer',
   };
 }

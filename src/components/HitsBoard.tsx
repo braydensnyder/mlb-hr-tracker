@@ -1,15 +1,10 @@
 /**
- * HitsBoard — ranked list for one of the two Hits rankers (1+ or 2+).
+ * HitsBoard — compact dark-theme ranked list for one of the two Hits
+ * rankers (1+ or 2+). Visual pass — no scoring logic here.
  *
- * Kept intentionally simple. The four questions the page must answer:
- *   Who is most likely to get at least one hit today? / 2+?
- *   Why?
- *   How has this ranker performed?  (answered on the Backtest page)
- *   Which lineup slot / matchup?
- *
- * Every column pulls only from data the row carries. No cross-refs,
- * no computed-in-component metrics. If the value is null, the cell
- * shows "—" — never a fake zero.
+ * Matches the rest of the app: dark navy rows, high-contrast text,
+ * bold player names, muted secondaries, chip overflow, thin game
+ * dividers. All colours pulled from the CSS variables in index.css.
  */
 import { Link } from 'react-router-dom';
 import type { HitBoardRow } from '../lib/supabase';
@@ -20,25 +15,16 @@ interface Props {
   rows: HitBoardRow[];
   ranker: Ranker;
   limit: number;
-  showOutcomeBadges: boolean;    // true when displaying a past date with outcomes enriched
+  showOutcomeBadges: boolean;
+  pitcherNames: Map<number, string>;
 }
 
-/** How many reason chips to render per row. Keeps the board scannable. */
 const MAX_CHIPS_PER_ROW = 3;
 
 interface DisplayChip { label: string; tone: 'good' | 'bad' | 'neutral'; kind: string; detail?: string }
 
-/** Extract chip list from the row's contributions blob. Contributions
- *  come from HitTargetContributions which doesn't include chips
- *  directly — the chips live at the row level (from pickHitReasonChips
- *  in hitStats). But the snapshot writer only persists contributions,
- *  not the pre-computed chips. So we derive chips inline from features
- *  present in contributions.base_features. Keeps chip logic reusable
- *  without adding a separate DB column.
- *
- *  This is a small, evidence-only chip picker — mirror of the one in
- *  src/lib/hitStats.ts but simpler because we're only surfacing the
- *  top few. Never fires without underlying data. */
+/** Short evidence-only chips. Never fires without underlying data.
+ *  Labels tightened per the UI pass. */
 function pickTopChips(row: HitBoardRow, ranker: Ranker): DisplayChip[] {
   const contribs = (ranker === '1plus' ? row.contributions_1plus_json : row.contributions_2plus_json) ?? {};
   const base = (contribs as any).base_features ?? {};
@@ -60,12 +46,12 @@ function pickTopChips(row: HitBoardRow, ranker: Ranker): DisplayChip[] {
   if (hitRateL7 != null && abL7 != null && abL7 >= 12) {
     if (hitRateL7 >= 0.32) {
       chips.push({ kind: 'hot_recent', tone: 'good',
-        label: `Hot L7 ${(hitRateL7 * 100).toFixed(0)}%`,
-        detail: `${Math.round(hitRateL7 * abL7)}/${abL7} in L7d` });
+        label: `Hot L7`,
+        detail: `${Math.round(hitRateL7 * abL7)}/${abL7} = ${(hitRateL7 * 100).toFixed(0)}% in L7d` });
     } else if (hitRateL7 <= 0.15) {
       chips.push({ kind: 'cold_recent', tone: 'bad',
-        label: `Cold L7 ${(hitRateL7 * 100).toFixed(0)}%`,
-        detail: `${Math.round(hitRateL7 * abL7)}/${abL7} in L7d` });
+        label: `Cold L7`,
+        detail: `${Math.round(hitRateL7 * abL7)}/${abL7} = ${(hitRateL7 * 100).toFixed(0)}% in L7d` });
     }
   }
 
@@ -73,7 +59,7 @@ function pickTopChips(row: HitBoardRow, ranker: Ranker): DisplayChip[] {
     const multi = f('multi_hit_rate_l10g_asof');
     if (multi != null && multi >= 0.30) {
       chips.push({ kind: 'multi_hit_trend', tone: 'good',
-        label: `Multi-hit ${Math.round(multi * 10)}/10`,
+        label: `Multi ${Math.round(multi * 10)}/10`,
         detail: `${Math.round(multi * 10)} of last 10 games ≥ 2 H` });
     }
   }
@@ -91,8 +77,8 @@ function pickTopChips(row: HitBoardRow, ranker: Ranker): DisplayChip[] {
       detail: 'Dominant K pitcher' });
   } else if (pK9 != null && pK9 <= 7) {
     chips.push({ kind: 'low_k_pitcher', tone: 'good',
-      label: `Low K/9 ${pK9.toFixed(1)}`,
-      detail: 'Contact-friendly pitcher' });
+      label: `Low K/9`,
+      detail: `${pK9.toFixed(1)} K/9 — contact-friendly` });
   }
 
   const platoon = f('platoon_hit_rate_asof');
@@ -109,44 +95,90 @@ function pickTopChips(row: HitBoardRow, ranker: Ranker): DisplayChip[] {
       detail: `~${expectedPa.toFixed(2)} expected PA` });
   }
 
-  // Prioritize by tone (good first when the score is high, bad first
-  // when the score is low), then keep the first MAX_CHIPS_PER_ROW.
+  // Order by tone (good first when the score is high, bad first when low).
   const prob = ranker === '1plus' ? row.hit_prob_1plus : row.hit_prob_2plus;
   if (prob != null && prob >= 0.55) {
     chips.sort((a, b) => (a.tone === 'good' ? -1 : 1) - (b.tone === 'good' ? -1 : 1));
   } else {
     chips.sort((a, b) => (a.tone === 'bad' ? -1 : 1) - (b.tone === 'bad' ? -1 : 1));
   }
-  return chips.slice(0, MAX_CHIPS_PER_ROW);
-}
-
-function confidenceStyle(conf: string | null): React.CSSProperties {
-  if (conf === 'high') return { color: '#059669', fontWeight: 600 };
-  if (conf === 'low') return { color: '#d97706', fontWeight: 600 };
-  return { color: '#6b7280', fontWeight: 500 };
+  return chips;
 }
 
 function chipStyle(tone: 'good' | 'bad' | 'neutral'): React.CSSProperties {
-  const bg = tone === 'good' ? '#dcfce7' : tone === 'bad' ? '#fee2e2' : '#f3f4f6';
-  const fg = tone === 'good' ? '#166534' : tone === 'bad' ? '#991b1b' : '#374151';
+  // Dark-theme palette that reads on --panel and --panel-2.
+  const bg = tone === 'good' ? 'rgba(74,222,128,0.14)'
+           : tone === 'bad'  ? 'rgba(239,68,68,0.14)'
+           :                    'rgba(133,147,184,0.12)';
+  const fg = tone === 'good' ? '#4ade80'
+           : tone === 'bad'  ? '#fca5a5'
+           :                    '#8593b8';
   return {
     background: bg, color: fg,
-    padding: '2px 8px', borderRadius: 12, fontSize: 12, whiteSpace: 'nowrap',
+    padding: '1px 8px', borderRadius: 10, fontSize: 11, whiteSpace: 'nowrap',
     marginRight: 4, marginBottom: 2, display: 'inline-block',
+    border: `1px solid ${fg}22`,
   };
 }
 
-function outcomeBadge(row: HitBoardRow): { text: string; bg: string; fg: string } | null {
-  if (row.hits == null) return null;
-  if (row.hits >= 2) return { text: `${row.hits}H`, bg: '#166534', fg: '#f0fdf4' };
-  if (row.hits === 1) return { text: '1H', bg: '#0369a1', fg: '#f0f9ff' };
-  return { text: '0H', bg: '#9ca3af', fg: '#f9fafb' };
+function confidencePill(conf: string | null): React.ReactNode {
+  if (!conf) return <span style={{ color: '#4b5878', fontSize: 11 }}>—</span>;
+  const map: Record<string, { text: string; fg: string; bg: string }> = {
+    high:   { text: 'HIGH', fg: '#4ade80', bg: 'rgba(74,222,128,0.10)' },
+    medium: { text: 'MED',  fg: '#8593b8', bg: 'rgba(133,147,184,0.08)' },
+    low:    { text: 'LOW',  fg: '#8593b8', bg: 'rgba(133,147,184,0.08)' },
+  };
+  const s = map[conf] ?? map.medium;
+  return (
+    <span style={{
+      background: s.bg, color: s.fg,
+      padding: '1px 7px', borderRadius: 4, fontSize: 10,
+      fontWeight: 600, letterSpacing: 0.4, textTransform: 'uppercase',
+      border: `1px solid ${s.fg}22`,
+    }}>{s.text}</span>
+  );
 }
 
-export default function HitsBoard({ rows, ranker, limit, showOutcomeBadges }: Props) {
+function outcomeBadge(row: HitBoardRow): React.ReactNode {
+  if (row.hits == null) return <span style={{ color: '#4b5878', fontSize: 11 }}>—</span>;
+  if (row.hits >= 2) {
+    return <span style={{
+      background: 'rgba(74,222,128,0.18)', color: '#4ade80',
+      padding: '1px 7px', borderRadius: 4, fontSize: 11, fontWeight: 700,
+      border: '1px solid #4ade8033',
+    }}>{row.hits}H</span>;
+  }
+  if (row.hits === 1) {
+    return <span style={{
+      background: 'rgba(255,209,102,0.15)', color: '#ffd166',
+      padding: '1px 7px', borderRadius: 4, fontSize: 11, fontWeight: 600,
+      border: '1px solid #ffd16633',
+    }}>1H</span>;
+  }
+  return <span style={{
+    background: 'rgba(133,147,184,0.08)', color: '#8593b8',
+    padding: '1px 7px', borderRadius: 4, fontSize: 11,
+    border: '1px solid #8593b833',
+  }}>0H</span>;
+}
+
+/** Format opposing-pitcher cell: "Paul Skenes (R)". Falls back to id if
+ *  the catalog didn't resolve the name. Never invents a name. */
+function formatOpposingPitcher(id: number | null, hand: string | null, pitcherNames: Map<number, string>): React.ReactNode {
+  if (id == null) return <span style={{ color: '#4b5878' }}>—</span>;
+  const name = pitcherNames.get(id) ?? `#${id}`;
+  return (
+    <span style={{ color: '#c8d3ee' }} title={pitcherNames.has(id) ? `pitcher_id=${id}` : 'not in players catalog — showing id'}>
+      {name}{hand ? <span style={{ color: '#8593b8' }}> ({hand})</span> : null}
+    </span>
+  );
+}
+
+export default function HitsBoard({ rows, ranker, limit, showOutcomeBadges, pitcherNames }: Props) {
   const rankKey = ranker === '1plus' ? 'rank_1plus' : 'rank_2plus';
   const probKey = ranker === '1plus' ? 'hit_prob_1plus' : 'hit_prob_2plus';
   const confKey = ranker === '1plus' ? 'confidence_1plus' : 'confidence_2plus';
+  const probLabel = ranker === '1plus' ? 'P(1+)' : 'P(2+)';
 
   const sorted = rows
     .filter((r) => r[rankKey] != null)
@@ -154,83 +186,93 @@ export default function HitsBoard({ rows, ranker, limit, showOutcomeBadges }: Pr
     .slice(0, limit);
 
   if (sorted.length === 0) {
-    return <p style={{ color: '#6b7280' }}>No rows to display.</p>;
+    return <p style={{ color: 'var(--muted)' }}>No rows to display.</p>;
   }
+
+  // Thin game divider: mark the row where game_pk changes from the previous.
+  let prevGamePk: number | null = null;
 
   return (
     <div style={{ overflowX: 'auto' }}>
-      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14 }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
         <thead>
-          <tr style={{ borderBottom: '2px solid #e5e7eb', textAlign: 'left' }}>
-            <th style={{ padding: '8px 10px', width: 40 }}>#</th>
-            <th style={{ padding: '8px 10px' }}>Player</th>
-            <th style={{ padding: '8px 10px' }}>Team → Opp</th>
-            <th style={{ padding: '8px 10px', textAlign: 'right' }}>
-              P({ranker === '1plus' ? '≥1 Hit' : '≥2 Hits'})
-            </th>
-            <th style={{ padding: '8px 10px', textAlign: 'center', width: 60 }}>Slot</th>
-            <th style={{ padding: '8px 10px' }}>Opp Pitcher</th>
-            <th style={{ padding: '8px 10px', width: 80 }}>Conf</th>
-            <th style={{ padding: '8px 10px' }}>Why</th>
-            {showOutcomeBadges && <th style={{ padding: '8px 10px', width: 60 }}>Actual</th>}
+          <tr style={{ color: 'var(--muted)', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+            <th style={{ padding: '6px 8px', textAlign: 'left', width: 32 }}>#</th>
+            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Player</th>
+            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Matchup</th>
+            <th style={{ padding: '6px 8px', textAlign: 'right' }}>{probLabel}</th>
+            <th style={{ padding: '6px 8px', textAlign: 'center', width: 40 }}>Slot</th>
+            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Opp Pitcher</th>
+            <th style={{ padding: '6px 8px', textAlign: 'center', width: 48 }}>Conf</th>
+            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Why</th>
+            {showOutcomeBadges && <th style={{ padding: '6px 8px', textAlign: 'center', width: 48 }}>Actual</th>}
           </tr>
         </thead>
         <tbody>
-          {sorted.map((r) => {
+          {sorted.map((r, idx) => {
             const rank = r[rankKey] as number;
             const prob = r[probKey];
-            const conf = r[confKey];
-            const chips = pickTopChips(r, ranker);
-            const outcome = showOutcomeBadges ? outcomeBadge(r) : null;
+            const conf = r[confKey] as string | null;
+            const allChips = pickTopChips(r, ranker);
+            const visible = allChips.slice(0, MAX_CHIPS_PER_ROW);
+            const overflow = allChips.length - visible.length;
+
+            const newGame = r.game_pk !== prevGamePk && idx > 0;
+            prevGamePk = r.game_pk;
+
+            const zebra = idx % 2 === 0 ? 'var(--panel)' : 'var(--panel-2)';
             const rowStyle: React.CSSProperties = {
-              borderBottom: '1px solid #f3f4f6',
-              backgroundColor: rank <= 3 ? '#fafaf9' : 'transparent',
+              background: zebra,
+              borderTop: newGame ? '1px solid var(--border)' : '1px solid rgba(36,51,88,0.35)',
             };
+
             return (
               <tr key={r.player_id} style={rowStyle}>
-                <td style={{ padding: '10px', fontWeight: 600, color: rank <= 3 ? '#111827' : '#6b7280' }}>{rank}</td>
-                <td style={{ padding: '10px' }}>
-                  <Link to={`/hits/${r.target_date}/${r.player_id}`} style={{ color: '#111827', fontWeight: 500 }}>
+                <td style={{ padding: '8px', color: rank <= 3 ? 'var(--accent-2)' : 'var(--muted)', fontWeight: rank <= 3 ? 700 : 500, fontVariantNumeric: 'tabular-nums' }}>{rank}</td>
+                <td style={{ padding: '8px' }}>
+                  <Link to={`/hits/${r.target_date}/${r.player_id}`} style={{ color: 'var(--text)', fontWeight: 600, textDecoration: 'none' }}>
                     {r.player_name}
                   </Link>
                   {r.lineup_status === 'pending' && (
-                    <span style={{ color: '#d97706', fontSize: 11, marginLeft: 6 }}>pending</span>
+                    <span style={{ color: 'var(--accent-2)', fontSize: 10, marginLeft: 6, letterSpacing: 0.4 }}>PENDING</span>
                   )}
                 </td>
-                <td style={{ padding: '10px', color: '#6b7280' }}>
+                <td style={{ padding: '8px', color: 'var(--muted)', fontSize: 12 }}>
                   {r.team} → {r.opponent ?? '—'}
                 </td>
-                <td style={{ padding: '10px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                <td style={{ padding: '8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: 'var(--text)', fontWeight: 500 }}>
                   {prob != null ? `${(Number(prob) * 100).toFixed(1)}%` : '—'}
                 </td>
-                <td style={{ padding: '10px', textAlign: 'center', color: '#6b7280' }}>
+                <td style={{ padding: '8px', textAlign: 'center', color: 'var(--muted)', fontVariantNumeric: 'tabular-nums' }}>
                   {r.batting_order_slot ?? '—'}
                 </td>
-                <td style={{ padding: '10px', color: '#6b7280', fontSize: 13 }}>
-                  {r.opposing_starter_id != null
-                    ? <span>#{r.opposing_starter_id}{r.opposing_starter_hand ? ` (${r.opposing_starter_hand})` : ''}</span>
-                    : '—'}
+                <td style={{ padding: '8px', fontSize: 12 }}>
+                  {formatOpposingPitcher(r.opposing_starter_id, r.opposing_starter_hand, pitcherNames)}
                 </td>
-                <td style={{ padding: '10px', ...confidenceStyle(conf as string | null) }}>
-                  {conf ?? '—'}
+                <td style={{ padding: '8px', textAlign: 'center' }}>
+                  {confidencePill(conf)}
                 </td>
-                <td style={{ padding: '10px' }}>
-                  {chips.length === 0
-                    ? <span style={{ color: '#9ca3af', fontSize: 12 }}>no chips</span>
-                    : chips.map((c) => (
-                        <span key={c.kind} style={chipStyle(c.tone)} title={c.detail ?? ''}>
-                          {c.label}
-                        </span>
-                      ))}
+                <td style={{ padding: '8px' }}>
+                  {visible.length === 0
+                    ? <span style={{ color: '#4b5878', fontSize: 11 }}>—</span>
+                    : (
+                      <>
+                        {visible.map((c) => (
+                          <span key={c.kind} style={chipStyle(c.tone)} title={c.detail ?? ''}>
+                            {c.label}
+                          </span>
+                        ))}
+                        {overflow > 0 && (
+                          <span style={{ color: 'var(--muted)', fontSize: 11, marginLeft: 2 }} title={allChips.slice(MAX_CHIPS_PER_ROW).map((c) => c.label).join(' · ')}>
+                            +{overflow} more
+                          </span>
+                        )}
+                      </>
+                    )}
                 </td>
                 {showOutcomeBadges && (
-                  <td style={{ padding: '10px', textAlign: 'center' }}>
-                    {outcome
-                      ? <span style={{
-                          background: outcome.bg, color: outcome.fg,
-                          padding: '2px 8px', borderRadius: 4, fontSize: 12, fontWeight: 600,
-                        }}>{outcome.text}</span>
-                      : <span style={{ color: '#9ca3af', fontSize: 12 }}>—</span>}
+                  <td style={{ padding: '8px', textAlign: 'center' }}>
+                    {outcomeBadge(r)}
                   </td>
                 )}
               </tr>
