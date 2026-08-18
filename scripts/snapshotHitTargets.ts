@@ -437,8 +437,15 @@ function makeUniverseRow(r: RankedTarget, targetDate: string, pregameRunAt: stri
 }
 
 function makeSnapshotRow(r: RankedTarget, targetDate: string, pregameRunAt: string, snapshotType: 'pregame' | 'simulated'): Record<string, unknown> {
+  // Reuse the universe row shape but STRIP captured_at — that column
+  // exists on hit_target_universe only. The snapshot table uses
+  // snapshot_at (row-write time) + pregame_run_at (frozen decision
+  // time) instead. Two-tables-mirror-HR-pattern design has them
+  // deliberately distinct.
+  const { captured_at: _dropped, ...universeShape } = makeUniverseRow(r, targetDate, pregameRunAt);
+  void _dropped;
   return {
-    ...makeUniverseRow(r, targetDate, pregameRunAt),
+    ...universeShape,
     snapshot_at: pregameRunAt,
     pregame_run_at: pregameRunAt,
     snapshot_type: snapshotType,
