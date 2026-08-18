@@ -1552,6 +1552,7 @@ export interface HitBoardRow {
   /** True when this row came from hit_target_snapshots — meaning the
    *  outcome fields below MAY have data. Live-view rows carry nulls. */
   is_snapshot_row: boolean;
+  snapshot_type: 'pregame' | 'simulated' | null;
   hits: number | null;
   at_bats: number | null;
   hit_1plus: boolean | null;
@@ -1566,6 +1567,15 @@ export interface HitBoardBundle {
   source: 'universe' | 'snapshots';
   model_version: number;
   rows: HitBoardRow[];
+  /** For snapshot-source bundles: 'pregame' when the row was written
+   *  before first pitch, 'simulated' when reconstructed after the
+   *  fact via backfill:hit-snapshots. Null when reading the live
+   *  universe (which has no snapshot_type concept). */
+  snapshot_type: 'pregame' | 'simulated' | null;
+  /** Bundle-level outcome flag — true when at least one row has
+   *  outcome_enriched_at set. Drives success highlighting + Top-N
+   *  summary rendering on the /hits page. */
+  outcomes_enriched: boolean;
   /** Model identity + validation state — the /hits page reads this to
    *  decide whether to show the EXPERIMENTAL badge. */
   model_1plus_id: string | null;
@@ -1624,10 +1634,11 @@ export async function fetchHitTargetsForDate(
       if (/does not exist|schema cache/i.test(error.message)) return [];
       throw new Error(`hit_target_universe read: ${error.message}`);
     }
-    return ((data ?? []) as unknown as Array<Omit<HitBoardRow, 'is_snapshot_row' | 'hits' | 'at_bats' | 'hit_1plus' | 'hit_2plus' | 'doubles' | 'triples' | 'outcome_enriched_at'>>)
+    return ((data ?? []) as unknown as Array<Omit<HitBoardRow, 'is_snapshot_row' | 'snapshot_type' | 'hits' | 'at_bats' | 'hit_1plus' | 'hit_2plus' | 'doubles' | 'triples' | 'outcome_enriched_at'>>)
       .map((r) => ({
         ...r,
         is_snapshot_row: false,
+        snapshot_type: null,
         hits: null, at_bats: null, hit_1plus: null, hit_2plus: null,
         doubles: null, triples: null, outcome_enriched_at: null,
       }));
@@ -1645,6 +1656,7 @@ export async function fetchHitTargetsForDate(
         'confidence_2plus, contributions_2plus_json, ' +
         'flags, model_config_id_1plus, model_config_hash_1plus, ' +
         'model_config_id_2plus, model_config_hash_2plus, ' +
+        'snapshot_type, ' +
         'hits, at_bats, hit_1plus, hit_2plus, doubles, triples, outcome_enriched_at',
       )
       .eq('target_date', date)
@@ -1669,11 +1681,20 @@ export async function fetchHitTargetsForDate(
   }
 
   const sample = rows[0] ?? null;
+  // Bundle-level snapshot_type: rows written on the same date/version
+  // share the same snapshot_type by design (writer stamps one value
+  // per run). Read from the first snapshot row when the source is
+  // snapshots; null for live-universe reads.
+  const snapshot_type: HitBoardBundle['snapshot_type'] =
+    source === 'snapshots' ? (sample?.snapshot_type ?? null) : null;
+  const outcomes_enriched = rows.some((r) => r.outcome_enriched_at != null);
   return {
     date,
     source,
     model_version: modelVersion,
     rows,
+    snapshot_type,
+    outcomes_enriched,
     model_1plus_id: sample?.model_config_id_1plus ?? null,
     model_1plus_hash: sample?.model_config_hash_1plus ?? null,
     model_1plus_is_validated: !isExperimentalConfigId(sample?.model_config_id_1plus ?? null),

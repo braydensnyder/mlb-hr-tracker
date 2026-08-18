@@ -139,27 +139,45 @@ function confidencePill(conf: string | null): React.ReactNode {
   );
 }
 
-function outcomeBadge(row: HitBoardRow): React.ReactNode {
+/** Actual-column badge. Coloured against the CURRENT ranker so the
+ *  colour matches whether the row 'succeeded' on the visible board.
+ *
+ *  1+ board:
+ *    hits >= 1  → green   (success on this board)
+ *    hits == 0  → muted grey
+ *
+ *  2+ board:
+ *    hits >= 2  → green   (success on this board)
+ *    hits == 1  → amber   (partial — got a hit but not two)
+ *    hits == 0  → muted grey
+ *
+ *  A player with exactly 1 hit is DELIBERATELY NOT green on the 2+
+ *  board — the user's requirement. */
+function outcomeBadge(row: HitBoardRow, ranker: Ranker): React.ReactNode {
   if (row.hits == null) return <span style={{ color: '#4b5878', fontSize: 11 }}>—</span>;
-  if (row.hits >= 2) {
-    return <span style={{
-      background: 'rgba(74,222,128,0.18)', color: '#4ade80',
-      padding: '1px 7px', borderRadius: 4, fontSize: 11, fontWeight: 700,
-      border: '1px solid #4ade8033',
-    }}>{row.hits}H</span>;
-  }
-  if (row.hits === 1) {
-    return <span style={{
-      background: 'rgba(255,209,102,0.15)', color: '#ffd166',
-      padding: '1px 7px', borderRadius: 4, fontSize: 11, fontWeight: 600,
-      border: '1px solid #ffd16633',
-    }}>1H</span>;
-  }
-  return <span style={{
-    background: 'rgba(133,147,184,0.08)', color: '#8593b8',
-    padding: '1px 7px', borderRadius: 4, fontSize: 11,
-    border: '1px solid #8593b833',
-  }}>0H</span>;
+  const successOnBoard = ranker === '1plus' ? row.hits >= 1 : row.hits >= 2;
+  const partial = ranker === '2plus' && row.hits === 1;
+  const bg = successOnBoard ? 'rgba(74,222,128,0.18)'
+           : partial        ? 'rgba(255,209,102,0.15)'
+           :                  'rgba(133,147,184,0.08)';
+  const fg = successOnBoard ? '#4ade80'
+           : partial        ? '#ffd166'
+           :                  '#8593b8';
+  const weight = successOnBoard ? 700 : partial ? 600 : 500;
+  return (
+    <span style={{
+      background: bg, color: fg,
+      padding: '1px 7px', borderRadius: 4, fontSize: 11, fontWeight: weight,
+      border: `1px solid ${fg}33`,
+    }}>{row.hits}H</span>
+  );
+}
+
+/** Is this row a success on the currently-selected board? Drives
+ *  row-level highlighting when outcomes are enriched. */
+function rowIsSuccess(row: HitBoardRow, ranker: Ranker): boolean {
+  if (row.hits == null) return false;
+  return ranker === '1plus' ? row.hits >= 1 : row.hits >= 2;
 }
 
 /** Format opposing-pitcher cell: "Paul Skenes (R)". Falls back to id if
@@ -224,11 +242,21 @@ export default function HitsBoard({ rows, ranker, limit, showOutcomeBadges, pitc
             const newGame = r.game_pk !== prevGamePk && idx > 0;
             prevGamePk = r.game_pk;
 
+            const isSuccess = showOutcomeBadges && rowIsSuccess(r, ranker);
             const zebra = idx % 2 === 0 ? 'var(--panel)' : 'var(--panel-2)';
-            const rowStyle: React.CSSProperties = {
-              background: zebra,
-              borderTop: newGame ? '1px solid var(--border)' : '1px solid rgba(36,51,88,0.35)',
-            };
+            // Subtle green wash on success rows. Doesn't dominate the
+            // page — a 5-10% overlay + a left-edge stripe so the pattern
+            // is legible without shouting.
+            const rowStyle: React.CSSProperties = isSuccess
+              ? {
+                  background: 'linear-gradient(90deg, rgba(74,222,128,0.09), rgba(74,222,128,0.04))',
+                  borderTop: newGame ? '1px solid var(--border)' : '1px solid rgba(36,51,88,0.35)',
+                  boxShadow: 'inset 3px 0 0 var(--good)',
+                }
+              : {
+                  background: zebra,
+                  borderTop: newGame ? '1px solid var(--border)' : '1px solid rgba(36,51,88,0.35)',
+                };
 
             return (
               <tr key={r.player_id} style={rowStyle}>
@@ -276,7 +304,7 @@ export default function HitsBoard({ rows, ranker, limit, showOutcomeBadges, pitc
                 </td>
                 {showOutcomeBadges && (
                   <td style={{ padding: '8px', textAlign: 'center' }}>
-                    {outcomeBadge(r)}
+                    {outcomeBadge(r, ranker)}
                   </td>
                 )}
               </tr>

@@ -12,6 +12,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { fetchHitTargetsForDate, fetchPlayerIndex, type HitBoardBundle } from '../lib/supabase';
 import { mlbToday, addDays as mlbAddDays } from '../lib/mlbDate';
+import { HIT_MODEL_VERSIONS } from '../lib/hitModels';
 import HitsBoard from '../components/HitsBoard';
 
 type Ranker = '1plus' | '2plus';
@@ -21,6 +22,8 @@ const LIMIT_LABELS: Record<BoardLimit, string> = {
   10: 'Top 10', 25: 'Top 25', 50: 'Top 50', 999: 'Full',
 };
 
+const DEFAULT_MODEL_VERSION = HIT_MODEL_VERSIONS.find((v) => v.is_default)?.version ?? 1;
+
 export default function Hits() {
   const [params, setParams] = useSearchParams();
   const today = mlbToday();
@@ -29,6 +32,15 @@ export default function Hits() {
   const ranker = (params.get('r') === '2plus' ? '2plus' : '1plus') as Ranker;
   const limit = (Number(params.get('n')) as BoardLimit) || 10;
   const validLimit: BoardLimit = ([10, 25, 50, 999] as BoardLimit[]).includes(limit) ? limit : 10;
+  // ?model=v1|v2 — falls back to the HIT_MODEL_VERSIONS is_default entry.
+  const rawModel = params.get('model');
+  const modelVersion: number = (() => {
+    if (rawModel && /^v?(\d+)$/.test(rawModel)) {
+      const n = Number(rawModel.replace(/^v/, ''));
+      if (HIT_MODEL_VERSIONS.some((v) => v.version === n)) return n;
+    }
+    return DEFAULT_MODEL_VERSION;
+  })();
 
   const [bundle, setBundle] = useState<HitBoardBundle | null>(null);
   const [loading, setLoading] = useState(true);
@@ -40,11 +52,11 @@ export default function Hits() {
     let cancelled = false;
     setLoading(true);
     setErr(null);
-    fetchHitTargetsForDate(date, { preferSnapshots: date !== today })
+    fetchHitTargetsForDate(date, { modelVersion, preferSnapshots: date !== today })
       .then((b) => { if (!cancelled) { setBundle(b); setLoading(false); } })
       .catch((e) => { if (!cancelled) { setErr(e instanceof Error ? e.message : String(e)); setLoading(false); } });
     return () => { cancelled = true; };
-  }, [date, today]);
+  }, [date, today, modelVersion]);
 
   // Load the players catalog once — used to resolve opposing-pitcher names.
   useEffect(() => {
@@ -63,12 +75,43 @@ export default function Hits() {
   }, []);
 
   const isPastDate = date < today;
-  const outcomesAvailable = useMemo(
-    () => !!bundle?.rows.some((r) => r.outcome_enriched_at != null),
-    [bundle],
-  );
+  const outcomesAvailable = !!bundle?.outcomes_enriched;
   const showOutcomeBadges = bundle?.source === 'snapshots' && outcomesAvailable;
   const experimental = !!bundle && (!bundle.model_1plus_is_validated || !bundle.model_2plus_is_validated);
+
+  // Snapshot status label. Priority: FINAL beats PREGAME; SIMULATED
+  // always distinct so a backfilled row is never confused with a
+  // real pregame audit record.
+  const snapshotStatus: { label: string; tone: 'good' | 'neutral' | 'warn' } | null = (() => {
+    if (!bundle) return null;
+    if (bundle.source === 'universe') return { label: 'LIVE VIEW', tone: 'neutral' };
+    if (bundle.snapshot_type === 'simulated') return { label: 'SIMULATED HISTORICAL', tone: 'warn' };
+    if (bundle.outcomes_enriched) return { label: 'FINAL — RESULTS ENRICHED', tone: 'good' };
+    return { label: 'PREGAME — FROZEN', tone: 'neutral' };
+  })();
+
+  // Top-N daily summary for the currently-selected ranker.
+  // Uses the outcome field aligned with the ranker (1+ board sums
+  // hit_1plus, 2+ board sums hit_2plus). Only rendered when outcomes
+  // are enriched.
+  const topNSummary = useMemo(() => {
+    if (!bundle || !outcomesAvailable) return null;
+    const rankKey = ranker === '1plus' ? 'rank_1plus' : 'rank_2plus';
+    const outcomeKey = ranker === '1plus' ? 'hit_1plus' : 'hit_2plus';
+    const sorted = bundle.rows
+      .filter((r) => r[rankKey] != null)
+      .sort((a, b) => (a[rankKey] as number) - (b[rankKey] as number));
+    function countHits(n: number) {
+      let hits = 0, total = 0;
+      for (const r of sorted.slice(0, n)) {
+        if (r[outcomeKey] != null) { total += 1; if (r[outcomeKey]) hits += 1; }
+      }
+      return { hits, total };
+    }
+    return {
+      top3: countHits(3), top5: countHits(5), top10: countHits(10), top25: countHits(25),
+    };
+  }, [bundle, ranker, outcomesAvailable]);
 
   function updateParam(k: string, v: string) {
     const next = new URLSearchParams(params);
@@ -149,11 +192,20 @@ export default function Hits() {
         </div>
       )}
 
-      {/* ---- Segmented controls: ranker + limit ---- */}
+      {/* ---- Segmented controls: model + ranker + limit ---- */}
       <div style={{
-        display: 'flex', gap: 12, alignItems: 'center',
+        display: 'flex', gap: 10, alignItems: 'center',
         marginBottom: 10, flexWrap: 'wrap',
       }}>
+        <div style={segGroup()}>
+          {HIT_MODEL_VERSIONS.map((v) => (
+            <button key={v.version} onClick={() => updateParam('model', 'v' + v.version)}
+              style={segBtn(modelVersion === v.version)}
+              title={`${v.label}${v.config_1plus.is_validated ? '' : ' — experimental'}`}>
+              {v.label}
+            </button>
+          ))}
+        </div>
         <div style={segGroup()}>
           {(['1plus', '2plus'] as const).map((r) => (
             <button key={r} onClick={() => updateParam('r', r)} style={segBtn(ranker === r)}>
@@ -170,29 +222,64 @@ export default function Hits() {
         </div>
       </div>
 
-      {/* ---- Source strip (thin) ---- */}
+      {/* ---- Source strip (thin) + snapshot status badge ---- */}
       {bundle && bundle.rows.length > 0 && (
         <div style={{
           display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
           fontSize: 11, color: 'var(--muted)', marginBottom: 6,
         }}>
+          {snapshotStatus && (
+            <span style={statusBadgeStyle(snapshotStatus.tone)}
+                  title="PREGAME — FROZEN: written before first pitch, ranks immutable. FINAL — RESULTS ENRICHED: pregame ranks with actual outcomes filled in. SIMULATED HISTORICAL: reconstructed via backfill AFTER games completed — never confuse with a real pregame audit record.">
+              {snapshotStatus.label}
+            </span>
+          )}
           <span>
             <code style={{ background: 'var(--panel-2)', padding: '1px 5px', borderRadius: 3, color: 'var(--muted)' }}>
               {bundle.source === 'snapshots' ? 'snapshots (frozen)' : 'universe (live)'}
             </code>
           </span>
           <span>·</span>
+          <span>v{bundle.model_version}</span>
+          <span>·</span>
           <span>{bundle.rows.length} starters</span>
-          {isPastDate && (
+          {isPastDate && !outcomesAvailable && (
             <>
               <span>·</span>
-              <span>{outcomesAvailable ? 'outcomes enriched' : 'outcomes pending'}</span>
+              <span>outcomes pending</span>
             </>
           )}
           <span>·</span>
           <span title="The Hit Score column is the ranker's raw sigmoid output ×100. It is NOT an empirically calibrated probability. Ranking within the day is meaningful; the absolute value is not a P(hit).">
             Hit Score = ranker output, not a calibrated probability
           </span>
+        </div>
+      )}
+
+      {/* ---- Top-N daily result summary (only when outcomes enriched) ---- */}
+      {topNSummary && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap',
+          padding: '8px 12px', marginBottom: 10,
+          background: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: 6,
+          fontSize: 13, color: 'var(--text)', fontVariantNumeric: 'tabular-nums',
+        }}>
+          <span style={{ color: 'var(--muted)', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+            {ranker === '1plus' ? '1+ Hit' : '2+ Hits'} results
+          </span>
+          {(['top3', 'top5', 'top10', 'top25'] as const).map((k) => {
+            const n = k === 'top3' ? 3 : k === 'top5' ? 5 : k === 'top10' ? 10 : 25;
+            const s = topNSummary[k];
+            const rate = s.total > 0 ? s.hits / s.total : 0;
+            const tone = s.total === 0 ? 'muted' : rate >= 0.5 ? 'good' : rate >= 0.3 ? 'neutral' : 'weak';
+            const color = tone === 'good' ? 'var(--good)' : tone === 'neutral' ? 'var(--text)' : tone === 'weak' ? '#fca5a5' : 'var(--muted)';
+            return (
+              <span key={k} style={{ display: 'inline-flex', alignItems: 'baseline', gap: 4 }}>
+                <span style={{ color: 'var(--muted)', fontSize: 11 }}>Top {n}:</span>
+                <span style={{ color, fontWeight: 600 }}>{s.hits}/{s.total || n}</span>
+              </span>
+            );
+          })}
         </div>
       )}
 
@@ -262,6 +349,25 @@ function segBtn(active: boolean): React.CSSProperties {
     transition: 'background 120ms',
   };
 }
+function statusBadgeStyle(tone: 'good' | 'neutral' | 'warn'): React.CSSProperties {
+  // Semantic colours for the snapshot-status badge. 'good' = FINAL
+  // enriched (results present). 'warn' = SIMULATED historical
+  // (backfilled, NOT a genuine pregame). 'neutral' = pregame frozen
+  // or live view.
+  const bg = tone === 'good'   ? 'rgba(74,222,128,0.12)'
+           : tone === 'warn'   ? 'rgba(255,209,102,0.10)'
+           :                     'rgba(133,147,184,0.10)';
+  const fg = tone === 'good'   ? 'var(--good)'
+           : tone === 'warn'   ? 'var(--accent-2)'
+           :                     'var(--muted)';
+  return {
+    background: bg, color: fg,
+    padding: '1px 7px', borderRadius: 4, fontSize: 10,
+    fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase',
+    border: `1px solid ${fg}33`,
+  };
+}
+
 function btn(active: boolean): React.CSSProperties {
   return {
     padding: '4px 9px',
