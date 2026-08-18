@@ -55,6 +55,20 @@ export interface HitModelConfig {
   weights: Record<string, number>;
   /** LR bias term (DET usually 0). */
   bias: number;
+  /** Temperature scaling applied BEFORE the sigmoid:
+   *    scaled = linear / temperature
+   *    probability = sigmoid(scaled)   (when transform === 'sigmoid')
+   *
+   *  Higher temperature → softer probabilities (less collapse to 0/1);
+   *  temperature=1 is the neutral default. DET presets derived from
+   *  calibrateHitScore use temperature=10 to match how they were
+   *  designed (calibrateHitScore's deterministicScore does sigmoid(s/10)).
+   *
+   *  Temperature is part of the model identity — it's included in the
+   *  canonical config hash. Rank ordering is invariant to temperature
+   *  (sigmoid is monotonic), so historical ranks under any temperature
+   *  remain honest even when probabilities render differently. */
+  temperature: number;
   /** Post-linear transform: sigmoid → probability in (0,1); none = raw score. */
   transform: 'sigmoid' | 'none';
   /** Which prediction outcome this ranker targets. Persisted for backtest. */
@@ -121,7 +135,9 @@ function roundForHash(v: unknown): unknown {
   return v;
 }
 
-/** Deterministic JSON with sorted keys and rounded numbers. */
+/** Deterministic JSON with sorted keys and rounded numbers. Any change
+ *  to this shape (new hashed field, new required key) changes every
+ *  config's hash, so this is the one place that pins model identity. */
 export function canonicalConfigJson(cfg: HitModelConfig): string {
   const shape = {
     kind: cfg.kind,
@@ -130,6 +146,7 @@ export function canonicalConfigJson(cfg: HitModelConfig): string {
     fixed_standardization: cfg.fixed_standardization,
     weights: cfg.weights,
     bias: cfg.bias,
+    temperature: cfg.temperature ?? 1, // NEW — pre-migration configs default to 1
     transform: cfg.transform,
     target: cfg.target,
   };
@@ -212,14 +229,17 @@ export const HIT_MODEL_1PLUS: HitModelConfig = {
     weather_wind_mph:         0,
   },
   bias: 0,
+  temperature: 10,                      // matches calibrateHitScore's sigmoid(s/10)
   transform: 'sigmoid',
   target: 'hit_1plus',
   is_validated: false,
   promoted_from_walkforward: null,
   notes:
     'Experimental placeholder. Deterministic contact-first preset from ' +
-    'calibrateHitScore. No walk-forward validation yet. Rankings must be ' +
-    'labelled EXPERIMENTAL in the UI until a validated winner replaces this.',
+    'calibrateHitScore. Temperature=10 matches the /10 scaling those ' +
+    'weights were designed under. No walk-forward validation yet. ' +
+    'Rankings must be labelled EXPERIMENTAL in the UI until a validated ' +
+    'winner replaces this.',
 };
 
 export const HIT_MODEL_2PLUS: HitModelConfig = {
@@ -246,14 +266,16 @@ export const HIT_MODEL_2PLUS: HitModelConfig = {
     multi_hit_rate_l10g_asof: 4,
   },
   bias: 0,
+  temperature: 10,                      // matches calibrateHitScore's sigmoid(s/10)
   transform: 'sigmoid',
   target: 'hit_2plus',
   is_validated: false,
   promoted_from_walkforward: null,
   notes:
     'Experimental placeholder. Deterministic 2+ preset lifts multi_hit_rate + ' +
-    'expected_pa. Showed promising early Top-5 lift but not yet validated on ' +
-    'a walk-forward sample large enough to clear the promotion guardrails.',
+    'expected_pa. Temperature=10 matches the /10 scaling those weights were ' +
+    'designed under. Showed promising early Top-5 lift but not yet validated ' +
+    'on a walk-forward sample large enough to clear the promotion guardrails.',
 };
 
 /** Cached at module-load so writers don't recompute per row. Safe to

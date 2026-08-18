@@ -381,7 +381,17 @@ export function scoreHit(
     features_used.push(key);
   }
 
-  const probability = cfg.transform === 'sigmoid' ? sigmoid(linear) : linear;
+  // Temperature scaling — applies ONLY to the sigmoid branch. linear_score
+  // (persisted below) stays unscaled so historical rows can be re-scored
+  // under any temperature without touching stored feature values.
+  //   scaled = linear / temperature
+  //   probability = sigmoid(scaled)
+  // Default temperature=1 preserves pre-fix behaviour for configs that
+  // don't set it (interface has no `?`; TypeScript enforces the field
+  // but the ?? guard also protects any runtime deserialisation edge).
+  const temperature = cfg.temperature > 0 ? cfg.temperature : 1;
+  const scaled = linear / temperature;
+  const probability = cfg.transform === 'sigmoid' ? sigmoid(scaled) : linear;
 
   return {
     base_features,
