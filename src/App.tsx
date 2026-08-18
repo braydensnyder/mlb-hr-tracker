@@ -4,6 +4,7 @@ import PlayerDetail from './pages/PlayerDetail';
 import Matchups from './pages/Matchups';
 import HrTargets from './pages/HrTargets';
 import Hits from './pages/Hits';
+import HitsBacktest from './pages/HitsBacktest';
 import TonightsCard from './pages/TonightsCard';
 import TeamBoard from './pages/TeamBoard';
 import ParlayLab from './pages/ParlayLab';
@@ -55,6 +56,7 @@ export default function App() {
         <Route path="/learning/compare/:date" element={<CompareModelsPage />} />
         <Route path="/targets" element={<HrTargets />} />
         <Route path="/hits" element={<Hits />} />
+        <Route path="/hits/backtest" element={<HitsBacktest />} />
         <Route path="/odds" element={<Odds />} />
         <Route path="/backtest" element={<Backtest />} />
         <Route path="/player/:playerId" element={<PlayerDetail />} />

@@ -1703,3 +1703,274 @@ export async function fetchHitTargetsForDate(
     model_2plus_is_validated: !isExperimentalConfigId(sample?.model_config_id_2plus ?? null),
   };
 }
+
+// -----------------------------------------------------------------------------
+//  Hits backtest — v1 vs v2 side-by-side (Phase C)
+//
+//  Everything below is read-only. It aggregates client-side from
+//  hit_target_snapshots so no schema or writer changes are needed.
+//  The disagreement fetcher joins the two model versions on
+//  (target_date, player_id) so we can inspect exactly which players
+//  each ranker put in its Top-N but the other buried.
+// -----------------------------------------------------------------------------
+
+export interface HitBacktestTopN { hits: number; total: number; rate: number }
+
+export interface HitBacktestDayVersion {
+  date: string;
+  model_version: number;
+  snapshot_type: 'pregame' | 'simulated' | null;
+  outcomes_enriched: boolean;
+  slate_size: number;
+  baseline_1plus: number;                  // fraction of scored rows that recorded ≥1 hit
+  baseline_2plus: number;                  // fraction that recorded ≥2 hits
+  top3_1plus: HitBacktestTopN;
+  top5_1plus: HitBacktestTopN;
+  top10_1plus: HitBacktestTopN;
+  top25_1plus: HitBacktestTopN;
+  top3_2plus: HitBacktestTopN;
+  top5_2plus: HitBacktestTopN;
+  top10_2plus: HitBacktestTopN;
+  top25_2plus: HitBacktestTopN;
+}
+
+export interface HitBacktestRange {
+  from: string;
+  to: string;
+  // Per (date, version) row. Only dates with rows for a version appear
+  // in that version's slice. Unified into one array so the UI can group
+  // as it renders.
+  rows: HitBacktestDayVersion[];
+}
+
+/** Compute Top-N counts within a set of scored rows already sorted
+ *  by rank asc. Truncates to the number of rows actually available
+ *  (Top-3 with only 2 rows returns total=2). */
+function computeTopN(
+  sortedRows: Array<{ hit: boolean | null }>,
+  n: number,
+): HitBacktestTopN {
+  let hits = 0, total = 0;
+  for (let i = 0; i < Math.min(n, sortedRows.length); i++) {
+    const y = sortedRows[i].hit;
+    if (y == null) continue;
+    total += 1;
+    if (y) hits += 1;
+  }
+  return { hits, total, rate: total > 0 ? hits / total : 0 };
+}
+
+/**
+ * Range backtest fetcher. Loads every hit_target_snapshots row in
+ * the date range across ALL model_versions, then aggregates
+ * client-side into per-(date, version) rollups with slate baselines
+ * and Top-N hit counts for both rankers.
+ *
+ * Only rows with outcomes enriched contribute to the Top-N tallies.
+ * Dates without enrichment for a version still appear in the result
+ * with outcomes_enriched=false so the UI can render 'pending' cells.
+ */
+export async function fetchHitBacktestForRange(
+  from: string,
+  to: string,
+): Promise<HitBacktestRange> {
+  // Load per-row essentials: date, version, snapshot_type, ranks, outcomes.
+  const all: Array<{
+    target_date: string;
+    model_version: number;
+    snapshot_type: 'pregame' | 'simulated' | null;
+    rank_1plus: number | null;
+    rank_2plus: number | null;
+    hit_1plus: boolean | null;
+    hit_2plus: boolean | null;
+    outcome_enriched_at: string | null;
+  }> = [];
+  const PAGE = 1000;
+  for (let page = 0; page < 200; page++) {
+    const { data, error } = await supabase
+      .from('hit_target_snapshots')
+      .select(
+        'target_date, model_version, snapshot_type, ' +
+        'rank_1plus, rank_2plus, hit_1plus, hit_2plus, outcome_enriched_at',
+      )
+      .gte('target_date', from)
+      .lte('target_date', to)
+      .range(page * PAGE, page * PAGE + PAGE - 1);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return { from, to, rows: [] };
+      throw new Error(`hit_target_snapshots backtest read: ${error.message}`);
+    }
+    const rows = (data ?? []) as unknown as typeof all;
+    all.push(...rows);
+    if (rows.length < PAGE) break;
+  }
+
+  // Group by (date, version).
+  const groups = new Map<string, typeof all>();
+  for (const r of all) {
+    const key = `${r.target_date}|${r.model_version}`;
+    const arr = groups.get(key) ?? [];
+    arr.push(r);
+    groups.set(key, arr);
+  }
+
+  const out: HitBacktestDayVersion[] = [];
+  for (const [key, rows] of groups) {
+    const [date, verStr] = key.split('|');
+    const modelVersion = Number(verStr);
+    const outcomes_enriched = rows.some((r) => r.outcome_enriched_at != null);
+    const scoredForRanker = (rows: typeof all, rankKey: 'rank_1plus' | 'rank_2plus', outcomeKey: 'hit_1plus' | 'hit_2plus') =>
+      rows
+        .filter((r) => r[rankKey] != null)
+        .sort((a, b) => (a[rankKey] as number) - (b[rankKey] as number))
+        .map((r) => ({ hit: r[outcomeKey] }));
+
+    const sorted1 = scoredForRanker(rows, 'rank_1plus', 'hit_1plus');
+    const sorted2 = scoredForRanker(rows, 'rank_2plus', 'hit_2plus');
+
+    // Baselines — fraction of ALL rows (regardless of rank) that
+    // recorded the outcome. Only meaningful when enriched; falls back
+    // to 0 otherwise (UI gates on outcomes_enriched anyway).
+    const baseline_1plus = outcomes_enriched && rows.length > 0
+      ? rows.filter((r) => r.hit_1plus === true).length / rows.filter((r) => r.hit_1plus != null).length
+      : 0;
+    const baseline_2plus = outcomes_enriched && rows.length > 0
+      ? rows.filter((r) => r.hit_2plus === true).length / rows.filter((r) => r.hit_2plus != null).length
+      : 0;
+
+    out.push({
+      date,
+      model_version: modelVersion,
+      snapshot_type: rows[0]?.snapshot_type ?? null,
+      outcomes_enriched,
+      slate_size: rows.length,
+      baseline_1plus, baseline_2plus,
+      top3_1plus:  computeTopN(sorted1, 3),
+      top5_1plus:  computeTopN(sorted1, 5),
+      top10_1plus: computeTopN(sorted1, 10),
+      top25_1plus: computeTopN(sorted1, 25),
+      top3_2plus:  computeTopN(sorted2, 3),
+      top5_2plus:  computeTopN(sorted2, 5),
+      top10_2plus: computeTopN(sorted2, 10),
+      top25_2plus: computeTopN(sorted2, 25),
+    });
+  }
+  out.sort((a, b) => a.date.localeCompare(b.date) || a.model_version - b.model_version);
+  return { from, to, rows: out };
+}
+
+// ---------- Disagreement view ----------
+
+export interface HitDisagreementPlayer {
+  player_id: number;
+  player_name: string;
+  team: string;
+  opponent: string | null;
+  rank_v1: number | null;                  // rank on the SELECTED ranker for v1
+  rank_v2: number | null;                  // rank on the SELECTED ranker for v2
+  rank_diff: number | null;                // v2_rank - v1_rank  (negative = v2 ranks higher)
+  hits: number | null;                     // actual outcome (across ranker's outcome)
+  hit_success: boolean | null;             // hit_1plus or hit_2plus depending on selected ranker
+  hit_prob_v1: number | null;              // sigmoid score persisted per-version
+  hit_prob_v2: number | null;
+}
+
+export interface HitDisagreementResult {
+  date: string;
+  ranker: '1plus' | '2plus';
+  top_n: number;                           // usually 10
+  outcomes_enriched: boolean;
+  v2_only: HitDisagreementPlayer[];        // in v2 Top-N but not v1 Top-N
+  v1_only: HitDisagreementPlayer[];        // in v1 Top-N but not v2 Top-N
+  shared: HitDisagreementPlayer[];         // in both Top-N (sorted by combined rank)
+}
+
+/**
+ * Fetch v1 vs v2 rankings for a single date+ranker and derive the
+ * disagreement sets. Requires both versions to exist in
+ * hit_target_snapshots for the date; missing rows return empty
+ * v2_only / v1_only sections cleanly.
+ */
+export async function fetchHitDisagreement(
+  date: string,
+  ranker: '1plus' | '2plus',
+  opts: { topN?: number } = {},
+): Promise<HitDisagreementResult> {
+  const topN = opts.topN ?? 10;
+  const rankKey = ranker === '1plus' ? 'rank_1plus' : 'rank_2plus';
+  const outcomeKey = ranker === '1plus' ? 'hit_1plus' : 'hit_2plus';
+  const probKey = ranker === '1plus' ? 'hit_prob_1plus' : 'hit_prob_2plus';
+
+  const { data, error } = await supabase
+    .from('hit_target_snapshots')
+    .select(
+      'target_date, model_version, player_id, player_name, team, opponent, ' +
+      'rank_1plus, rank_2plus, hit_prob_1plus, hit_prob_2plus, ' +
+      'hits, hit_1plus, hit_2plus, outcome_enriched_at',
+    )
+    .eq('target_date', date);
+  if (error) {
+    if (/does not exist|schema cache/i.test(error.message)) {
+      return { date, ranker, top_n: topN, outcomes_enriched: false, v2_only: [], v1_only: [], shared: [] };
+    }
+    throw new Error(`disagreement fetch: ${error.message}`);
+  }
+
+  const rows = (data ?? []) as unknown as Array<{
+    target_date: string; model_version: number;
+    player_id: number; player_name: string; team: string; opponent: string | null;
+    rank_1plus: number | null; rank_2plus: number | null;
+    hit_prob_1plus: number | null; hit_prob_2plus: number | null;
+    hits: number | null; hit_1plus: boolean | null; hit_2plus: boolean | null;
+    outcome_enriched_at: string | null;
+  }>;
+
+  const outcomes_enriched = rows.some((r) => r.outcome_enriched_at != null);
+  // Index by (version, player_id) for O(1) join.
+  const byVerPlayer = new Map<string, typeof rows[number]>();
+  for (const r of rows) byVerPlayer.set(`${r.model_version}|${r.player_id}`, r);
+
+  // Distinct player_ids across both versions.
+  const playerIds = new Set<number>(rows.map((r) => r.player_id));
+
+  const players: HitDisagreementPlayer[] = [];
+  for (const pid of playerIds) {
+    const v1 = byVerPlayer.get(`1|${pid}`);
+    const v2 = byVerPlayer.get(`2|${pid}`);
+    // Player identity + outcome — prefer v1 row, fall back to v2 (outcomes are model-agnostic).
+    const idRow = v1 ?? v2!;
+    const r1 = (v1 as any)?.[rankKey] as number | null | undefined ?? null;
+    const r2 = (v2 as any)?.[rankKey] as number | null | undefined ?? null;
+    const p1 = (v1 as any)?.[probKey] as number | null | undefined ?? null;
+    const p2 = (v2 as any)?.[probKey] as number | null | undefined ?? null;
+    const outcomeVal = (v1 as any)?.[outcomeKey] as boolean | null | undefined
+                    ?? (v2 as any)?.[outcomeKey] as boolean | null | undefined
+                    ?? null;
+    const rank_diff = (r1 != null && r2 != null) ? r2 - r1 : null;
+    players.push({
+      player_id: pid,
+      player_name: idRow.player_name,
+      team: idRow.team,
+      opponent: idRow.opponent,
+      rank_v1: r1,
+      rank_v2: r2,
+      rank_diff,
+      hits: idRow.hits,
+      hit_success: outcomeVal ?? null,
+      hit_prob_v1: p1,
+      hit_prob_v2: p2,
+    });
+  }
+
+  const v2_only = players
+    .filter((p) => p.rank_v2 != null && p.rank_v2 <= topN && (p.rank_v1 == null || p.rank_v1 > topN))
+    .sort((a, b) => (a.rank_v2 as number) - (b.rank_v2 as number));
+  const v1_only = players
+    .filter((p) => p.rank_v1 != null && p.rank_v1 <= topN && (p.rank_v2 == null || p.rank_v2 > topN))
+    .sort((a, b) => (a.rank_v1 as number) - (b.rank_v1 as number));
+  const shared = players
+    .filter((p) => p.rank_v1 != null && p.rank_v1 <= topN && p.rank_v2 != null && p.rank_v2 <= topN)
+    .sort((a, b) => Math.min(a.rank_v1 as number, a.rank_v2 as number) - Math.min(b.rank_v1 as number, b.rank_v2 as number));
+
+  return { date, ranker, top_n: topN, outcomes_enriched, v2_only, v1_only, shared };
+}

@@ -9,7 +9,7 @@
  * ranking logic.
  */
 import { useEffect, useMemo, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { fetchHitTargetsForDate, fetchPlayerIndex, type HitBoardBundle } from '../lib/supabase';
 import { mlbToday, addDays as mlbAddDays } from '../lib/mlbDate';
 import { HIT_MODEL_VERSIONS } from '../lib/hitModels';
@@ -126,12 +126,17 @@ export default function Hits() {
         display: 'flex', alignItems: 'baseline', justifyContent: 'space-between',
         flexWrap: 'wrap', gap: 10, marginBottom: 10,
       }}>
-        <h2 style={{
-          margin: 0, fontSize: 14, textTransform: 'uppercase', letterSpacing: 0.8,
-          color: 'var(--muted)',
-        }}>
-          Hits · {date}
-        </h2>
+        <div>
+          <h2 style={{
+            margin: 0, fontSize: 14, textTransform: 'uppercase', letterSpacing: 0.8,
+            color: 'var(--muted)',
+          }}>
+            Hits · {date}
+          </h2>
+          <div style={{ marginTop: 2, fontSize: 11 }}>
+            <Link to="/hits/backtest" style={{ color: 'var(--accent-2)' }}>Backtest · v1 vs v2 →</Link>
+          </div>
+        </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <button onClick={() => updateParam('date', mlbAddDays(date, -1))} style={btn(false)}>◀</button>
           <input
