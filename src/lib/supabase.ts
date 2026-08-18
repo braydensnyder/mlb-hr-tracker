@@ -1508,3 +1508,177 @@ export async function fetchVersionRolling(opts: {
     };
   });
 }
+
+// =============================================================================
+//  Hits tab (mig 021) — read-only fetchers isolated from the HR pipeline
+// =============================================================================
+
+/** One row served to the /hits page. Flattened from hit_target_universe
+ *  or hit_target_snapshots (both tables share the same core columns —
+ *  we merge the shape client-side so components don't care which source). */
+export interface HitBoardRow {
+  target_date: string;
+  player_id: number;
+  player_name: string;
+  team: string;
+  opponent: string | null;
+  game_pk: number | null;
+
+  batting_order_slot: number | null;
+  lineup_status: string;
+  opposing_starter_id: number | null;
+  opposing_starter_hand: string | null;
+
+  hit_prob_1plus: number | null;
+  hit_score_1plus: number | null;
+  rank_1plus: number | null;
+  team_rank_1plus: number | null;
+  confidence_1plus: string | null;
+  contributions_1plus_json: Record<string, unknown> | null;
+
+  hit_prob_2plus: number | null;
+  hit_score_2plus: number | null;
+  rank_2plus: number | null;
+  team_rank_2plus: number | null;
+  confidence_2plus: string | null;
+  contributions_2plus_json: Record<string, unknown> | null;
+
+  flags: string[];
+  model_config_id_1plus: string;
+  model_config_hash_1plus: string;
+  model_config_id_2plus: string;
+  model_config_hash_2plus: string;
+
+  /** True when this row came from hit_target_snapshots — meaning the
+   *  outcome fields below MAY have data. Live-view rows carry nulls. */
+  is_snapshot_row: boolean;
+  hits: number | null;
+  at_bats: number | null;
+  hit_1plus: boolean | null;
+  hit_2plus: boolean | null;
+  doubles: number | null;
+  triples: number | null;
+  outcome_enriched_at: string | null;
+}
+
+export interface HitBoardBundle {
+  date: string;
+  source: 'universe' | 'snapshots';
+  model_version: number;
+  rows: HitBoardRow[];
+  /** Model identity + validation state — the /hits page reads this to
+   *  decide whether to show the EXPERIMENTAL badge. */
+  model_1plus_id: string | null;
+  model_1plus_hash: string | null;
+  model_1plus_is_validated: boolean;
+  model_2plus_id: string | null;
+  model_2plus_hash: string | null;
+  model_2plus_is_validated: boolean;
+}
+
+/** Detect whether a config id string denotes an experimental config.
+ *  The producer of the row is the source of truth (hitModels.ts) but
+ *  we don't want to import that here — the id string prefix is a
+ *  reliable proxy since every experimental config id starts with
+ *  'experimental_'. */
+function isExperimentalConfigId(id: string | null): boolean {
+  return typeof id === 'string' && id.startsWith('experimental_');
+}
+
+/**
+ * Load one date's Hits board. Prefers hit_target_universe (live view)
+ * when target_date == today; falls back to hit_target_snapshots for
+ * past dates so the board reflects the frozen pregame audit record.
+ *
+ * `dateIsToday` should be true when the caller has already anchored the
+ * page date at the Pacific-anchored today. When true and the universe
+ * returns rows, we use those; otherwise we read snapshots (which for
+ * today would exist AFTER Phase 4.7 has run).
+ */
+export async function fetchHitTargetsForDate(
+  date: string,
+  opts: { modelVersion?: number; preferSnapshots?: boolean } = {},
+): Promise<HitBoardBundle> {
+  const modelVersion = opts.modelVersion ?? 1;
+  const preferSnapshots = !!opts.preferSnapshots;
+
+  // Try snapshots first for past dates OR when caller forced it.
+  const trySnapshotsFirst = preferSnapshots;
+
+  async function readUniverse(): Promise<HitBoardRow[]> {
+    const { data, error } = await supabase
+      .from('hit_target_universe')
+      .select(
+        'target_date, player_id, player_name, team, opponent, game_pk, ' +
+        'batting_order_slot, lineup_status, opposing_starter_id, opposing_starter_hand, ' +
+        'hit_prob_1plus, hit_score_1plus, rank_1plus, team_rank_1plus, ' +
+        'confidence_1plus, contributions_1plus_json, ' +
+        'hit_prob_2plus, hit_score_2plus, rank_2plus, team_rank_2plus, ' +
+        'confidence_2plus, contributions_2plus_json, ' +
+        'flags, model_config_id_1plus, model_config_hash_1plus, ' +
+        'model_config_id_2plus, model_config_hash_2plus',
+      )
+      .eq('target_date', date)
+      .eq('model_version', modelVersion);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return [];
+      throw new Error(`hit_target_universe read: ${error.message}`);
+    }
+    return ((data ?? []) as unknown as Array<Omit<HitBoardRow, 'is_snapshot_row' | 'hits' | 'at_bats' | 'hit_1plus' | 'hit_2plus' | 'doubles' | 'triples' | 'outcome_enriched_at'>>)
+      .map((r) => ({
+        ...r,
+        is_snapshot_row: false,
+        hits: null, at_bats: null, hit_1plus: null, hit_2plus: null,
+        doubles: null, triples: null, outcome_enriched_at: null,
+      }));
+  }
+
+  async function readSnapshots(): Promise<HitBoardRow[]> {
+    const { data, error } = await supabase
+      .from('hit_target_snapshots')
+      .select(
+        'target_date, player_id, player_name, team, opponent, game_pk, ' +
+        'batting_order_slot, lineup_status, opposing_starter_id, opposing_starter_hand, ' +
+        'hit_prob_1plus, hit_score_1plus, rank_1plus, team_rank_1plus, ' +
+        'confidence_1plus, contributions_1plus_json, ' +
+        'hit_prob_2plus, hit_score_2plus, rank_2plus, team_rank_2plus, ' +
+        'confidence_2plus, contributions_2plus_json, ' +
+        'flags, model_config_id_1plus, model_config_hash_1plus, ' +
+        'model_config_id_2plus, model_config_hash_2plus, ' +
+        'hits, at_bats, hit_1plus, hit_2plus, doubles, triples, outcome_enriched_at',
+      )
+      .eq('target_date', date)
+      .eq('model_version', modelVersion);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return [];
+      throw new Error(`hit_target_snapshots read: ${error.message}`);
+    }
+    return ((data ?? []) as unknown as HitBoardRow[]).map((r) => ({ ...r, is_snapshot_row: true }));
+  }
+
+  let rows: HitBoardRow[] = [];
+  let source: 'universe' | 'snapshots' = 'universe';
+  if (trySnapshotsFirst) {
+    rows = await readSnapshots();
+    source = 'snapshots';
+    if (rows.length === 0) { rows = await readUniverse(); source = 'universe'; }
+  } else {
+    rows = await readUniverse();
+    source = 'universe';
+    if (rows.length === 0) { rows = await readSnapshots(); source = 'snapshots'; }
+  }
+
+  const sample = rows[0] ?? null;
+  return {
+    date,
+    source,
+    model_version: modelVersion,
+    rows,
+    model_1plus_id: sample?.model_config_id_1plus ?? null,
+    model_1plus_hash: sample?.model_config_hash_1plus ?? null,
+    model_1plus_is_validated: !isExperimentalConfigId(sample?.model_config_id_1plus ?? null),
+    model_2plus_id: sample?.model_config_id_2plus ?? null,
+    model_2plus_hash: sample?.model_config_hash_2plus ?? null,
+    model_2plus_is_validated: !isExperimentalConfigId(sample?.model_config_id_2plus ?? null),
+  };
+}

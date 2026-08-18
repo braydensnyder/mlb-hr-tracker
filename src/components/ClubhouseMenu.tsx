@@ -37,6 +37,7 @@ const ITEMS: NavItem[] = [
   { to: '/learning', label: 'Learning',   description: 'Captured days, model versions, feedback timeline' },
   { to: '/matchups', label: 'Matchups',   description: 'Today\'s probable pitchers and game notes' },
   { to: '/targets',  label: 'HR Targets', description: 'Heat Score model + research deep-dive' },
+  { to: '/hits',     label: 'Hits',       description: 'Who is most likely to record 1+ or 2+ hits today (experimental)' },
   { to: '/odds',     label: 'Odds',       description: 'HR props, line movement, Model vs Market' },
   { to: '/backtest', label: 'Backtest',   description: 'Hit rate, lift vs random, miss analysis' },
 ];
