@@ -544,14 +544,20 @@ export async function updateDaily(
         hitRes.status === 'refused_games_started' ? '⛔' :
         hitRes.status === 'no_games' || hitRes.status === 'no_candidates' ? '·' :
         '⚠';
+      const totalUniverse = hitRes.per_version.reduce((s, v) => s + v.universe_rows_written, 0);
+      const totalSnapshot = hitRes.per_version.reduce((s, v) => s + v.snapshot_rows_written, 0);
+      const totalFrozen   = hitRes.per_version.reduce((s, v) => s + v.snapshot_rows_kept_frozen, 0);
       console.log(
         `  ${icon} hits snapshot [${hitRes.status}] — ${hitRes.reason} · ` +
         `candidates=${hitRes.candidates_total} (${hitRes.candidates_confirmed} confirmed, ${hitRes.candidates_pending} pending) · ` +
-        `universe=${hitRes.universe_rows_written} · snapshot=${hitRes.snapshot_rows_written} new / ${hitRes.snapshot_rows_kept_frozen} frozen · ` +
+        `universe=${totalUniverse} · snapshot=${totalSnapshot} new / ${totalFrozen} frozen · ` +
         `games=${hitRes.games_started}/${hitRes.games_total} started`,
       );
-      if (!hitRes.model_1plus.is_validated || !hitRes.model_2plus.is_validated) {
-        console.log(`    ⓘ EXPERIMENTAL configs (1+ id=${hitRes.model_1plus.id}, 2+ id=${hitRes.model_2plus.id}) — walk-forward promotion still pending.`);
+      for (const pv of hitRes.per_version) {
+        console.log(
+          `    v${pv.model_version} (${pv.label}) — universe=${pv.universe_rows_written} · snapshot=${pv.snapshot_rows_written} new / ${pv.snapshot_rows_kept_frozen} frozen` +
+          (pv.is_validated_1plus && pv.is_validated_2plus ? '' : `  ⓘ experimental (1+ ${pv.config_id_1plus}, 2+ ${pv.config_id_2plus})`),
+        );
       }
       steps.push({
         step: 'snapshot:hits',
@@ -561,11 +567,7 @@ export async function updateDaily(
           date: hitRes.date,
           status: hitRes.status,
           candidates_total: hitRes.candidates_total,
-          universe_rows_written: hitRes.universe_rows_written,
-          snapshot_rows_written: hitRes.snapshot_rows_written,
-          snapshot_rows_kept_frozen: hitRes.snapshot_rows_kept_frozen,
-          model_1plus: hitRes.model_1plus,
-          model_2plus: hitRes.model_2plus,
+          per_version: hitRes.per_version,
         },
       });
     } catch (err) {

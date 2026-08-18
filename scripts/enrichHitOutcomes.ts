@@ -17,7 +17,13 @@
 import 'dotenv/config';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
 
-const HIT_MODEL_VERSION = 1;
+export interface EnrichHitOutcomesPerVersion {
+  model_version: number;
+  snapshot_rows_total: number;
+  snapshot_rows_enriched: number;
+  snapshot_rows_already_enriched: number;
+  snapshot_rows_no_batting_line: number;
+}
 
 export interface EnrichHitOutcomesResult {
   date: string;
@@ -27,6 +33,7 @@ export interface EnrichHitOutcomesResult {
   snapshot_rows_no_batting_line: number;
   players_with_batting_line: number;
   players_with_no_snapshot_row: number;
+  per_version: EnrichHitOutcomesPerVersion[];
 }
 
 export interface EnrichHitOutcomesOptions {
@@ -36,6 +43,7 @@ export interface EnrichHitOutcomesOptions {
 
 interface SnapshotRowLite {
   id: number;
+  model_version: number;
   player_id: number;
   outcome_enriched_at: string | null;
 }
@@ -49,14 +57,16 @@ interface BattingLineLite {
 }
 
 async function loadSnapshotRows(date: string): Promise<SnapshotRowLite[]> {
+  // Read ALL model_versions — outcomes are model-agnostic. Per-version
+  // breakdown reported in the result so operators can see enrichment
+  // coverage per experiment.
   const out: SnapshotRowLite[] = [];
   const PAGE = 1000;
   for (let page = 0; page < 40; page++) {
     const { data, error } = await supabaseAdmin
       .from('hit_target_snapshots')
-      .select('id, player_id, outcome_enriched_at')
+      .select('id, model_version, player_id, outcome_enriched_at')
       .eq('target_date', date)
-      .eq('model_version', HIT_MODEL_VERSION)
       .range(page * PAGE, page * PAGE + PAGE - 1);
     if (error) {
       if (/does not exist|schema cache/i.test(error.message)) return out;
@@ -109,27 +119,38 @@ export async function enrichHitOutcomes(date: string, opts: EnrichHitOutcomesOpt
       snapshot_rows_no_batting_line: 0,
       players_with_batting_line: 0,
       players_with_no_snapshot_row: 0,
+      per_version: [],
     };
   }
 
   const linesByPlayer = await loadBattingLinesForDate(date);
-  console.log(`  ${snapshots.length} snapshot rows, ${linesByPlayer.size} batting-line entries`);
+  console.log(`  ${snapshots.length} snapshot rows across all versions, ${linesByPlayer.size} batting-line entries`);
 
   const snapshotPlayerIds = new Set<number>(snapshots.map((s) => s.player_id));
   const linePlayerIds = new Set<number>(linesByPlayer.keys());
   const playersWithNoSnapshot = [...linePlayerIds].filter((pid) => !snapshotPlayerIds.has(pid)).length;
 
+  // Per-version counters — reported so operators can see enrichment
+  // coverage split across v1 and v2 (both are the same batting-line
+  // outcome, just applied to different frozen rankings).
+  const perVersionAgg = new Map<number, EnrichHitOutcomesPerVersion>();
+  const bumpPV = (ver: number, k: 'total' | 'enriched' | 'already_enriched' | 'no_batting_line') => {
+    const p = perVersionAgg.get(ver) ?? { model_version: ver, snapshot_rows_total: 0, snapshot_rows_enriched: 0, snapshot_rows_already_enriched: 0, snapshot_rows_no_batting_line: 0 };
+    if (k === 'total') p.snapshot_rows_total += 1;
+    else if (k === 'enriched') p.snapshot_rows_enriched += 1;
+    else if (k === 'already_enriched') p.snapshot_rows_already_enriched += 1;
+    else if (k === 'no_batting_line') p.snapshot_rows_no_batting_line += 1;
+    perVersionAgg.set(ver, p);
+  };
+
   let enriched = 0, alreadyEnriched = 0, noLine = 0;
   for (const s of snapshots) {
-    if (!force && s.outcome_enriched_at != null) { alreadyEnriched++; continue; }
+    bumpPV(s.model_version, 'total');
+    if (!force && s.outcome_enriched_at != null) { alreadyEnriched++; bumpPV(s.model_version, 'already_enriched'); continue; }
     const line = linesByPlayer.get(s.player_id);
     if (!line) {
-      // Player was in the pregame snapshot but never got a batting line
-      // (was scratched, benched, or the game was postponed). Mark as
-      // enriched with zero stats so the row is no longer "pending" —
-      // but only if the row wasn't already enriched.
-      if (!force && s.outcome_enriched_at != null) { alreadyEnriched++; continue; }
       noLine++;
+      bumpPV(s.model_version, 'no_batting_line');
       const { error } = await supabaseAdmin
         .from('hit_target_snapshots')
         .update({
@@ -157,12 +178,20 @@ export async function enrichHitOutcomes(date: string, opts: EnrichHitOutcomesOpt
       .eq('id', s.id);
     if (error) throw new Error(`enrich ${s.player_id}: ${error.message}`);
     enriched++;
+    bumpPV(s.model_version, 'enriched');
   }
 
   console.log(
     `[enrichHitOutcomes] ✓ enriched=${enriched}  no_batting_line_zeroed=${noLine}  already_enriched=${alreadyEnriched}` +
     (playersWithNoSnapshot > 0 ? `  · ${playersWithNoSnapshot} player(s) hit but had no snapshot row (scratched-in or extractor missed lineup)` : ''),
   );
+  const perVersion = [...perVersionAgg.values()].sort((a, b) => a.model_version - b.model_version);
+  for (const pv of perVersion) {
+    console.log(
+      `    v${pv.model_version}: total=${pv.snapshot_rows_total} enriched=${pv.snapshot_rows_enriched} ` +
+      `zeroed=${pv.snapshot_rows_no_batting_line} already_enriched=${pv.snapshot_rows_already_enriched}`,
+    );
+  }
 
   return {
     date,
@@ -172,5 +201,6 @@ export async function enrichHitOutcomes(date: string, opts: EnrichHitOutcomesOpt
     snapshot_rows_no_batting_line: noLine,
     players_with_batting_line: linesByPlayer.size,
     players_with_no_snapshot_row: playersWithNoSnapshot,
+    per_version: perVersion,
   };
 }

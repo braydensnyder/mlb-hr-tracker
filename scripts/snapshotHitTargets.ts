@@ -27,24 +27,37 @@ import 'dotenv/config';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
 import { mlbToday } from './lib/mlbDate.js';
 import {
-  HIT_MODEL_1PLUS,
-  HIT_MODEL_1PLUS_HASH,
-  HIT_MODEL_2PLUS,
-  HIT_MODEL_2PLUS_HASH,
+  HIT_MODEL_VERSIONS,
   computeHitTargets,
   describeHitModels,
   type HitCandidate,
   type HitGameContext,
   type HitTarget,
+  type HitModelVersionSpec,
   type PitcherFormRow,
   type PlayerDailyHitSummaryRow,
   type LineupStatus,
 } from '../src/lib/hitStats.js';
+import { hashConfig } from '../src/lib/hitModels.js';
 
 /** Statuses that mean a game is past its pre-game state. Copied here
  *  (not imported from the HR side) so the two pipelines share zero
  *  code paths. */
 const STARTED_STATUSES = new Set(['In Progress', 'Final', 'Game Over', 'Completed Early', 'Suspended']);
+
+export interface SnapshotHitPerVersion {
+  model_version: number;
+  label: string;
+  universe_rows_written: number;
+  snapshot_rows_written: number;
+  snapshot_rows_kept_frozen: number;
+  config_id_1plus: string;
+  config_hash_1plus: string;
+  is_validated_1plus: boolean;
+  config_id_2plus: string;
+  config_hash_2plus: string;
+  is_validated_2plus: boolean;
+}
 
 export interface SnapshotHitResult {
   date: string;
@@ -55,11 +68,9 @@ export interface SnapshotHitResult {
   candidates_total: number;
   candidates_confirmed: number;
   candidates_pending: number;
-  universe_rows_written: number;
-  snapshot_rows_written: number;
-  snapshot_rows_kept_frozen: number;
-  model_1plus: { id: string; hash: string; is_validated: boolean };
-  model_2plus: { id: string; hash: string; is_validated: boolean };
+  /** Per-version write summary. One entry per HIT_MODEL_VERSIONS spec.
+   *  v1 and v2 are computed and persisted independently every run. */
+  per_version: SnapshotHitPerVersion[];
 }
 
 export interface SnapshotHitOptions {
@@ -70,11 +81,10 @@ export interface SnapshotHitOptions {
   /** Skip snapshot when any game has started. Default true — the
    *  writer refuses to fabricate a pregame record after first pitch. */
   skipIfGamesStarted?: boolean;
+  /** Restrict to specific model versions. Default: all versions defined
+   *  in HIT_MODEL_VERSIONS. Useful for spot re-runs. */
+  onlyVersions?: number[];
 }
-
-/** Model version stamped on rows. Bumped when we promote a walk-forward
- *  winner and want to distinguish historical rows. */
-const HIT_MODEL_VERSION = 1;
 
 // ---------------------------------------------------------------------
 // Loaders
@@ -200,25 +210,12 @@ async function loadPitcherForm(pitcherIds: number[]): Promise<Map<number, Pitche
   return out;
 }
 
-async function countExistingUniverse(date: string): Promise<number> {
-  const { count, error } = await supabaseAdmin
-    .from('hit_target_universe')
-    .select('id', { count: 'exact', head: true })
-    .eq('target_date', date)
-    .eq('model_version', HIT_MODEL_VERSION);
-  if (error) {
-    if (/does not exist|schema cache/i.test(error.message)) return 0;
-    throw new Error(`count universe: ${error.message}`);
-  }
-  return count ?? 0;
-}
-
-async function countExistingSnapshot(date: string): Promise<number> {
+async function countExistingSnapshot(date: string, modelVersion: number): Promise<number> {
   const { count, error } = await supabaseAdmin
     .from('hit_target_snapshots')
     .select('id', { count: 'exact', head: true })
     .eq('target_date', date)
-    .eq('model_version', HIT_MODEL_VERSION);
+    .eq('model_version', modelVersion);
   if (error) {
     if (/does not exist|schema cache/i.test(error.message)) return 0;
     throw new Error(`count snapshot: ${error.message}`);
@@ -226,12 +223,12 @@ async function countExistingSnapshot(date: string): Promise<number> {
   return count ?? 0;
 }
 
-async function loadExistingSnapshotPlayerIds(date: string): Promise<Set<number>> {
+async function loadExistingSnapshotPlayerIds(date: string, modelVersion: number): Promise<Set<number>> {
   const { data, error } = await supabaseAdmin
     .from('hit_target_snapshots')
     .select('player_id')
     .eq('target_date', date)
-    .eq('model_version', HIT_MODEL_VERSION);
+    .eq('model_version', modelVersion);
   if (error) {
     if (/does not exist|schema cache/i.test(error.message)) return new Set();
     throw new Error(`existing snapshot player ids: ${error.message}`);
@@ -395,12 +392,12 @@ function assignRanks(targets: HitTarget[]): RankedTarget[] {
 // Row builders
 // ---------------------------------------------------------------------
 
-function makeUniverseRow(r: RankedTarget, targetDate: string, pregameRunAt: string): Record<string, unknown> {
+function makeUniverseRow(r: RankedTarget, targetDate: string, pregameRunAt: string, modelVersion: number): Record<string, unknown> {
   const t = r.target;
   return {
     target_date: targetDate,
     captured_at: pregameRunAt,
-    model_version: HIT_MODEL_VERSION,
+    model_version: modelVersion,
 
     model_config_id_1plus: t.contributions_1plus.model.id,
     model_config_hash_1plus: t.contributions_1plus.model.hash,
@@ -436,13 +433,13 @@ function makeUniverseRow(r: RankedTarget, targetDate: string, pregameRunAt: stri
   };
 }
 
-function makeSnapshotRow(r: RankedTarget, targetDate: string, pregameRunAt: string, snapshotType: 'pregame' | 'simulated'): Record<string, unknown> {
+function makeSnapshotRow(r: RankedTarget, targetDate: string, pregameRunAt: string, modelVersion: number, snapshotType: 'pregame' | 'simulated'): Record<string, unknown> {
   // Reuse the universe row shape but STRIP captured_at — that column
   // exists on hit_target_universe only. The snapshot table uses
   // snapshot_at (row-write time) + pregame_run_at (frozen decision
   // time) instead. Two-tables-mirror-HR-pattern design has them
   // deliberately distinct.
-  const { captured_at: _dropped, ...universeShape } = makeUniverseRow(r, targetDate, pregameRunAt);
+  const { captured_at: _dropped, ...universeShape } = makeUniverseRow(r, targetDate, pregameRunAt, modelVersion);
   void _dropped;
   return {
     ...universeShape,
@@ -477,7 +474,25 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
   console.log(`[snapshotHitTargets] date=${date}${force ? ' force' : ''}${runningToday ? ' (today)' : ''}`);
   console.log(describeHitModels().split('\n').map((l) => `  ${l}`).join('\n'));
 
-  // --- Fetch games ---
+  const versionsToRun: HitModelVersionSpec[] = opts.onlyVersions
+    ? HIT_MODEL_VERSIONS.filter((v) => opts.onlyVersions!.includes(v.version))
+    : HIT_MODEL_VERSIONS;
+
+  const emptyPerVersion: SnapshotHitPerVersion[] = versionsToRun.map((v) => ({
+    model_version: v.version,
+    label: v.label,
+    universe_rows_written: 0,
+    snapshot_rows_written: 0,
+    snapshot_rows_kept_frozen: 0,
+    config_id_1plus: v.config_1plus.id,
+    config_hash_1plus: hashConfig(v.config_1plus),
+    is_validated_1plus: v.config_1plus.is_validated,
+    config_id_2plus: v.config_2plus.id,
+    config_hash_2plus: hashConfig(v.config_2plus),
+    is_validated_2plus: v.config_2plus.is_validated,
+  }));
+
+  // --- Fetch games (shared across versions) ---
   const games = await loadGamesForDate(date);
   const startedCount = games.filter((g) => STARTED_STATUSES.has(g.status)).length;
 
@@ -487,18 +502,21 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
       date, status: 'no_games', reason: 'no games scheduled',
       games_total: 0, games_started: 0,
       candidates_total: 0, candidates_confirmed: 0, candidates_pending: 0,
-      universe_rows_written: 0, snapshot_rows_written: 0, snapshot_rows_kept_frozen: 0,
-      model_1plus: { id: HIT_MODEL_1PLUS.id, hash: HIT_MODEL_1PLUS_HASH, is_validated: HIT_MODEL_1PLUS.is_validated },
-      model_2plus: { id: HIT_MODEL_2PLUS.id, hash: HIT_MODEL_2PLUS_HASH, is_validated: HIT_MODEL_2PLUS.is_validated },
+      per_version: emptyPerVersion,
     };
   }
 
-  // --- Games-started fence ---
-  const existingSnapshotCount = await countExistingSnapshot(date);
-  if (startedCount > 0 && skipIfStarted && !force && existingSnapshotCount === 0) {
+  // --- Games-started fence — checked against ANY version's snapshot ---
+  //     If a pregame snapshot exists for ANY version we let subsequent
+  //     versions run (they may be filling in a newly-added model).
+  let anyExistingSnapshot = 0;
+  for (const v of versionsToRun) {
+    anyExistingSnapshot += await countExistingSnapshot(date, v.version);
+  }
+  if (startedCount > 0 && skipIfStarted && !force && anyExistingSnapshot === 0) {
     console.warn(
       `[snapshotHitTargets] ✗ REFUSED — ${startedCount}/${games.length} games already started for ${date} ` +
-      `and no prior pregame snapshot exists. Cannot fabricate a clean pregame Hits record from ` +
+      `and no prior pregame snapshot exists (any version). Cannot fabricate a clean pregame Hits record from ` +
       `potentially contaminated inputs. Use --force to override.`,
     );
     return {
@@ -506,13 +524,11 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
       reason: `${startedCount}/${games.length} games started; no prior pregame snapshot`,
       games_total: games.length, games_started: startedCount,
       candidates_total: 0, candidates_confirmed: 0, candidates_pending: 0,
-      universe_rows_written: 0, snapshot_rows_written: 0, snapshot_rows_kept_frozen: 0,
-      model_1plus: { id: HIT_MODEL_1PLUS.id, hash: HIT_MODEL_1PLUS_HASH, is_validated: HIT_MODEL_1PLUS.is_validated },
-      model_2plus: { id: HIT_MODEL_2PLUS.id, hash: HIT_MODEL_2PLUS_HASH, is_validated: HIT_MODEL_2PLUS.is_validated },
+      per_version: emptyPerVersion,
     };
   }
 
-  // --- Load catalog + summaries + pitcher form ---
+  // --- Load catalog + summaries + pitcher form (shared across versions) ---
   const asOfSummary = mlbAddDaysUtc(date, -1);   // strictly-prior data only
   const playerIdSet = new Set<number>();
   const pitcherIdSet = new Set<number>();
@@ -529,7 +545,7 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
   ]);
   console.log(`  loaded ${catalog.size} player-catalog rows, ${summariesById.size} summaries (as-of ${asOfSummary}), ${pitcherFormById.size} pitcher-form rows`);
 
-  // --- Assemble candidates ---
+  // --- Assemble candidates (shared across versions) ---
   const candidates = assembleCandidates(games, catalog);
   const confirmed = candidates.filter((c) => c.lineup_status === 'confirmed').length;
   const pending = candidates.filter((c) => c.lineup_status === 'pending').length;
@@ -540,13 +556,11 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
       date, status: 'no_candidates', reason: 'no eligible starters (lineups empty)',
       games_total: games.length, games_started: startedCount,
       candidates_total: 0, candidates_confirmed: 0, candidates_pending: 0,
-      universe_rows_written: 0, snapshot_rows_written: 0, snapshot_rows_kept_frozen: existingSnapshotCount,
-      model_1plus: { id: HIT_MODEL_1PLUS.id, hash: HIT_MODEL_1PLUS_HASH, is_validated: HIT_MODEL_1PLUS.is_validated },
-      model_2plus: { id: HIT_MODEL_2PLUS.id, hash: HIT_MODEL_2PLUS_HASH, is_validated: HIT_MODEL_2PLUS.is_validated },
+      per_version: emptyPerVersion,
     };
   }
 
-  // --- Build game context map ---
+  // --- Build game context map (shared across versions) ---
   const gamesByPk = new Map<number, HitGameContext>();
   for (const g of games) {
     gamesByPk.set(g.game_pk, {
@@ -570,93 +584,108 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
     });
   }
 
-  // --- Score ---
-  const boards = computeHitTargets({
-    candidates,
-    gamesByPk,
-    hitSummaryById: summariesById,
-    pitcherFormById,
-  });
-  const allTargets: HitTarget[] = [];
-  for (const b of boards) allTargets.push(...b.home_targets, ...b.away_targets);
-  console.log(`  scored ${allTargets.length} targets across ${boards.length} game board(s)`);
+  // --- Per-version scoring + write ---
+  const snapshotType: 'pregame' | 'simulated' = startedCount > 0 ? 'simulated' : 'pregame';
+  const perVersion: SnapshotHitPerVersion[] = [];
+  let anyKeptFrozen = 0;
+  let anyWritten = 0;
 
-  const ranked = assignRanks(allTargets);
+  for (const v of versionsToRun) {
+    console.log(`\n  ── v${v.version} (${v.label}) ──`);
+    // Score with this version's configs.
+    const boards = computeHitTargets({
+      candidates, gamesByPk,
+      hitSummaryById: summariesById, pitcherFormById,
+      config1Plus: v.config_1plus,
+      config2Plus: v.config_2plus,
+    });
+    const allTargets: HitTarget[] = [];
+    for (const b of boards) allTargets.push(...b.home_targets, ...b.away_targets);
+    const ranked = assignRanks(allTargets);
+    console.log(`    scored ${allTargets.length} targets`);
 
-  // --- Universe: force-clean per run ---
-  {
+    // Universe: force-clean per version per run.
     const { error: delErr } = await supabaseAdmin
       .from('hit_target_universe')
       .delete()
       .eq('target_date', date)
-      .eq('model_version', HIT_MODEL_VERSION);
+      .eq('model_version', v.version);
     if (delErr && !/does not exist|schema cache/i.test(delErr.message)) {
-      throw new Error(`hit_target_universe delete: ${delErr.message}`);
+      throw new Error(`hit_target_universe delete v${v.version}: ${delErr.message}`);
     }
-  }
-  const universeRows = ranked.map((r) => makeUniverseRow(r, date, nowIso));
-  let universeWritten = 0;
-  {
+    const universeRows = ranked.map((r) => makeUniverseRow(r, date, nowIso, v.version));
+    let universeWritten = 0;
     const BATCH = 500;
     for (let i = 0; i < universeRows.length; i += BATCH) {
       const chunk = universeRows.slice(i, i + BATCH);
       const { error, count } = await supabaseAdmin
         .from('hit_target_universe')
         .insert(chunk, { count: 'exact' });
-      if (error) throw new Error(`hit_target_universe insert: ${error.message}`);
+      if (error) throw new Error(`hit_target_universe insert v${v.version}: ${error.message}`);
       universeWritten += count ?? chunk.length;
     }
-  }
-  console.log(`  hit_target_universe: wrote ${universeWritten} rows`);
+    console.log(`    hit_target_universe (v${v.version}): wrote ${universeWritten} rows`);
 
-  // --- Snapshots: first-write-wins per (date, player, model_version) ---
-  //     Existing snapshot rows are ALWAYS preserved (their pregame ranks
-  //     stay frozen). Only new players get new rows unless --force.
-  const snapshotType: 'pregame' | 'simulated' = startedCount > 0 ? 'simulated' : 'pregame';
-  const existingSnapshotIds = await loadExistingSnapshotPlayerIds(date);
-  const snapshotRowsToWrite: Array<Record<string, unknown>> = [];
-  let keptFrozen = 0;
-  for (const r of ranked) {
-    if (existingSnapshotIds.has(r.target.player_id) && !force) {
-      keptFrozen++;
-      continue;
+    // Snapshots: first-write-wins per (date, player, model_version).
+    const existingSnapshotIds = await loadExistingSnapshotPlayerIds(date, v.version);
+    const snapshotRowsToWrite: Array<Record<string, unknown>> = [];
+    let keptFrozen = 0;
+    for (const r of ranked) {
+      if (existingSnapshotIds.has(r.target.player_id) && !force) {
+        keptFrozen++;
+        continue;
+      }
+      snapshotRowsToWrite.push(makeSnapshotRow(r, date, nowIso, v.version, snapshotType));
     }
-    snapshotRowsToWrite.push(makeSnapshotRow(r, date, nowIso, snapshotType));
-  }
-
-  if (force && existingSnapshotIds.size > 0) {
-    const { error: delSnapErr } = await supabaseAdmin
-      .from('hit_target_snapshots')
-      .delete()
-      .eq('target_date', date)
-      .eq('model_version', HIT_MODEL_VERSION);
-    if (delSnapErr && !/does not exist|schema cache/i.test(delSnapErr.message)) {
-      throw new Error(`hit_target_snapshots force-delete: ${delSnapErr.message}`);
-    }
-    console.log(`  hit_target_snapshots: force-cleared ${existingSnapshotIds.size} existing pregame row(s)`);
-  }
-
-  let snapshotWritten = 0;
-  if (snapshotRowsToWrite.length > 0) {
-    const BATCH = 500;
-    for (let i = 0; i < snapshotRowsToWrite.length; i += BATCH) {
-      const chunk = snapshotRowsToWrite.slice(i, i + BATCH);
-      const { error, count } = await supabaseAdmin
+    if (force && existingSnapshotIds.size > 0) {
+      const { error: delSnapErr } = await supabaseAdmin
         .from('hit_target_snapshots')
-        .upsert(chunk, { onConflict: 'target_date,player_id,model_version', count: 'exact' });
-      if (error) throw new Error(`hit_target_snapshots upsert: ${error.message}`);
-      snapshotWritten += count ?? chunk.length;
+        .delete()
+        .eq('target_date', date)
+        .eq('model_version', v.version);
+      if (delSnapErr && !/does not exist|schema cache/i.test(delSnapErr.message)) {
+        throw new Error(`hit_target_snapshots force-delete v${v.version}: ${delSnapErr.message}`);
+      }
+      console.log(`    hit_target_snapshots (v${v.version}): force-cleared ${existingSnapshotIds.size} existing`);
     }
+    let snapshotWritten = 0;
+    if (snapshotRowsToWrite.length > 0) {
+      for (let i = 0; i < snapshotRowsToWrite.length; i += BATCH) {
+        const chunk = snapshotRowsToWrite.slice(i, i + BATCH);
+        const { error, count } = await supabaseAdmin
+          .from('hit_target_snapshots')
+          .upsert(chunk, { onConflict: 'target_date,player_id,model_version', count: 'exact' });
+        if (error) throw new Error(`hit_target_snapshots upsert v${v.version}: ${error.message}`);
+        snapshotWritten += count ?? chunk.length;
+      }
+    }
+    console.log(`    hit_target_snapshots (v${v.version}): wrote ${snapshotWritten} new, kept ${keptFrozen} frozen`);
+    anyKeptFrozen += keptFrozen;
+    anyWritten += snapshotWritten;
+
+    perVersion.push({
+      model_version: v.version,
+      label: v.label,
+      universe_rows_written: universeWritten,
+      snapshot_rows_written: snapshotWritten,
+      snapshot_rows_kept_frozen: keptFrozen,
+      config_id_1plus: v.config_1plus.id,
+      config_hash_1plus: hashConfig(v.config_1plus),
+      is_validated_1plus: v.config_1plus.is_validated,
+      config_id_2plus: v.config_2plus.id,
+      config_hash_2plus: hashConfig(v.config_2plus),
+      is_validated_2plus: v.config_2plus.is_validated,
+    });
   }
 
   const status: SnapshotHitResult['status'] =
-    keptFrozen > 0 && snapshotWritten === 0 && !force ? 'frozen_kept' : 'written';
+    anyKeptFrozen > 0 && anyWritten === 0 && !force ? 'frozen_kept' : 'written';
   const reason =
     status === 'frozen_kept'
-      ? `all ${keptFrozen} pregame snapshot rows preserved`
-      : `${snapshotWritten} new snapshot rows + ${keptFrozen} kept frozen`;
+      ? `all ${anyKeptFrozen} pregame snapshot rows preserved (across versions)`
+      : `${anyWritten} new snapshot rows + ${anyKeptFrozen} kept frozen (across versions)`;
   console.log(
-    `[snapshotHitTargets] ✓ ${status.toUpperCase()} — ${reason} · type=${snapshotType} · ` +
+    `\n[snapshotHitTargets] ✓ ${status.toUpperCase()} — ${reason} · type=${snapshotType} · ` +
     `games=${startedCount}/${games.length} started`,
   );
 
@@ -666,11 +695,7 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
     candidates_total: candidates.length,
     candidates_confirmed: confirmed,
     candidates_pending: pending,
-    universe_rows_written: universeWritten,
-    snapshot_rows_written: snapshotWritten,
-    snapshot_rows_kept_frozen: keptFrozen,
-    model_1plus: { id: HIT_MODEL_1PLUS.id, hash: HIT_MODEL_1PLUS_HASH, is_validated: HIT_MODEL_1PLUS.is_validated },
-    model_2plus: { id: HIT_MODEL_2PLUS.id, hash: HIT_MODEL_2PLUS_HASH, is_validated: HIT_MODEL_2PLUS.is_validated },
+    per_version: perVersion,
   };
 }
 

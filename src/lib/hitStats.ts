@@ -253,9 +253,22 @@ export function buildHitFeatures(inputs: HitFeatureInputs): Record<string, numbe
     multi_hit_rate_l10g_asof = summary.multi_hit_games_l10g / 10;
   }
 
-  // Season K rate — approximated from strikeout_rate_l7d if we don't have
-  // a persisted season one. NULL when neither exists.
-  const season_k_rate_asof = summary?.strikeout_rate_l7d ?? null;
+  // Season K rate — NO SUBSTITUTION.
+  //   Prior bug: this line was 'const season_k_rate_asof =
+  //   summary?.strikeout_rate_l7d ?? null;' which silently populated
+  //   season_k_rate_asof AND recent_k_rate_asof from the SAME L7d
+  //   source, producing a ρ=1.000 correlation and effectively
+  //   double-counting the K-rate signal. Any config that weighted
+  //   season_k_rate_asof separately had that weight added to the
+  //   same underlying value.
+  //
+  //   Correct behaviour: return null until we hydrate real season K
+  //   rate from MLB API (e.g. via players.season_k_rate, one small
+  //   ingestion change to enrichPlayers). All configs that included
+  //   this feature must be regenerated (new hash) because their
+  //   scoring behaviour changes when a persisted null replaces a
+  //   silently-substituted number.
+  const season_k_rate_asof: number | null = null;
 
   return {
     season_avg_asof:          summary?.season_avg ?? null,
@@ -700,5 +713,12 @@ export function computeHitTargets(opts: ComputeHitTargetsOpts): HitTargetsBoard[
 // -------------------------------------------------------------------
 // Re-exports for callers who want the pair of config stamps handy.
 // -------------------------------------------------------------------
-export type { HitConfigStamp } from './hitModels.js';
-export { HIT_MODEL_1PLUS, HIT_MODEL_2PLUS, HIT_MODEL_1PLUS_HASH, HIT_MODEL_2PLUS_HASH, describeHitModels } from './hitModels.js';
+export type { HitConfigStamp, HitModelVersionSpec } from './hitModels.js';
+export {
+  HIT_MODEL_1PLUS, HIT_MODEL_2PLUS,
+  HIT_MODEL_1PLUS_HASH, HIT_MODEL_2PLUS_HASH,
+  HIT_MODEL_1PLUS_V2, HIT_MODEL_2PLUS_V2,
+  HIT_MODEL_1PLUS_V2_HASH, HIT_MODEL_2PLUS_V2_HASH,
+  HIT_MODEL_VERSIONS,
+  describeHitModels,
+} from './hitModels.js';

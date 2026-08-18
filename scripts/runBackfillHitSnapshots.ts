@@ -37,7 +37,7 @@ import { enrichHitOutcomes } from './enrichHitOutcomes.js';
 import { rebuildHitSummaries } from './rebuildHitSummaries.js';
 import { rebuildPitcherForm } from './rebuildPitcherForm.js';
 
-const HIT_MODEL_VERSION = 1;
+// (was HIT_MODEL_VERSION = 1 — removed after snapshotHitTargets moved to multi-version)
 
 interface Args {
   from: string | null;
@@ -81,74 +81,77 @@ function iterateDates(from: string, to: string): string[] {
 async function verify(from: string, to: string): Promise<void> {
   console.log(`\n═══ Verification ═══`);
 
-  // A. rows by date
+  // A. rows by date (broken down by model_version)
   const { data: byDateRaw, error: byDateErr } = await supabaseAdmin
     .from('hit_target_snapshots')
-    .select('target_date, snapshot_type, hits')
-    .eq('model_version', HIT_MODEL_VERSION)
+    .select('target_date, model_version, snapshot_type, hits')
     .gte('target_date', from)
     .lte('target_date', to);
   if (byDateErr) throw new Error(`verify: ${byDateErr.message}`);
-  const rows = (byDateRaw ?? []) as { target_date: string; snapshot_type: string; hits: number | null }[];
-  const byDate = new Map<string, { total: number; enriched: number; simulated: number; pregame: number }>();
+  const rows = (byDateRaw ?? []) as { target_date: string; model_version: number; snapshot_type: string; hits: number | null }[];
+  const byDateVersion = new Map<string, { total: number; enriched: number; simulated: number; pregame: number }>();
   for (const r of rows) {
-    const c = byDate.get(r.target_date) ?? { total: 0, enriched: 0, simulated: 0, pregame: 0 };
+    const key = `${r.target_date}|v${r.model_version}`;
+    const c = byDateVersion.get(key) ?? { total: 0, enriched: 0, simulated: 0, pregame: 0 };
     c.total += 1;
     if (r.hits != null) c.enriched += 1;
     if (r.snapshot_type === 'simulated') c.simulated += 1;
     if (r.snapshot_type === 'pregame') c.pregame += 1;
-    byDate.set(r.target_date, c);
+    byDateVersion.set(key, c);
   }
 
-  console.log(`\n  1. Snapshot rows by date (model_version=${HIT_MODEL_VERSION}):`);
-  console.log(`     ${'date'.padEnd(11)}  ${'total'.padStart(6)}  ${'enriched'.padStart(9)}  ${'simulated'.padStart(10)}  ${'pregame'.padStart(8)}`);
-  const dates = [...byDate.keys()].sort();
+  console.log(`\n  1. Snapshot rows by date × model_version:`);
+  console.log(`     ${'date'.padEnd(11)}  ${'ver'.padStart(4)}  ${'total'.padStart(6)}  ${'enriched'.padStart(9)}  ${'simulated'.padStart(10)}  ${'pregame'.padStart(8)}`);
+  const keys = [...byDateVersion.keys()].sort();
   let grandTotal = 0, grandEnriched = 0;
-  for (const d of dates) {
-    const c = byDate.get(d)!;
-    console.log(`     ${d.padEnd(11)}  ${String(c.total).padStart(6)}  ${String(c.enriched).padStart(9)}  ${String(c.simulated).padStart(10)}  ${String(c.pregame).padStart(8)}`);
+  for (const k of keys) {
+    const [d, v] = k.split('|');
+    const c = byDateVersion.get(k)!;
+    console.log(`     ${d.padEnd(11)}  ${v.padStart(4)}  ${String(c.total).padStart(6)}  ${String(c.enriched).padStart(9)}  ${String(c.simulated).padStart(10)}  ${String(c.pregame).padStart(8)}`);
     grandTotal += c.total;
     grandEnriched += c.enriched;
   }
-  console.log(`     ${'TOTAL'.padEnd(11)}  ${String(grandTotal).padStart(6)}  ${String(grandEnriched).padStart(9)}  ${'—'.padStart(10)}  ${'—'.padStart(8)}`);
+  console.log(`     ${'TOTAL'.padEnd(11)}  ${'—'.padStart(4)}  ${String(grandTotal).padStart(6)}  ${String(grandEnriched).padStart(9)}  ${'—'.padStart(10)}  ${'—'.padStart(8)}`);
 
-  // B. rows with hits IS NOT NULL (across all history for context)
+  // B. rows with hits IS NOT NULL (across all history, all versions)
   const { count: allEnriched, error: allEnrichedErr } = await supabaseAdmin
     .from('hit_target_snapshots')
     .select('id', { count: 'exact', head: true })
-    .eq('model_version', HIT_MODEL_VERSION)
     .not('hits', 'is', null);
   if (allEnrichedErr) throw new Error(`allEnriched: ${allEnrichedErr.message}`);
 
-  // C. total rows for model_version=1 (across all history)
+  // C. total rows (across all history, all versions)
   const { count: allRows, error: allRowsErr } = await supabaseAdmin
     .from('hit_target_snapshots')
-    .select('id', { count: 'exact', head: true })
-    .eq('model_version', HIT_MODEL_VERSION);
+    .select('id', { count: 'exact', head: true });
   if (allRowsErr) throw new Error(`allRows: ${allRowsErr.message}`);
 
-  console.log(`\n  2. Rows with hits IS NOT NULL (all history, model_version=${HIT_MODEL_VERSION}): ${allEnriched ?? 0}`);
-  console.log(`  3. Total rows for model_version=${HIT_MODEL_VERSION} (all history): ${allRows ?? 0}`);
+  console.log(`\n  2. Rows with hits IS NOT NULL (all history, all versions): ${allEnriched ?? 0}`);
+  console.log(`  3. Total rows (all history, all versions): ${allRows ?? 0}`);
 
-  // D. distinct config hashes in the reconstructed range
-  const hashes1 = new Set<string>();
-  const hashes2 = new Set<string>();
+  // D. distinct config hashes in the reconstructed range, per model_version
   const { data: hashRows, error: hashErr } = await supabaseAdmin
     .from('hit_target_snapshots')
-    .select('model_config_hash_1plus, model_config_hash_2plus')
-    .eq('model_version', HIT_MODEL_VERSION)
+    .select('model_version, model_config_hash_1plus, model_config_hash_2plus')
     .gte('target_date', from)
     .lte('target_date', to);
   if (hashErr) throw new Error(`hashes: ${hashErr.message}`);
-  for (const r of (hashRows ?? []) as { model_config_hash_1plus: string; model_config_hash_2plus: string }[]) {
-    hashes1.add(r.model_config_hash_1plus);
-    hashes2.add(r.model_config_hash_2plus);
+  const hashByVersion = new Map<number, { h1: Set<string>; h2: Set<string> }>();
+  for (const r of (hashRows ?? []) as { model_version: number; model_config_hash_1plus: string; model_config_hash_2plus: string }[]) {
+    const c = hashByVersion.get(r.model_version) ?? { h1: new Set<string>(), h2: new Set<string>() };
+    c.h1.add(r.model_config_hash_1plus);
+    c.h2.add(r.model_config_hash_2plus);
+    hashByVersion.set(r.model_version, c);
   }
-  console.log(`\n  4. Distinct config hashes in [${from} .. ${to}]:`);
-  console.log(`     1+ ranker: ${hashes1.size} hash(es)  [${[...hashes1].join(', ')}]`);
-  console.log(`     2+ ranker: ${hashes2.size} hash(es)  [${[...hashes2].join(', ')}]`);
-  if (hashes1.size > 1 || hashes2.size > 1) {
-    console.log(`     ⚠ Multiple hashes in the range means rows were scored under DIFFERENT configs.`);
+  console.log(`\n  4. Distinct config hashes in [${from} .. ${to}], per model_version:`);
+  let anyMulti = false;
+  for (const [ver, c] of [...hashByVersion.entries()].sort(([a], [b]) => a - b)) {
+    console.log(`     v${ver}  1+: ${c.h1.size} hash(es)  [${[...c.h1].join(', ')}]`);
+    console.log(`     v${ver}  2+: ${c.h2.size} hash(es)  [${[...c.h2].join(', ')}]`);
+    if (c.h1.size > 1 || c.h2.size > 1) anyMulti = true;
+  }
+  if (anyMulti) {
+    console.log(`     ⚠ Multiple hashes within a version means rows were scored under DIFFERENT configs.`);
     console.log(`       Per-row scoring is honest (each row carries its own hash) but sample-mean`);
     console.log(`       predicted probability mixes calibrations.`);
   }
@@ -200,10 +203,15 @@ async function main() {
       console.log(`  (skipped pitcher-form rebuild — --skip-summary-rebuild)`);
     }
 
-    // 3. reconstruct snapshot for D
+    // 3. reconstruct snapshot for D (writes ALL model versions)
     try {
       const res = await snapshotHitTargets(D, { force: true, skipIfGamesStarted: false });
-      console.log(`  → snapshot [${res.status}] · candidates=${res.candidates_total} · universe=${res.universe_rows_written} · snapshot=${res.snapshot_rows_written} · games=${res.games_started}/${res.games_total} started`);
+      const totalUniv = res.per_version.reduce((s, v) => s + v.universe_rows_written, 0);
+      const totalSnap = res.per_version.reduce((s, v) => s + v.snapshot_rows_written, 0);
+      console.log(`  → snapshot [${res.status}] · candidates=${res.candidates_total} · universe=${totalUniv} · snapshot=${totalSnap} · games=${res.games_started}/${res.games_total} started`);
+      for (const pv of res.per_version) {
+        console.log(`      v${pv.model_version} (${pv.label}): universe=${pv.universe_rows_written} · snapshot=${pv.snapshot_rows_written} new / ${pv.snapshot_rows_kept_frozen} frozen`);
+      }
     } catch (e) {
       console.warn(`  ⚠ snapshotHitTargets(${D}) failed (continuing): ${e instanceof Error ? e.message : e}`);
       continue;

@@ -184,13 +184,21 @@ export function stampFor(cfg: HitModelConfig): HitConfigStamp {
 // EXPERIMENTAL badge. Do NOT interpret their rankings as production-
 // grade until we swap in a validated winner.
 
-const EXPERIMENTAL_FEATURE_ORDER_1PLUS = [
+/**
+ * Feature order for the experimental v0.1 (K-rate-fix) configs.
+ * season_k_rate_asof was REMOVED after the buildHitFeatures bug fix
+ * — that field is now always null (no real season K source yet),
+ * and having it in the features list with weight -3 was producing a
+ * duplicate weighting of the recent-K signal. Removing it changes
+ * the config hash automatically, which is correct: post-fix scoring
+ * behaviour is genuinely different from pre-fix scoring.
+ */
+const V0_1_FEATURE_ORDER_1PLUS = [
   'season_avg_asof',
   'hit_rate_l7d_asof',
   'hits_l7d_asof',
   'ab_l7d_asof',
   'expected_pa',
-  'season_k_rate_asof',
   'recent_k_rate_asof',
   'pitcher_h_per_9_asof',
   'pitcher_whip_asof',
@@ -201,15 +209,20 @@ const EXPERIMENTAL_FEATURE_ORDER_1PLUS = [
   'weather_wind_mph',
 ];
 
-const EXPERIMENTAL_FEATURE_ORDER_2PLUS = [
-  ...EXPERIMENTAL_FEATURE_ORDER_1PLUS,
+const V0_1_FEATURE_ORDER_2PLUS = [
+  ...V0_1_FEATURE_ORDER_1PLUS,
   'multi_hit_rate_l10g_asof',
 ];
 
+/** v2 experiment feature order — identical to v0.1's since the v2
+ *  weight edits don't change which features are read (just weights). */
+const V2_FEATURE_ORDER_1PLUS = V0_1_FEATURE_ORDER_1PLUS;
+const V2_FEATURE_ORDER_2PLUS = V0_1_FEATURE_ORDER_2PLUS;
+
 export const HIT_MODEL_1PLUS: HitModelConfig = {
-  id: 'experimental_v0_det_1plus',
+  id: 'experimental_v0_1_det_1plus',
   kind: 'DET',
-  features: EXPERIMENTAL_FEATURE_ORDER_1PLUS,
+  features: V0_1_FEATURE_ORDER_1PLUS,
   standardize: 'z_score_per_day',
   fixed_standardization: null,
   weights: {
@@ -218,8 +231,7 @@ export const HIT_MODEL_1PLUS: HitModelConfig = {
     hits_l7d_asof:            1,
     ab_l7d_asof:              0,
     expected_pa:              5,
-    season_k_rate_asof:      -3,
-    recent_k_rate_asof:      -2,
+    recent_k_rate_asof:      -2,       // was -2 pre-fix; effective was -5 due to K-rate duplication bug
     pitcher_h_per_9_asof:     3,
     pitcher_whip_asof:        2,
     pitcher_k_per_9_asof:    -3,
@@ -229,23 +241,24 @@ export const HIT_MODEL_1PLUS: HitModelConfig = {
     weather_wind_mph:         0,
   },
   bias: 0,
-  temperature: 10,                      // matches calibrateHitScore's sigmoid(s/10)
+  temperature: 10,
   transform: 'sigmoid',
   target: 'hit_1plus',
   is_validated: false,
   promoted_from_walkforward: null,
   notes:
-    'Experimental placeholder. Deterministic contact-first preset from ' +
-    'calibrateHitScore. Temperature=10 matches the /10 scaling those ' +
-    'weights were designed under. No walk-forward validation yet. ' +
-    'Rankings must be labelled EXPERIMENTAL in the UI until a validated ' +
-    'winner replaces this.',
+    'v0.1 — the K-rate double-counting bug in buildHitFeatures was ' +
+    'fixed (season_k_rate_asof no longer silently populated from ' +
+    'strikeout_rate_l7d) AND season_k_rate_asof removed from the ' +
+    'features list. New hash reflects the corrected scoring behaviour. ' +
+    'Historical hit_target_snapshots rows keep their pre-fix hash. ' +
+    'Still EXPERIMENTAL — walk-forward promotion still pending.',
 };
 
 export const HIT_MODEL_2PLUS: HitModelConfig = {
-  id: 'experimental_v0_det_2plus',
+  id: 'experimental_v0_1_det_2plus',
   kind: 'DET',
-  features: EXPERIMENTAL_FEATURE_ORDER_2PLUS,
+  features: V0_1_FEATURE_ORDER_2PLUS,
   standardize: 'z_score_per_day',
   fixed_standardization: null,
   weights: {
@@ -254,8 +267,7 @@ export const HIT_MODEL_2PLUS: HitModelConfig = {
     hits_l7d_asof:            2,
     ab_l7d_asof:              1,
     expected_pa:              6,
-    season_k_rate_asof:      -3,
-    recent_k_rate_asof:      -2,
+    recent_k_rate_asof:      -2,       // was -2 pre-fix; effective was -5 due to K-rate duplication bug
     pitcher_h_per_9_asof:     3,
     pitcher_whip_asof:        2,
     pitcher_k_per_9_asof:    -2,
@@ -266,31 +278,163 @@ export const HIT_MODEL_2PLUS: HitModelConfig = {
     multi_hit_rate_l10g_asof: 4,
   },
   bias: 0,
-  temperature: 10,                      // matches calibrateHitScore's sigmoid(s/10)
+  temperature: 10,
   transform: 'sigmoid',
   target: 'hit_2plus',
   is_validated: false,
   promoted_from_walkforward: null,
   notes:
-    'Experimental placeholder. Deterministic 2+ preset lifts multi_hit_rate + ' +
-    'expected_pa. Temperature=10 matches the /10 scaling those weights were ' +
-    'designed under. Showed promising early Top-5 lift but not yet validated ' +
-    'on a walk-forward sample large enough to clear the promotion guardrails.',
+    'v0.1 — same K-rate bug fix as the 1+ variant. New hash reflects ' +
+    'the corrected scoring behaviour. Historical rows keep their ' +
+    'pre-fix hash. Still EXPERIMENTAL.',
+};
+
+// ---------------------------------------------------------------------
+// v2 EXPERIMENT — side-by-side with v1, not a replacement
+// ---------------------------------------------------------------------
+//
+// User-approved changes vs v1 (from the rank-ordering diagnostic):
+//   - hit_rate_l7d_asof: 3 → 1   (materially reduced, not removed)
+//   - pitcher_whip_asof: 2 → 0.5 (recognises ρ=0.877 with H/9;
+//     not fully removed on 7 dates of evidence alone)
+//   - season_k_rate_asof: excluded (same K-rate bug fix; if it re-
+//     appears in the feature builder later, v2 configs won't try to
+//     read it)
+//   - recent_k_rate_asof: -2 (unchanged; the diagnostic showed the
+//     historical -5 effective weight came from the K-rate duplication
+//     bug, and user does not want to preserve that accidental weight)
+//   - Every other weight unchanged from v1
+//
+// Temperature kept at 10 so v1 and v2 Hit Score magnitudes are directly
+// comparable in the disagreement view.
+//
+// is_validated stays false — v2 becomes validated only through the same
+// walk-forward promotion guardrails as v1 would.
+
+export const HIT_MODEL_1PLUS_V2: HitModelConfig = {
+  id: 'experimental_v2_det_1plus',
+  kind: 'DET',
+  features: V2_FEATURE_ORDER_1PLUS,
+  standardize: 'z_score_per_day',
+  fixed_standardization: null,
+  weights: {
+    season_avg_asof:          6,
+    hit_rate_l7d_asof:        1,       // v1: 3
+    hits_l7d_asof:            1,
+    ab_l7d_asof:              0,
+    expected_pa:              5,
+    recent_k_rate_asof:      -2,
+    pitcher_h_per_9_asof:     3,
+    pitcher_whip_asof:        0.5,     // v1: 2 (ρ=0.877 with H/9)
+    pitcher_k_per_9_asof:    -3,
+    pitcher_bb_per_9_asof:    1,
+    platoon_hit_rate_asof:    1,
+    weather_temp_f:           0.5,
+    weather_wind_mph:         0,
+  },
+  bias: 0,
+  temperature: 10,
+  transform: 'sigmoid',
+  target: 'hit_1plus',
+  is_validated: false,
+  promoted_from_walkforward: null,
+  notes:
+    'v2 experiment (1+). Reduced hit_rate_l7d 3→1 to test the ' +
+    'no-recent-rate ablation finding. Reduced pitcher_whip 2→0.5 to ' +
+    'partially deduplicate with H/9 (ρ=0.877). Pitcher context and ' +
+    'season/opportunity signals preserved. Runs side-by-side with v1; ' +
+    'promotion decided by prospective walk-forward performance.',
+};
+
+export const HIT_MODEL_2PLUS_V2: HitModelConfig = {
+  id: 'experimental_v2_det_2plus',
+  kind: 'DET',
+  features: V2_FEATURE_ORDER_2PLUS,
+  standardize: 'z_score_per_day',
+  fixed_standardization: null,
+  weights: {
+    season_avg_asof:          5,
+    hit_rate_l7d_asof:        1,       // v1: 3 — ablation showed Top-3 38.1 → 47.6, mono 0.216 → 0.310
+    hits_l7d_asof:            2,
+    ab_l7d_asof:              1,
+    expected_pa:              6,
+    recent_k_rate_asof:      -2,
+    pitcher_h_per_9_asof:     3,
+    pitcher_whip_asof:        0.5,     // v1: 2
+    pitcher_k_per_9_asof:    -2,
+    pitcher_bb_per_9_asof:    1,
+    platoon_hit_rate_asof:    1,
+    weather_temp_f:           0.5,
+    weather_wind_mph:         0,
+    multi_hit_rate_l10g_asof: 4,
+  },
+  bias: 0,
+  temperature: 10,
+  transform: 'sigmoid',
+  target: 'hit_2plus',
+  is_validated: false,
+  promoted_from_walkforward: null,
+  notes:
+    'v2 experiment (2+). Same reductions as v2 1+. Multi-hit rate + ' +
+    'expected_pa + pitcher context all preserved per the ablation ' +
+    'evidence (no_pitcher damaged 6-10 bucket). Runs side-by-side ' +
+    'with v1; promotion decided by prospective walk-forward performance.',
 };
 
 /** Cached at module-load so writers don't recompute per row. Safe to
  *  export — the hash of an immutable config never changes at runtime. */
 export const HIT_MODEL_1PLUS_HASH = hashConfig(HIT_MODEL_1PLUS);
 export const HIT_MODEL_2PLUS_HASH = hashConfig(HIT_MODEL_2PLUS);
+export const HIT_MODEL_1PLUS_V2_HASH = hashConfig(HIT_MODEL_1PLUS_V2);
+export const HIT_MODEL_2PLUS_V2_HASH = hashConfig(HIT_MODEL_2PLUS_V2);
 
-/** Small utility: dump the current model hashes so anyone editing this
- *  file can paste the new values into their commit message. Also
- *  invoked at the start of snapshotHitTargets to log which configs
- *  scored today's run into the operator's stdout. */
+// ---------------------------------------------------------------------
+// HIT_MODEL_VERSIONS — the source of truth for which model_versions
+// exist and which config pair scores each. snapshotHitTargets iterates
+// this array so future v3/v4 additions are a one-file edit.
+//
+// The model_version int matches the model_version column on
+// hit_target_universe / hit_target_snapshots — that column is what the
+// UI's model selector filters by.
+// ---------------------------------------------------------------------
+
+export interface HitModelVersionSpec {
+  version: number;
+  label: string;                  // 'v1 Current' | 'v2 Experimental' etc.
+  is_default: boolean;            // which one the UI shows by default
+  config_1plus: HitModelConfig;
+  config_2plus: HitModelConfig;
+}
+
+export const HIT_MODEL_VERSIONS: HitModelVersionSpec[] = [
+  {
+    version: 1,
+    label: 'v1 Current',
+    is_default: true,
+    config_1plus: HIT_MODEL_1PLUS,
+    config_2plus: HIT_MODEL_2PLUS,
+  },
+  {
+    version: 2,
+    label: 'v2 Experimental',
+    is_default: false,
+    config_1plus: HIT_MODEL_1PLUS_V2,
+    config_2plus: HIT_MODEL_2PLUS_V2,
+  },
+];
+
+/** Small utility: dump every model version's ids + hashes so an operator
+ *  editing this file can paste the new values into their commit message.
+ *  Called at the start of snapshotHitTargets to log which configs scored
+ *  the run into stdout. */
 export function describeHitModels(): string {
-  return [
-    'Hit model configs:',
-    `  1+: id=${HIT_MODEL_1PLUS.id.padEnd(36)} hash=${HIT_MODEL_1PLUS_HASH}  validated=${HIT_MODEL_1PLUS.is_validated}`,
-    `  2+: id=${HIT_MODEL_2PLUS.id.padEnd(36)} hash=${HIT_MODEL_2PLUS_HASH}  validated=${HIT_MODEL_2PLUS.is_validated}`,
-  ].join('\n');
+  const lines: string[] = ['Hit model configs:'];
+  for (const v of HIT_MODEL_VERSIONS) {
+    lines.push(
+      `  v${v.version} (${v.label})` + (v.is_default ? '  [default]' : ''),
+      `    1+: id=${v.config_1plus.id.padEnd(36)} hash=${hashConfig(v.config_1plus)}  validated=${v.config_1plus.is_validated}`,
+      `    2+: id=${v.config_2plus.id.padEnd(36)} hash=${hashConfig(v.config_2plus)}  validated=${v.config_2plus.is_validated}`,
+    );
+  }
+  return lines.join('\n');
 }
