@@ -228,6 +228,58 @@ async function fetchSavedSnapshot(date: string): Promise<HrTargetSnapshotRow[]> 
   return (data ?? []) as HrTargetSnapshotRow[];
 }
 
+/**
+ * Batting-order slot chip (HR Option A — display-only).
+ *
+ * A small compact pill (e.g. `Bat 1`) that renders next to the player name
+ * when the player is confirmed in a posted lineup and a legit slot 1–9 is
+ * known. Purely display-time: it reads from a React context populated from
+ * the already-fetched `games.home_lineup` / `games.away_lineup` arrays.
+ *
+ * Explicitly NOT:
+ *   - persisted anywhere
+ *   - part of computeHrTargets / HR scoring
+ *   - stored on hr_target_snapshots or hr_target_universe
+ *
+ * If we later decide to persist slot into the HR pipeline (Option B), it
+ * will be a separate change; this component and context stay display-only.
+ */
+const LineupSlotContext = React.createContext<Map<number, number>>(new Map());
+
+function LineupSlotChip({
+  player_id,
+  lineup_status,
+}: {
+  player_id: number;
+  lineup_status?: 'confirmed' | 'pending' | 'not_starting' | 'postponed' | string | null;
+}) {
+  const slotMap = React.useContext(LineupSlotContext);
+  // Only render for confirmed lineups with a real slot 1..9.
+  if (lineup_status !== 'confirmed') return null;
+  const slot = slotMap.get(player_id);
+  if (!slot || slot < 1 || slot > 9) return null;
+  return (
+    <span
+      title={`Batting ${slot}${slot === 1 ? 'st' : slot === 2 ? 'nd' : slot === 3 ? 'rd' : 'th'} — confirmed lineup slot`}
+      style={{
+        marginLeft: 6,
+        padding: '1px 6px',
+        fontSize: 10,
+        fontWeight: 700,
+        letterSpacing: 0.3,
+        borderRadius: 4,
+        border: '1px solid var(--border)',
+        background: 'var(--panel-2, rgba(255,255,255,0.04))',
+        color: 'var(--muted, #a9b0be)',
+        verticalAlign: 'middle',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      Bat {slot}
+    </span>
+  );
+}
+
 export default function HrTargets() {
   const [searchParams, setSearchParams] = useSearchParams();
   const initialTarget = searchParams.get('date') ?? todayISO();
@@ -677,6 +729,28 @@ export default function HrTargets() {
     [canonHrs, asOf, targetGames, pitcherIndex, venueIndex, elitePowerIds],
   );
 
+  // HR Option A — batting-order slot lookup (display-only, not persisted).
+  //   player_id → slot number (1..9), built from confirmed lineup arrays on
+  //   `games`. A hitter appears in at most one game per day, so a flat map
+  //   is safe. Consumed by <LineupSlotChip> via LineupSlotContext.
+  //   Does NOT feed computeHrTargets or any snapshot writer.
+  const slotByPlayer = useMemo(() => {
+    const m = new Map<number, number>();
+    for (const g of games) {
+      if (Array.isArray(g.home_lineup)) {
+        g.home_lineup.forEach((pid, i) => {
+          if (pid != null && i >= 0 && i < 9) m.set(pid, i + 1);
+        });
+      }
+      if (Array.isArray(g.away_lineup)) {
+        g.away_lineup.forEach((pid, i) => {
+          if (pid != null && i >= 0 && i < 9) m.set(pid, i + 1);
+        });
+      }
+    }
+    return m;
+  }, [games]);
+
   // Flatten across all games + sort by Heat Score desc.
   // `allRankedRaw` = everyone (used for the sleeper layer + bench section).
   // `allRanked` = the eligible pool (confirmed + pending), with not_starting
@@ -777,7 +851,7 @@ export default function HrTargets() {
   const tomorrow = addDays(today, 1);
 
   return (
-    <>
+    <LineupSlotContext.Provider value={slotByPlayer}>
       <div className="kpi-strip" style={{ marginBottom: 12 }}>
         <Kpi label="Target date" value={targetDate} />
         <Kpi label="Stats anchor" value={asOf} />
@@ -969,7 +1043,10 @@ export default function HrTargets() {
                   {modelDisagreements.slice(0, 5).map(({ target: t, rank }) => (
                     <tr key={`${t.player_id}-${rank}`}>
                       <td className="num">{rank}</td>
-                      <td><Link className="player-link" to={`/player/${t.player_id}?asOf=${asOf}`}>{t.player_name}</Link></td>
+                      <td>
+                        <Link className="player-link" to={`/player/${t.player_id}?asOf=${asOf}`}>{t.player_name}</Link>
+                        <LineupSlotChip player_id={t.player_id} lineup_status={t.lineup_status} />
+                      </td>
                       <td><span className="pill">{t.team}</span></td>
                       <td className="subtle" style={{ fontSize: 12 }}>vs {t.opponent}</td>
                       <td className="num">{t.season_hr}</td>
@@ -1015,7 +1092,7 @@ export default function HrTargets() {
           <GameTargetsCard key={b.game_pk} board={b} asOf={asOf} />
         ))}
       </div>
-    </>
+    </LineupSlotContext.Provider>
   );
 }
 
@@ -1077,6 +1154,7 @@ function Top10Table({ targets, asOf }: { targets: HrTarget[]; asOf: string }) {
                     )}
                     {' '}
                     <LineupStatusTag status={t.lineup_status} />
+                    <LineupSlotChip player_id={t.player_id} lineup_status={t.lineup_status} />
                   </td>
                   <td><span className="pill">{t.team}</span></td>
                   <td className="subtle" style={{ fontSize: 12 }}>vs {t.opponent}</td>
@@ -2031,6 +2109,7 @@ function SidePanel({
                     <Link className="player-link" to={`/player/${t.player_id}?asOf=${asOf}`}>
                       {t.player_name}
                     </Link>
+                    <LineupSlotChip player_id={t.player_id} lineup_status={t.lineup_status} />
                   </td>
                   <td>{t.batter_side ?? '—'}</td>
                   <td className="num">{t.hrs_l3}</td>

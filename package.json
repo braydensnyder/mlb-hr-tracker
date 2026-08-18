@@ -21,6 +21,7 @@
     "enrich:hit-outcomes": "tsx scripts/runEnrichHitOutcomes.ts",
     "diagnose:hit-calibration": "tsx scripts/diagnoseHitCalibration.ts",
     "backfill:hit-snapshots": "tsx scripts/runBackfillHitSnapshots.ts",
+    "probe:hits": "node scripts/probeHitsState.mjs",
     "diagnose:hit-ordering": "tsx scripts/diagnoseHitRankOrdering.ts",
     "rebuild:all": "tsx scripts/runRebuildAll.ts",
     "enrich:handedness": "tsx scripts/runEnrichHandedness.ts",

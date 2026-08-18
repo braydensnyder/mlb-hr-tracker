@@ -44,6 +44,7 @@ interface Args {
   to: string;
   skipSummaryRebuild: boolean;
   skipEnrichment: boolean;
+  forceEnrichment: boolean;
   verifyOnly: boolean;
 }
 
@@ -53,6 +54,7 @@ function parseArgs(argv: string[]): Args {
   let last: number | null = null;
   let skipSummaryRebuild = false;
   let skipEnrichment = false;
+  let forceEnrichment = false;
   let verifyOnly = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -61,6 +63,10 @@ function parseArgs(argv: string[]): Args {
     else if (a === '--last') last = Number(argv[++i]);
     else if (a === '--skip-summary-rebuild') skipSummaryRebuild = true;
     else if (a === '--skip-enrichment') skipEnrichment = true;
+    // Re-write outcome columns even for already-enriched rows. Useful
+    // after backfilling batting_lines mid-run, or when validating that
+    // the enrichment path itself produces the expected outcomes.
+    else if (a === '--force-enrichment') forceEnrichment = true;
     else if (a === '--verify-only') verifyOnly = true;
     else if (/^\d{4}-\d{2}-\d{2}$/.test(a)) { from = to = a; }
     else throw new Error(`Unknown arg: ${a}`);
@@ -68,7 +74,7 @@ function parseArgs(argv: string[]): Args {
   if (last != null && !from) from = mlbAddDays(to, -(last - 1));
   if (!from) from = to;
   if (from > to) throw new Error(`--from (${from}) > --to (${to})`);
-  return { from, to, skipSummaryRebuild, skipEnrichment, verifyOnly };
+  return { from, to, skipSummaryRebuild, skipEnrichment, forceEnrichment, verifyOnly };
 }
 
 function iterateDates(from: string, to: string): string[] {
@@ -176,6 +182,11 @@ async function main() {
   const dates = iterateDates(args.from!, args.to);
   console.log(`  ${dates.length} date(s) to process\n`);
 
+  // Track failures so a mid-loop error can't be lost in the console
+  // scrollback. Reported (with non-zero exit) at the very end.
+  const failed: Array<{ date: string; stage: string; message: string }> = [];
+  const enrichedByDate = new Map<string, { enriched: number; zeroed: number; already: number; total: number }>();
+
   for (const D of dates) {
     const asOf = mlbAddDays(D, -1);
     console.log(`\n──────────────── ${D} ────────────────`);
@@ -220,10 +231,18 @@ async function main() {
     // 4. enrich outcomes
     if (!args.skipEnrichment) {
       try {
-        const er = await enrichHitOutcomes(D);
+        const er = await enrichHitOutcomes(D, { force: args.forceEnrichment });
         console.log(`  → enrichment · enriched=${er.snapshot_rows_enriched} · zeroed=${er.snapshot_rows_no_batting_line} · already=${er.snapshot_rows_already_enriched}`);
+        enrichedByDate.set(D, {
+          enriched: er.snapshot_rows_enriched,
+          zeroed: er.snapshot_rows_no_batting_line,
+          already: er.snapshot_rows_already_enriched,
+          total: er.snapshot_rows_total,
+        });
       } catch (e) {
-        console.warn(`  ⚠ enrichHitOutcomes(${D}) failed (continuing): ${e instanceof Error ? e.message : e}`);
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`  ⚠ enrichHitOutcomes(${D}) FAILED: ${msg}`);
+        failed.push({ date: D, stage: 'enrichHitOutcomes', message: msg });
       }
     } else {
       console.log(`  (skipped enrichment — --skip-enrichment)`);
@@ -232,7 +251,31 @@ async function main() {
 
   await verify(args.from!, args.to);
 
-  console.log(`Done. Rerun the calibration audit:`);
+  // Post-run summary — visible enough that a silent per-date enrichment
+  // failure can't hide in the scrollback and produce the "outcomes
+  // pending" regression the user hit.
+  console.log(`\n═══ Post-run enrichment summary ═══`);
+  for (const D of dates) {
+    const s = enrichedByDate.get(D);
+    if (!s) {
+      console.log(`  ${D}: enrichment DID NOT RUN`);
+    } else {
+      console.log(
+        `  ${D}: enriched=${s.enriched}/${s.total}` +
+        (s.zeroed > 0 ? ` zeroed(no-batting-line)=${s.zeroed}` : '') +
+        (s.already > 0 ? ` already=${s.already}` : '')
+      );
+    }
+  }
+  if (failed.length > 0) {
+    console.error(`\n${failed.length} stage failure(s):`);
+    for (const f of failed) console.error(`  ${f.date} [${f.stage}]: ${f.message}`);
+    console.error(`\nRe-run enrichment for the failed dates via:`);
+    console.error(`  npm run enrich:hit-outcomes -- --from ${args.from} --to ${args.to} --force\n`);
+    process.exit(1);
+  }
+
+  console.log(`\nDone. Rerun the calibration audit:`);
   console.log(`  npm run diagnose:hit-calibration -- --from ${args.from} --to ${args.to}\n`);
 }
 
