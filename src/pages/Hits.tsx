@@ -189,6 +189,10 @@ export default function Hits() {
               <span>{outcomesAvailable ? 'outcomes enriched' : 'outcomes pending'}</span>
             </>
           )}
+          <span>·</span>
+          <span title="The Hit Score column is the ranker's raw sigmoid output ×100. It is NOT an empirically calibrated probability. Ranking within the day is meaningful; the absolute value is not a P(hit).">
+            Hit Score = ranker output, not a calibrated probability
+          </span>
         </div>
       )}
 

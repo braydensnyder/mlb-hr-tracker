@@ -178,7 +178,11 @@ export default function HitsBoard({ rows, ranker, limit, showOutcomeBadges, pitc
   const rankKey = ranker === '1plus' ? 'rank_1plus' : 'rank_2plus';
   const probKey = ranker === '1plus' ? 'hit_prob_1plus' : 'hit_prob_2plus';
   const confKey = ranker === '1plus' ? 'confidence_1plus' : 'confidence_2plus';
-  const probLabel = ranker === '1plus' ? 'P(1+)' : 'P(2+)';
+  // Column header is 'Hit Score' — the sigmoid output has NOT been
+  // empirically calibrated as a probability yet. Showing 87.3% would be
+  // dishonest. Instead render the value × 100 (0-100 monotone score)
+  // with no percent sign. Ranking order is unchanged.
+  const scoreLabel = 'Hit Score';
 
   const sorted = rows
     .filter((r) => r[rankKey] != null)
@@ -200,7 +204,7 @@ export default function HitsBoard({ rows, ranker, limit, showOutcomeBadges, pitc
             <th style={{ padding: '6px 8px', textAlign: 'left', width: 32 }}>#</th>
             <th style={{ padding: '6px 8px', textAlign: 'left' }}>Player</th>
             <th style={{ padding: '6px 8px', textAlign: 'left' }}>Matchup</th>
-            <th style={{ padding: '6px 8px', textAlign: 'right' }}>{probLabel}</th>
+            <th style={{ padding: '6px 8px', textAlign: 'right' }} title="Ranker output, not an empirically calibrated probability. Higher = better within this day's slate.">{scoreLabel}</th>
             <th style={{ padding: '6px 8px', textAlign: 'center', width: 40 }}>Slot</th>
             <th style={{ padding: '6px 8px', textAlign: 'left' }}>Opp Pitcher</th>
             <th style={{ padding: '6px 8px', textAlign: 'center', width: 48 }}>Conf</th>
@@ -241,7 +245,7 @@ export default function HitsBoard({ rows, ranker, limit, showOutcomeBadges, pitc
                   {r.team} → {r.opponent ?? '—'}
                 </td>
                 <td style={{ padding: '8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: 'var(--text)', fontWeight: 500 }}>
-                  {prob != null ? `${(Number(prob) * 100).toFixed(1)}%` : '—'}
+                  {prob != null ? (Number(prob) * 100).toFixed(1) : '—'}
                 </td>
                 <td style={{ padding: '8px', textAlign: 'center', color: 'var(--muted)', fontVariantNumeric: 'tabular-nums' }}>
                   {r.batting_order_slot ?? '—'}
