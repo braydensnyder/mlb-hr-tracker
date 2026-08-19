@@ -17,10 +17,20 @@ import HitsBoard from '../components/HitsBoard';
 
 type Ranker = '1plus' | '2plus';
 type BoardLimit = 10 | 25 | 50 | 999;
+type ViewMode = 'auto' | 'frozen' | 'live';
 
 const LIMIT_LABELS: Record<BoardLimit, string> = {
   10: 'Top 10', 25: 'Top 25', 50: 'Top 50', 999: 'Full',
 };
+
+/** Compact HH:MM AM/PM localized to the viewer's browser. Falls back to
+ *  the raw ISO string if the input can't be parsed. */
+function fmtClock(iso: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+}
 
 const DEFAULT_MODEL_VERSION = HIT_MODEL_VERSIONS.find((v) => v.is_default)?.version ?? 1;
 
@@ -41,6 +51,13 @@ export default function Hits() {
     }
     return DEFAULT_MODEL_VERSION;
   })();
+  // ?view=frozen|live|auto — chooses source table.
+  //   auto (default) — snapshot when it exists, else universe. The
+  //     official "grade what we froze" behavior once Phase 4.7 has run.
+  //   frozen         — force snapshot table (Frozen Picks toggle).
+  //   live           — force universe table (Live Board toggle).
+  const rawView = params.get('view');
+  const view: ViewMode = rawView === 'frozen' || rawView === 'live' ? rawView : 'auto';
 
   const [bundle, setBundle] = useState<HitBoardBundle | null>(null);
   const [loading, setLoading] = useState(true);
@@ -52,11 +69,16 @@ export default function Hits() {
     let cancelled = false;
     setLoading(true);
     setErr(null);
-    fetchHitTargetsForDate(date, { modelVersion, preferSnapshots: date !== today })
+    // Mode maps directly from the URL param — 'auto' lets the fetcher
+    // pick snapshot when one exists for today (so we default to Frozen
+    // Picks the moment Phase 4.7 lands), universe when it doesn't yet.
+    const fetchMode: 'auto' | 'snapshot' | 'live' =
+      view === 'frozen' ? 'snapshot' : view === 'live' ? 'live' : 'auto';
+    fetchHitTargetsForDate(date, { modelVersion, mode: fetchMode })
       .then((b) => { if (!cancelled) { setBundle(b); setLoading(false); } })
       .catch((e) => { if (!cancelled) { setErr(e instanceof Error ? e.message : String(e)); setLoading(false); } });
     return () => { cancelled = true; };
-  }, [date, today, modelVersion]);
+  }, [date, today, modelVersion, view]);
 
   // Load the players catalog once — used to resolve opposing-pitcher names.
   useEffect(() => {
@@ -79,16 +101,36 @@ export default function Hits() {
   const showOutcomeBadges = bundle?.source === 'snapshots' && outcomesAvailable;
   const experimental = !!bundle && (!bundle.model_1plus_is_validated || !bundle.model_2plus_is_validated);
 
-  // Snapshot status label. Priority: FINAL beats PREGAME; SIMULATED
-  // always distinct so a backfilled row is never confused with a
-  // real pregame audit record.
+  // Snapshot status label with timestamp. Priority: FINAL beats PREGAME;
+  // SIMULATED always distinct so a backfilled row is never confused
+  // with a real pregame audit record. Universe rows carry the freshest
+  // captured_at ("LIVE — updated 10:42 AM"); snapshot rows carry
+  // pregame_run_at ("PREGAME — FROZEN 11:15 AM"). FINAL takes precedence
+  // over PREGAME once outcomes are enriched.
   const snapshotStatus: { label: string; tone: 'good' | 'neutral' | 'warn' } | null = (() => {
     if (!bundle) return null;
-    if (bundle.source === 'universe') return { label: 'LIVE VIEW', tone: 'neutral' };
-    if (bundle.snapshot_type === 'simulated') return { label: 'SIMULATED HISTORICAL', tone: 'warn' };
-    if (bundle.outcomes_enriched) return { label: 'FINAL — RESULTS ENRICHED', tone: 'good' };
-    return { label: 'PREGAME — FROZEN', tone: 'neutral' };
+    if (bundle.source === 'universe') {
+      const ts = fmtClock(bundle.updated_at);
+      return { label: `LIVE — updated ${ts}`, tone: 'neutral' };
+    }
+    if (bundle.snapshot_type === 'simulated') {
+      return { label: 'SIMULATED HISTORICAL', tone: 'warn' };
+    }
+    if (bundle.outcomes_enriched) {
+      return { label: 'FINAL — RESULTS ENRICHED', tone: 'good' };
+    }
+    const ts = fmtClock(bundle.updated_at);
+    return { label: `PREGAME — FROZEN ${ts}`, tone: 'neutral' };
   })();
+
+  // Companion "PREGAME — FROZEN HH:MM" badge shown alongside LIVE when
+  // we're viewing the universe but a snapshot ALREADY exists for the
+  // day. Tells the user "the graded picks stopped moving at 11:15 AM,
+  // this view is what's changed since then."
+  const companionFrozenBadge: string | null =
+    bundle && bundle.source === 'universe' && bundle.snapshot_available && bundle.snapshot_frozen_at
+      ? `PREGAME — FROZEN ${fmtClock(bundle.snapshot_frozen_at)}`
+      : null;
 
   // Top-N daily summary for the currently-selected ranker.
   // Uses the outcome field aligned with the ranker (1+ board sums
@@ -218,6 +260,21 @@ export default function Hits() {
             </button>
           ))}
         </div>
+        {/* Frozen / Live toggle — only meaningful when a snapshot
+            exists for the day. Grade-what-we-froze default is 'auto'
+            which resolves to snapshot the moment Phase 4.7 writes it. */}
+        {bundle && bundle.snapshot_available && (
+          <div style={segGroup()} title="Frozen Picks = the graded pregame snapshot (immutable). Live Board = the working hit_target_universe (moves as inputs update).">
+            {(['frozen', 'live'] as const).map((v) => {
+              const active = view === v || (view === 'auto' && v === 'frozen');
+              return (
+                <button key={v} onClick={() => updateParam('view', v)} style={segBtn(active)}>
+                  {v === 'frozen' ? 'Frozen Picks' : 'Live Board'}
+                </button>
+              );
+            })}
+          </div>
+        )}
         <div style={{ ...segGroup(), marginLeft: 'auto' }}>
           {([10, 25, 50, 999] as BoardLimit[]).map((n) => (
             <button key={n} onClick={() => updateParam('n', String(n))} style={segBtn(validLimit === n)}>
@@ -235,8 +292,14 @@ export default function Hits() {
         }}>
           {snapshotStatus && (
             <span style={statusBadgeStyle(snapshotStatus.tone)}
-                  title="PREGAME — FROZEN: written before first pitch, ranks immutable. FINAL — RESULTS ENRICHED: pregame ranks with actual outcomes filled in. SIMULATED HISTORICAL: reconstructed via backfill AFTER games completed — never confuse with a real pregame audit record.">
+                  title="LIVE — updated HH:MM: hit_target_universe was last refreshed at this time. PREGAME — FROZEN HH:MM: hit_target_snapshots was written at this time and cannot move. FINAL — RESULTS ENRICHED: pregame ranks with actual outcomes filled in. SIMULATED HISTORICAL: reconstructed via backfill AFTER games completed.">
               {snapshotStatus.label}
+            </span>
+          )}
+          {companionFrozenBadge && (
+            <span style={statusBadgeStyle('good')}
+                  title="A frozen pregame snapshot exists for this date. Grading is against those ranks — this live view shows what has changed since the freeze.">
+              {companionFrozenBadge}
             </span>
           )}
           <span>
@@ -248,7 +311,7 @@ export default function Hits() {
           <span>v{bundle.model_version}</span>
           <span>·</span>
           <span>{bundle.rows.length} starters</span>
-          {isPastDate && !outcomesAvailable && (
+          {isPastDate && bundle.source === 'snapshots' && !outcomesAvailable && (
             <>
               <span>·</span>
               <span>outcomes pending</span>

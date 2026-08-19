@@ -46,7 +46,7 @@ import { snapshotHrTargets, type SnapshotResult } from './snapshotHrTargets.js';
 import { captureDay } from './learning/captureDay.js';
 import { captureChangesForDate } from './learning/captureChanges.js';
 import { computeAiPicksForDate, computeAiPicksPregame } from './learning/computeAiPicks.js';
-import { snapshotHitTargets } from './snapshotHitTargets.js';
+import { snapshotHitTargets, refreshHitUniverse } from './snapshotHitTargets.js';
 import { enrichHitOutcomes } from './enrichHitOutcomes.js';
 import { replayDateForVersions, type DayModelOutcome } from './learning/replayModels.js';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
@@ -654,6 +654,60 @@ export async function updateDaily(
     );
   } else {
     console.log(`    (summary rebuilds skipped — mode=${mode})`);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  //  Phase 5c — Refresh Hits universe (score-only)
+  //
+  //  Re-scores today's hit_target_universe against the freshest inputs
+  //  we just refreshed: lineups (Phase 3.5), probable pitchers
+  //  (heavy enrichments), pitcher form + rolling hit summaries
+  //  (Phase 5b). This is the "live board" that keeps moving during the
+  //  day. The frozen hit_target_snapshots is NEVER touched here —
+  //  refreshHitUniverse is universe-only by design, so the graded
+  //  pregame picks stop moving once Phase 4.7 has written them.
+  //
+  //  Runs on every non-light tier. Skipped on `light` because that
+  //  mode also skips the summary rebuilds it would depend on.
+  //  Fully isolated try/catch — a Hits failure MUST NOT break the run.
+  // ─────────────────────────────────────────────────────────────────────
+  if (mode !== 'light') {
+    console.log(`\n▶ 5c) Refresh Hits universe (score-only, live board)`);
+    const uStartedAt = Date.now();
+    try {
+      const uRes = await refreshHitUniverse(today);
+      const totalUniverse = uRes.per_version.reduce((s, v) => s + v.universe_rows_written, 0);
+      const icon =
+        uRes.status === 'universe_refreshed' ? '✓' :
+        uRes.status === 'no_games' || uRes.status === 'no_candidates' ? '·' :
+        '⚠';
+      console.log(
+        `  ${icon} hits universe [${uRes.status}] — ${uRes.reason} · ` +
+        `candidates=${uRes.candidates_total} (${uRes.candidates_confirmed} confirmed, ${uRes.candidates_pending} pending) · ` +
+        `universe=${totalUniverse} · snapshot untouched (${uRes.wrote_snapshot ? 'wrote' : 'preserved'})`,
+      );
+      steps.push({
+        step: 'refresh:hits-universe',
+        durationMs: Date.now() - uStartedAt,
+        ok: true,
+        detail: {
+          date: uRes.date,
+          status: uRes.status,
+          candidates_total: uRes.candidates_total,
+          per_version: uRes.per_version,
+          wrote_snapshot: uRes.wrote_snapshot,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`  ⚠ refresh:hits-universe FAILED (non-fatal, HR path unaffected): ${msg}`);
+      steps.push({
+        step: 'refresh:hits-universe',
+        durationMs: Date.now() - uStartedAt,
+        ok: false,
+        detail: msg,
+      });
+    }
   }
 
   // -------------------------------------------------------------

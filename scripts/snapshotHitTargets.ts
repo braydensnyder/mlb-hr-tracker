@@ -61,7 +61,7 @@ export interface SnapshotHitPerVersion {
 
 export interface SnapshotHitResult {
   date: string;
-  status: 'written' | 'frozen_kept' | 'refused_games_started' | 'no_games' | 'no_candidates';
+  status: 'written' | 'frozen_kept' | 'refused_games_started' | 'no_games' | 'no_candidates' | 'universe_refreshed';
   reason: string;
   games_total: number;
   games_started: number;
@@ -71,6 +71,9 @@ export interface SnapshotHitResult {
   /** Per-version write summary. One entry per HIT_MODEL_VERSIONS spec.
    *  v1 and v2 are computed and persisted independently every run. */
   per_version: SnapshotHitPerVersion[];
+  /** True when this run wrote to hit_target_snapshots. False when the
+   *  run only refreshed hit_target_universe (universe-only mode). */
+  wrote_snapshot: boolean;
 }
 
 export interface SnapshotHitOptions {
@@ -84,6 +87,12 @@ export interface SnapshotHitOptions {
   /** Restrict to specific model versions. Default: all versions defined
    *  in HIT_MODEL_VERSIONS. Useful for spot re-runs. */
   onlyVersions?: number[];
+  /** Universe-only refresh — score and write to hit_target_universe but
+   *  DO NOT touch hit_target_snapshots. The morning/midday phases use
+   *  this to refresh the live board without moving the frozen picks.
+   *  Skips the games-started fence (universe can always update since
+   *  it's the live/working board, not a graded record). */
+  universeOnly?: boolean;
 }
 
 // ---------------------------------------------------------------------
@@ -467,11 +476,15 @@ function round4(n: number): number {
 
 export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions = {}): Promise<SnapshotHitResult> {
   const force = !!opts.force;
-  const skipIfStarted = opts.skipIfGamesStarted ?? true;
+  const universeOnly = !!opts.universeOnly;
+  // Universe-only refresh bypasses the games-started fence. Only the
+  // snapshot table is a graded/frozen record; the universe is a live
+  // working board that always reflects freshest inputs.
+  const skipIfStarted = universeOnly ? false : (opts.skipIfGamesStarted ?? true);
   const nowIso = new Date().toISOString();
   const runningToday = date === mlbToday();
 
-  console.log(`[snapshotHitTargets] date=${date}${force ? ' force' : ''}${runningToday ? ' (today)' : ''}`);
+  console.log(`[snapshotHitTargets] date=${date}${force ? ' force' : ''}${universeOnly ? ' UNIVERSE-ONLY' : ''}${runningToday ? ' (today)' : ''}`);
   console.log(describeHitModels().split('\n').map((l) => `  ${l}`).join('\n'));
 
   const versionsToRun: HitModelVersionSpec[] = opts.onlyVersions
@@ -503,6 +516,7 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
       games_total: 0, games_started: 0,
       candidates_total: 0, candidates_confirmed: 0, candidates_pending: 0,
       per_version: emptyPerVersion,
+      wrote_snapshot: false,
     };
   }
 
@@ -525,6 +539,7 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
       games_total: games.length, games_started: startedCount,
       candidates_total: 0, candidates_confirmed: 0, candidates_pending: 0,
       per_version: emptyPerVersion,
+      wrote_snapshot: false,
     };
   }
 
@@ -557,6 +572,7 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
       games_total: games.length, games_started: startedCount,
       candidates_total: 0, candidates_confirmed: 0, candidates_pending: 0,
       per_version: emptyPerVersion,
+      wrote_snapshot: false,
     };
   }
 
@@ -626,6 +642,26 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
     }
     console.log(`    hit_target_universe (v${v.version}): wrote ${universeWritten} rows`);
 
+    // Universe-only mode: skip the snapshot table entirely. Frozen picks
+    // must not move once the pregame snapshot has been written; this
+    // pathway is called from the morning/midday refresh cadence.
+    if (universeOnly) {
+      perVersion.push({
+        model_version: v.version,
+        label: v.label,
+        universe_rows_written: universeWritten,
+        snapshot_rows_written: 0,
+        snapshot_rows_kept_frozen: 0,
+        config_id_1plus: v.config_1plus.id,
+        config_hash_1plus: hashConfig(v.config_1plus),
+        is_validated_1plus: v.config_1plus.is_validated,
+        config_id_2plus: v.config_2plus.id,
+        config_hash_2plus: hashConfig(v.config_2plus),
+        is_validated_2plus: v.config_2plus.is_validated,
+      });
+      continue;
+    }
+
     // Snapshots: first-write-wins per (date, player, model_version).
     const existingSnapshotIds = await loadExistingSnapshotPlayerIds(date, v.version);
     const snapshotRowsToWrite: Array<Record<string, unknown>> = [];
@@ -678,12 +714,19 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
     });
   }
 
+  const totalUniverse = perVersion.reduce((s, v) => s + v.universe_rows_written, 0);
   const status: SnapshotHitResult['status'] =
-    anyKeptFrozen > 0 && anyWritten === 0 && !force ? 'frozen_kept' : 'written';
+    universeOnly
+      ? 'universe_refreshed'
+      : anyKeptFrozen > 0 && anyWritten === 0 && !force
+        ? 'frozen_kept'
+        : 'written';
   const reason =
-    status === 'frozen_kept'
-      ? `all ${anyKeptFrozen} pregame snapshot rows preserved (across versions)`
-      : `${anyWritten} new snapshot rows + ${anyKeptFrozen} kept frozen (across versions)`;
+    status === 'universe_refreshed'
+      ? `refreshed ${totalUniverse} universe rows (snapshot untouched)`
+      : status === 'frozen_kept'
+        ? `all ${anyKeptFrozen} pregame snapshot rows preserved (across versions)`
+        : `${anyWritten} new snapshot rows + ${anyKeptFrozen} kept frozen (across versions)`;
   console.log(
     `\n[snapshotHitTargets] ✓ ${status.toUpperCase()} — ${reason} · type=${snapshotType} · ` +
     `games=${startedCount}/${games.length} started`,
@@ -696,7 +739,23 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
     candidates_confirmed: confirmed,
     candidates_pending: pending,
     per_version: perVersion,
+    wrote_snapshot: !universeOnly,
   };
+}
+
+/**
+ * Universe-only refresh — score today's Hits board and write to
+ * hit_target_universe WITHOUT touching hit_target_snapshots. Called from
+ * the morning + midday phases so the live board can absorb late
+ * lineup / probable pitcher / weather changes right up until the
+ * pregame freeze point.
+ *
+ * The universe is a working board; the snapshot is the graded record.
+ * Once snapshotHitTargets() has written today's snapshot, that record
+ * is immutable — later refreshHitUniverse calls only move the universe.
+ */
+export async function refreshHitUniverse(date: string, opts: Omit<SnapshotHitOptions, 'universeOnly'> = {}): Promise<SnapshotHitResult> {
+  return snapshotHitTargets(date, { ...opts, universeOnly: true });
 }
 
 /** Local addDays — mlbToday module doesn't re-export it under that name.

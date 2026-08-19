@@ -1584,6 +1584,24 @@ export interface HitBoardBundle {
   model_2plus_id: string | null;
   model_2plus_hash: string | null;
   model_2plus_is_validated: boolean;
+  /** Timestamp when this bundle's data was last written.
+   *   - Universe source: freshest `captured_at` across the returned rows
+   *     (the last score-only refresh — Phase 5c).
+   *   - Snapshot source: `pregame_run_at` from the frozen rows (the
+   *     official freeze point — Phase 4.7).
+   *   Powers the LIVE — updated / PREGAME — FROZEN header timestamp. */
+  updated_at: string | null;
+  /** True when a snapshot exists for this date+version (independent of
+   *  the source we actually returned). The /hits page uses this to
+   *  decide whether the Frozen Picks toggle should be available and
+   *  what to default to. Populated by a lightweight sidecar probe when
+   *  the bundle source is 'universe' — otherwise inferred from source. */
+  snapshot_available: boolean;
+  /** Timestamp of the pregame freeze (pregame_run_at) when a snapshot
+   *  exists — surfaced even for universe-source bundles so the
+   *  Live Board view can still show "PREGAME — FROZEN 11:15 AM" as a
+   *  companion badge to the LIVE timestamp. Null when no snapshot. */
+  snapshot_frozen_at: string | null;
 }
 
 /** Detect whether a config id string denotes an experimental config.
@@ -1596,26 +1614,39 @@ function isExperimentalConfigId(id: string | null): boolean {
 }
 
 /**
- * Load one date's Hits board. Prefers hit_target_universe (live view)
- * when target_date == today; falls back to hit_target_snapshots for
- * past dates so the board reflects the frozen pregame audit record.
+ * Load one date's Hits board.
  *
- * `dateIsToday` should be true when the caller has already anchored the
- * page date at the Pacific-anchored today. When true and the universe
- * returns rows, we use those; otherwise we read snapshots (which for
- * today would exist AFTER Phase 4.7 has run).
+ * Two source tables:
+ *   - hit_target_universe: live/working board that updates on every
+ *     morning + midday refresh (Phase 5c).
+ *   - hit_target_snapshots: graded pregame audit record, first-write-
+ *     wins per (date, player, model_version). Written at Phase 4.7 and
+ *     never moved after.
+ *
+ * Selection rules:
+ *   - `mode: 'snapshot'`  → snapshots preferred, universe fallback.
+ *   - `mode: 'live'`      → universe preferred, snapshots fallback.
+ *   - `mode: 'auto'` (or unset) → snapshots when they exist, else
+ *     universe. This is the safe default because once we've frozen a
+ *     record we want the UI to grade against exactly what we froze.
+ *
+ * Legacy `preferSnapshots` is kept for back-compat and maps to 'snapshot'.
  */
 export async function fetchHitTargetsForDate(
   date: string,
-  opts: { modelVersion?: number; preferSnapshots?: boolean } = {},
+  opts: {
+    modelVersion?: number;
+    /** Legacy — same as mode='snapshot'. */
+    preferSnapshots?: boolean;
+    /** 'auto' (default) — snapshot if it exists, else universe. */
+    mode?: 'auto' | 'snapshot' | 'live';
+  } = {},
 ): Promise<HitBoardBundle> {
   const modelVersion = opts.modelVersion ?? 1;
-  const preferSnapshots = !!opts.preferSnapshots;
+  const mode: 'auto' | 'snapshot' | 'live' =
+    opts.mode ?? (opts.preferSnapshots ? 'snapshot' : 'auto');
 
-  // Try snapshots first for past dates OR when caller forced it.
-  const trySnapshotsFirst = preferSnapshots;
-
-  async function readUniverse(): Promise<HitBoardRow[]> {
+  async function readUniverse(): Promise<{ rows: HitBoardRow[]; freshest_captured_at: string | null }> {
     const { data, error } = await supabase
       .from('hit_target_universe')
       .select(
@@ -1626,25 +1657,34 @@ export async function fetchHitTargetsForDate(
         'hit_prob_2plus, hit_score_2plus, rank_2plus, team_rank_2plus, ' +
         'confidence_2plus, contributions_2plus_json, ' +
         'flags, model_config_id_1plus, model_config_hash_1plus, ' +
-        'model_config_id_2plus, model_config_hash_2plus',
+        'model_config_id_2plus, model_config_hash_2plus, ' +
+        'captured_at',
       )
       .eq('target_date', date)
       .eq('model_version', modelVersion);
     if (error) {
-      if (/does not exist|schema cache/i.test(error.message)) return [];
+      if (/does not exist|schema cache/i.test(error.message)) return { rows: [], freshest_captured_at: null };
       throw new Error(`hit_target_universe read: ${error.message}`);
     }
-    return ((data ?? []) as unknown as Array<Omit<HitBoardRow, 'is_snapshot_row' | 'snapshot_type' | 'hits' | 'at_bats' | 'hit_1plus' | 'hit_2plus' | 'doubles' | 'triples' | 'outcome_enriched_at'>>)
-      .map((r) => ({
-        ...r,
+    let freshest: string | null = null;
+    const raw = (data ?? []) as unknown as Array<Omit<HitBoardRow, 'is_snapshot_row' | 'snapshot_type' | 'hits' | 'at_bats' | 'hit_1plus' | 'hit_2plus' | 'doubles' | 'triples' | 'outcome_enriched_at'> & { captured_at: string | null }>;
+    for (const r of raw) {
+      if (r.captured_at && (!freshest || r.captured_at > freshest)) freshest = r.captured_at;
+    }
+    const rows: HitBoardRow[] = raw.map(({ captured_at: _drop, ...rest }) => {
+      void _drop;
+      return {
+        ...rest,
         is_snapshot_row: false,
         snapshot_type: null,
         hits: null, at_bats: null, hit_1plus: null, hit_2plus: null,
         doubles: null, triples: null, outcome_enriched_at: null,
-      }));
+      };
+    });
+    return { rows, freshest_captured_at: freshest };
   }
 
-  async function readSnapshots(): Promise<HitBoardRow[]> {
+  async function readSnapshots(): Promise<{ rows: HitBoardRow[]; pregame_run_at: string | null }> {
     const { data, error } = await supabase
       .from('hit_target_snapshots')
       .select(
@@ -1656,28 +1696,74 @@ export async function fetchHitTargetsForDate(
         'confidence_2plus, contributions_2plus_json, ' +
         'flags, model_config_id_1plus, model_config_hash_1plus, ' +
         'model_config_id_2plus, model_config_hash_2plus, ' +
-        'snapshot_type, ' +
+        'snapshot_type, pregame_run_at, ' +
         'hits, at_bats, hit_1plus, hit_2plus, doubles, triples, outcome_enriched_at',
       )
       .eq('target_date', date)
       .eq('model_version', modelVersion);
     if (error) {
-      if (/does not exist|schema cache/i.test(error.message)) return [];
+      if (/does not exist|schema cache/i.test(error.message)) return { rows: [], pregame_run_at: null };
       throw new Error(`hit_target_snapshots read: ${error.message}`);
     }
-    return ((data ?? []) as unknown as HitBoardRow[]).map((r) => ({ ...r, is_snapshot_row: true }));
+    const raw = (data ?? []) as unknown as Array<HitBoardRow & { pregame_run_at: string | null }>;
+    let firstPregame: string | null = null;
+    const rows: HitBoardRow[] = raw.map(({ pregame_run_at, ...rest }) => {
+      if (pregame_run_at && !firstPregame) firstPregame = pregame_run_at;
+      return { ...rest, is_snapshot_row: true } as HitBoardRow;
+    });
+    return { rows, pregame_run_at: firstPregame };
   }
+
+  // Auto-mode probe: check whether a snapshot exists BEFORE deciding
+  // which source to serve. Cheap head-count query — one row, no payload.
+  async function snapshotExists(): Promise<boolean> {
+    const { count, error } = await supabase
+      .from('hit_target_snapshots')
+      .select('id', { count: 'exact', head: true })
+      .eq('target_date', date)
+      .eq('model_version', modelVersion);
+    if (error) {
+      if (/does not exist|schema cache/i.test(error.message)) return false;
+      return false;
+    }
+    return (count ?? 0) > 0;
+  }
+
+  // Resolve read order based on mode:
+  //   snapshot → snap first, universe fallback
+  //   live     → universe first, snap fallback
+  //   auto     → probe snapshot existence; if present read snapshot, else universe
+  let trySnapshotsFirst = false;
+  if (mode === 'snapshot') trySnapshotsFirst = true;
+  else if (mode === 'live') trySnapshotsFirst = false;
+  else trySnapshotsFirst = await snapshotExists();
 
   let rows: HitBoardRow[] = [];
   let source: 'universe' | 'snapshots' = 'universe';
+  let freshestUniverseAt: string | null = null;
+  let snapshotFrozenAt: string | null = null;
   if (trySnapshotsFirst) {
-    rows = await readSnapshots();
-    source = 'snapshots';
-    if (rows.length === 0) { rows = await readUniverse(); source = 'universe'; }
+    const snap = await readSnapshots();
+    rows = snap.rows; source = 'snapshots'; snapshotFrozenAt = snap.pregame_run_at;
+    if (rows.length === 0) {
+      const uni = await readUniverse();
+      rows = uni.rows; source = 'universe'; freshestUniverseAt = uni.freshest_captured_at;
+    }
   } else {
-    rows = await readUniverse();
-    source = 'universe';
-    if (rows.length === 0) { rows = await readSnapshots(); source = 'snapshots'; }
+    const uni = await readUniverse();
+    rows = uni.rows; source = 'universe'; freshestUniverseAt = uni.freshest_captured_at;
+    if (rows.length === 0) {
+      const snap = await readSnapshots();
+      rows = snap.rows; source = 'snapshots'; snapshotFrozenAt = snap.pregame_run_at;
+    }
+  }
+
+  // Sidecar: when we served universe rows but a snapshot ALSO exists,
+  // still report the freeze timestamp so the UI can render a companion
+  // "PREGAME — FROZEN HH:MM" badge next to the LIVE stamp.
+  if (source === 'universe' && !snapshotFrozenAt) {
+    const snap = await readSnapshots();
+    snapshotFrozenAt = snap.pregame_run_at;
   }
 
   const sample = rows[0] ?? null;
@@ -1688,6 +1774,7 @@ export async function fetchHitTargetsForDate(
   const snapshot_type: HitBoardBundle['snapshot_type'] =
     source === 'snapshots' ? (sample?.snapshot_type ?? null) : null;
   const outcomes_enriched = rows.some((r) => r.outcome_enriched_at != null);
+  const updated_at = source === 'snapshots' ? snapshotFrozenAt : freshestUniverseAt;
   return {
     date,
     source,
@@ -1695,6 +1782,9 @@ export async function fetchHitTargetsForDate(
     rows,
     snapshot_type,
     outcomes_enriched,
+    updated_at,
+    snapshot_available: snapshotFrozenAt != null,
+    snapshot_frozen_at: snapshotFrozenAt,
     model_1plus_id: sample?.model_config_id_1plus ?? null,
     model_1plus_hash: sample?.model_config_hash_1plus ?? null,
     model_1plus_is_validated: !isExperimentalConfigId(sample?.model_config_id_1plus ?? null),
