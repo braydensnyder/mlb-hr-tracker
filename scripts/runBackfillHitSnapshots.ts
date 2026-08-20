@@ -215,16 +215,41 @@ async function main() {
     }
 
     // 3. reconstruct snapshot for D (writes ALL model versions)
+    //    Per-version errors are isolated inside snapshotHitTargets and
+    //    surface as per_version[].error + status='partial_failure'. We
+    //    grade each version explicitly here so a v2 failure cannot
+    //    masquerade as a successful date at the outer summary level.
+    let snapshotResSucceededVersions: number[] = [];
     try {
       const res = await snapshotHitTargets(D, { force: true, skipIfGamesStarted: false });
       const totalUniv = res.per_version.reduce((s, v) => s + v.universe_rows_written, 0);
       const totalSnap = res.per_version.reduce((s, v) => s + v.snapshot_rows_written, 0);
       console.log(`  → snapshot [${res.status}] · candidates=${res.candidates_total} · universe=${totalUniv} · snapshot=${totalSnap} · games=${res.games_started}/${res.games_total} started`);
       for (const pv of res.per_version) {
-        console.log(`      v${pv.model_version} (${pv.label}): universe=${pv.universe_rows_written} · snapshot=${pv.snapshot_rows_written} new / ${pv.snapshot_rows_kept_frozen} frozen`);
+        if (pv.error) {
+          console.error(`      ✗ v${pv.model_version} (${pv.label}): FAILED — ${pv.error}`);
+          failed.push({ date: D, stage: `snapshot(v${pv.model_version})`, message: pv.error });
+        } else {
+          console.log(`      ✓ v${pv.model_version} (${pv.label}): universe=${pv.universe_rows_written} · snapshot=${pv.snapshot_rows_written} new / ${pv.snapshot_rows_kept_frozen} frozen`);
+          snapshotResSucceededVersions.push(pv.model_version);
+        }
+      }
+      if (res.status === 'partial_failure') {
+        console.warn(`  ⚠ ${D} is INCOMPLETE — one or more versions failed. Enrichment below applies only to the versions that succeeded.`);
       }
     } catch (e) {
-      console.warn(`  ⚠ snapshotHitTargets(${D}) failed (continuing): ${e instanceof Error ? e.message : e}`);
+      // Total function-level throw (should be rare now that per-version
+      // errors are isolated). Treat as all-version failure for the date.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`  ✗ snapshotHitTargets(${D}) THREW — no version wrote: ${msg}`);
+      failed.push({ date: D, stage: 'snapshot(function-throw)', message: msg });
+      continue;
+    }
+    if (snapshotResSucceededVersions.length === 0) {
+      // Every version failed via isolated per-version errors — skip
+      // enrichment (nothing to enrich) but keep looping to gather
+      // failures across the rest of the range.
+      console.warn(`  ⚠ ${D}: no versions succeeded — skipping enrichment`);
       continue;
     }
 
@@ -251,26 +276,41 @@ async function main() {
 
   await verify(args.from!, args.to);
 
-  // Post-run summary — visible enough that a silent per-date enrichment
-  // failure can't hide in the scrollback and produce the "outcomes
-  // pending" regression the user hit.
-  console.log(`\n═══ Post-run enrichment summary ═══`);
+  // Per-date grading — a date is COMPLETE only when every version
+  // wrote (no failed[] entry for the date) AND enrichment ran.
+  // Anything less is reported as INCOMPLETE with non-zero exit.
+  console.log(`\n═══ Post-run per-date grading ═══`);
+  const failedByDate = new Map<string, Array<{ stage: string; message: string }>>();
+  for (const f of failed) {
+    const arr = failedByDate.get(f.date) ?? [];
+    arr.push({ stage: f.stage, message: f.message });
+    failedByDate.set(f.date, arr);
+  }
+  let anyIncomplete = false;
   for (const D of dates) {
+    const dateFailures = failedByDate.get(D) ?? [];
     const s = enrichedByDate.get(D);
-    if (!s) {
-      console.log(`  ${D}: enrichment DID NOT RUN`);
-    } else {
+    const complete = dateFailures.length === 0 && !!s;
+    if (complete) {
       console.log(
-        `  ${D}: enriched=${s.enriched}/${s.total}` +
-        (s.zeroed > 0 ? ` zeroed(no-batting-line)=${s.zeroed}` : '') +
-        (s.already > 0 ? ` already=${s.already}` : '')
+        `  ✓ ${D} COMPLETE — enriched=${s!.enriched}/${s!.total}` +
+        (s!.zeroed > 0 ? ` zeroed=${s!.zeroed}` : '') +
+        (s!.already > 0 ? ` already=${s!.already}` : '')
       );
+    } else {
+      anyIncomplete = true;
+      const parts: string[] = [];
+      if (dateFailures.length > 0) parts.push(dateFailures.map((f) => `${f.stage}: ${f.message}`).join(' | '));
+      if (!s) parts.push('enrichment did not run');
+      console.error(`  ✗ ${D} INCOMPLETE — ${parts.join(' · ')}`);
     }
   }
-  if (failed.length > 0) {
-    console.error(`\n${failed.length} stage failure(s):`);
-    for (const f of failed) console.error(`  ${f.date} [${f.stage}]: ${f.message}`);
-    console.error(`\nRe-run enrichment for the failed dates via:`);
+
+  if (anyIncomplete) {
+    console.error(`\n═══ Backfill FAILED — one or more dates are incomplete ═══`);
+    console.error(`Re-run the affected range once the root cause is fixed:`);
+    console.error(`  npm run backfill:hit-snapshots -- --from ${args.from} --to ${args.to}`);
+    console.error(`Or, for outcome-only recovery on dates whose snapshots all succeeded:`);
     console.error(`  npm run enrich:hit-outcomes -- --from ${args.from} --to ${args.to} --force\n`);
     process.exit(1);
   }

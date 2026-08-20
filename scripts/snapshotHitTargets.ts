@@ -57,11 +57,20 @@ export interface SnapshotHitPerVersion {
   config_id_2plus: string;
   config_hash_2plus: string;
   is_validated_2plus: boolean;
+  /** Non-null when this version's scoring/write pass threw. Isolating
+   *  per-version errors here means a v2 failure cannot masquerade as a
+   *  successful date at the outer summary level — the backfill script
+   *  reads per_version[].error to grade each date. */
+  error: string | null;
 }
 
 export interface SnapshotHitResult {
   date: string;
-  status: 'written' | 'frozen_kept' | 'refused_games_started' | 'no_games' | 'no_candidates' | 'universe_refreshed';
+  /** 'partial_failure' — at least one version's scoring/write pass
+   *  errored while at least one succeeded. Callers MUST treat this as
+   *  a failure at the date level (the frontend shows nothing for the
+   *  broken version, so the date is not complete). */
+  status: 'written' | 'frozen_kept' | 'refused_games_started' | 'no_games' | 'no_candidates' | 'universe_refreshed' | 'partial_failure';
   reason: string;
   games_total: number;
   games_started: number;
@@ -503,6 +512,7 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
     config_id_2plus: v.config_2plus.id,
     config_hash_2plus: hashConfig(v.config_2plus),
     is_validated_2plus: v.config_2plus.is_validated,
+    error: null,
   }));
 
   // --- Fetch games (shared across versions) ---
@@ -608,6 +618,7 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
 
   for (const v of versionsToRun) {
     console.log(`\n  ── v${v.version} (${v.label}) ──`);
+    try {
     // Score with this version's configs.
     const boards = computeHitTargets({
       candidates, gamesByPk,
@@ -658,6 +669,7 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
         config_id_2plus: v.config_2plus.id,
         config_hash_2plus: hashConfig(v.config_2plus),
         is_validated_2plus: v.config_2plus.is_validated,
+        error: null,
       });
       continue;
     }
@@ -711,22 +723,60 @@ export async function snapshotHitTargets(date: string, opts: SnapshotHitOptions 
       config_id_2plus: v.config_2plus.id,
       config_hash_2plus: hashConfig(v.config_2plus),
       is_validated_2plus: v.config_2plus.is_validated,
+      error: null,
     });
+    } catch (verErr) {
+      // Isolate per-version failures so a v2 crash doesn't take down
+      // v1's already-written rows or block v3+ iterations. The date is
+      // still reported as `partial_failure` at the outer status level
+      // and the backfill script grades every version explicitly.
+      const msg = verErr instanceof Error ? verErr.message : String(verErr);
+      console.error(`    ✗ v${v.version} (${v.label}) FAILED: ${msg}`);
+      perVersion.push({
+        model_version: v.version,
+        label: v.label,
+        universe_rows_written: 0,
+        snapshot_rows_written: 0,
+        snapshot_rows_kept_frozen: 0,
+        config_id_1plus: v.config_1plus.id,
+        config_hash_1plus: hashConfig(v.config_1plus),
+        is_validated_1plus: v.config_1plus.is_validated,
+        config_id_2plus: v.config_2plus.id,
+        config_hash_2plus: hashConfig(v.config_2plus),
+        is_validated_2plus: v.config_2plus.is_validated,
+        error: msg,
+      });
+    }
   }
 
   const totalUniverse = perVersion.reduce((s, v) => s + v.universe_rows_written, 0);
-  const status: SnapshotHitResult['status'] =
-    universeOnly
-      ? 'universe_refreshed'
-      : anyKeptFrozen > 0 && anyWritten === 0 && !force
-        ? 'frozen_kept'
-        : 'written';
-  const reason =
-    status === 'universe_refreshed'
-      ? `refreshed ${totalUniverse} universe rows (snapshot untouched)`
-      : status === 'frozen_kept'
-        ? `all ${anyKeptFrozen} pregame snapshot rows preserved (across versions)`
-        : `${anyWritten} new snapshot rows + ${anyKeptFrozen} kept frozen (across versions)`;
+  const failedVersions = perVersion.filter((pv) => pv.error != null);
+  const succeededVersions = perVersion.filter((pv) => pv.error == null);
+  const hasPartialFailure = failedVersions.length > 0 && succeededVersions.length > 0;
+  const hasTotalFailure = failedVersions.length > 0 && succeededVersions.length === 0;
+
+  let status: SnapshotHitResult['status'];
+  let reason: string;
+  if (hasTotalFailure) {
+    // Every version failed — surface as partial_failure so the backfill
+    // grader hard-fails the date. We reuse the same status enum value
+    // rather than adding another because callers already treat it as
+    // an incomplete-date signal.
+    status = 'partial_failure';
+    reason = `all ${failedVersions.length} version(s) failed: ${failedVersions.map((v) => `v${v.model_version}(${v.error})`).join('; ')}`;
+  } else if (hasPartialFailure) {
+    status = 'partial_failure';
+    reason = `${succeededVersions.length} version(s) written, ${failedVersions.length} FAILED: ${failedVersions.map((v) => `v${v.model_version}(${v.error})`).join('; ')}`;
+  } else if (universeOnly) {
+    status = 'universe_refreshed';
+    reason = `refreshed ${totalUniverse} universe rows (snapshot untouched)`;
+  } else if (anyKeptFrozen > 0 && anyWritten === 0 && !force) {
+    status = 'frozen_kept';
+    reason = `all ${anyKeptFrozen} pregame snapshot rows preserved (across versions)`;
+  } else {
+    status = 'written';
+    reason = `${anyWritten} new snapshot rows + ${anyKeptFrozen} kept frozen (across versions)`;
+  }
   console.log(
     `\n[snapshotHitTargets] ✓ ${status.toUpperCase()} — ${reason} · type=${snapshotType} · ` +
     `games=${startedCount}/${games.length} started`,

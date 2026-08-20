@@ -22,6 +22,7 @@
     "diagnose:hit-calibration": "tsx scripts/diagnoseHitCalibration.ts",
     "backfill:hit-snapshots": "tsx scripts/runBackfillHitSnapshots.ts",
     "probe:hits": "node scripts/probeHitsState.mjs",
+    "test:hit-scoring": "node --experimental-strip-types --import ./scripts/_test_ts_loader.mjs scripts/_test_hit_scoring.ts",
     "diagnose:hit-ordering": "tsx scripts/diagnoseHitRankOrdering.ts",
     "rebuild:all": "tsx scripts/runRebuildAll.ts",
     "enrich:handedness": "tsx scripts/runEnrichHandedness.ts",

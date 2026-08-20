@@ -26,9 +26,19 @@ import {
   HIT_MODEL_1PLUS_HASH,
   HIT_MODEL_2PLUS,
   HIT_MODEL_2PLUS_HASH,
+  HIT_MODEL_1PLUS_V2,
+  HIT_MODEL_1PLUS_V2_HASH,
+  HIT_MODEL_2PLUS_V2,
+  HIT_MODEL_2PLUS_V2_HASH,
+  hashConfig,
   type HitConfigStamp,
   type HitModelConfig,
 } from './hitModels.js';
+// NOTE: no circular dependency. hitModels.ts imports nothing from
+// hitStats — verified by grep. An earlier CommonJS `require('./hitModels')`
+// was a paranoid guard that fatally broke every scoring path except the
+// two identity fast-path configs (v1) under ESM (`require is not
+// defined`). v2 fell into the slow path and crashed the whole run.
 
 // -------------------------------------------------------------------
 // Types
@@ -415,9 +425,15 @@ export function scoreHit(
     probability,
     model: {
       id: cfg.id,
-      hash: cfg === HIT_MODEL_1PLUS ? HIT_MODEL_1PLUS_HASH
-          : cfg === HIT_MODEL_2PLUS ? HIT_MODEL_2PLUS_HASH
-          : hashLive(cfg),
+      // Identity fast-path for the four known configs (v1 + v2). Any
+      // other config (ad-hoc test configs, future v3+) falls through to
+      // the live hash. hashConfig is now a real ESM import — no more
+      // runtime require().
+      hash: cfg === HIT_MODEL_1PLUS    ? HIT_MODEL_1PLUS_HASH
+          : cfg === HIT_MODEL_2PLUS    ? HIT_MODEL_2PLUS_HASH
+          : cfg === HIT_MODEL_1PLUS_V2 ? HIT_MODEL_1PLUS_V2_HASH
+          : cfg === HIT_MODEL_2PLUS_V2 ? HIT_MODEL_2PLUS_V2_HASH
+          : hashConfig(cfg),
       kind: cfg.kind,
       is_validated: cfg.is_validated,
       features_used,
@@ -426,15 +442,6 @@ export function scoreHit(
     },
     quality,
   };
-}
-
-/** Slow path — used only when scoreHit is called with a config other
- *  than the two module-level exports (e.g. an ad-hoc config in a test). */
-function hashLive(cfg: HitModelConfig): string {
-  // Avoid re-importing the hash function circularly at module init.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { hashConfig } = require('./hitModels.js') as { hashConfig: (c: HitModelConfig) => string };
-  return hashConfig(cfg);
 }
 
 // -------------------------------------------------------------------
